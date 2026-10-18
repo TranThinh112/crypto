@@ -13,6 +13,8 @@ def signal(
     tp2_close_pct: float = 0.30,
     tp3_pct: float = 0.015,
     tp3_close_pct: float = 0.30,
+    tp4_pct: float = 0.022,
+    tp5_pct: float = 0.030,
     htf_trend: str | None = None,
     candles=None,
 ) -> dict:
@@ -37,6 +39,8 @@ def signal(
         "tp2_close_pct": tp2_close_pct,
         "tp3_pct": tp3_pct,
         "tp3_close_pct": tp3_close_pct,
+        "tp4_pct": tp4_pct,
+        "tp5_pct": tp5_pct,
     }
 
     # Guard: Detect recent strong bottom bounce to avoid shorting into V-shaped recovery
@@ -102,6 +106,8 @@ def signal(
                 "tp1": float(close * (1 + tp1_pct)),
                 "tp2": float(close * (1 + tp2_pct)),
                 "tp3": float(close * (1 + tp3_pct)),
+                "tp4": float(close * (1 + tp4_pct)),
+                "tp5": float(close * (1 + tp5_pct)),
                 **ladder,
             },
             "htf_trend": htf_trend or "aligned",
@@ -124,6 +130,8 @@ def signal(
                 "tp1": float(close * (1 - tp1_pct)),
                 "tp2": float(close * (1 - tp2_pct)),
                 "tp3": float(close * (1 - tp3_pct)),
+                "tp4": float(close * (1 - tp4_pct)),
+                "tp5": float(close * (1 - tp5_pct)),
                 **ladder,
             },
             "htf_trend": htf_trend or "aligned",

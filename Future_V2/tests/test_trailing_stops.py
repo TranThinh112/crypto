@@ -7,18 +7,26 @@ from app.paper_worker import PaperWorker
 
 
 @pytest.mark.asyncio
-async def test_manage_live_trailing_stops_long_tp1_and_tp2():
+async def test_manage_live_trailing_stops_long_multistage():
     settings = Settings(
         trading_mode=TradingMode.live,
         enable_live_trading=True,
         live_execution_enabled=True,
         live_dry_run=False,
         okx_read_only=False,
+        okx_demo_trading=False,
+        okx_api_key="mock_key",
+        okx_secret_key="mock_secret",
+        okx_passphrase="mock_passphrase",
         live_execution_confirmation="I_UNDERSTAND_LIVE_TRADING_RISK",
         live_trailing_stop_enabled=True,
         breakeven_offset_pct=0.0015,
         tp1_pct=0.004,
         tp2_pct=0.010,
+        tp3_pct=0.015,
+        tp4_pct=0.022,
+        tp5_pct=0.030,
+        tp6_pct=0.040,
     )
     worker = PaperWorker(settings)
     worker.client = MagicMock()
@@ -72,29 +80,61 @@ async def test_manage_live_trailing_stops_long_tp1_and_tp2():
     assert plan["trailing_stage"] == 1
     assert plan["current_sl"] == expected_be_sl
 
-    # Test 3: Price hits TP2 (2592.00 >= 2591.06) -> Amend SL to TP1 (2575.67)
+    # Test 3: Price hits TP2 (2592.00 >= 2591.06) -> Amend SL to TP1 (2575.67) and TP to TP4 (2621.85)
     positions["ETH-USDT-SWAP"]["mark_price"] = 2592.00
     await worker._manage_live_trailing_stops(positions)
     assert worker.client.amend_algo_order.call_count == 2
     call_args2 = worker.client.amend_algo_order.call_args[0][0]
     assert call_args2["newSlTriggerPx"] == "2575.67"
+    assert call_args2["newTpTriggerPx"] == str(plan["tp4"])
     assert plan["trailing_stage"] == 2
     assert plan["current_sl"] == 2575.67
+    assert plan["current_tp"] == plan["tp4"]
+
+    # Test 4: Price hits TP3 (2605.00 >= 2603.89) -> Amend SL to TP2 (2591.06) and TP to TP5 (2642.37)
+    positions["ETH-USDT-SWAP"]["mark_price"] = 2605.00
+    await worker._manage_live_trailing_stops(positions)
+    assert worker.client.amend_algo_order.call_count == 3
+    call_args3 = worker.client.amend_algo_order.call_args[0][0]
+    assert call_args3["newSlTriggerPx"] == str(plan["tp2"])
+    assert call_args3["newTpTriggerPx"] == str(plan["tp5"])
+    assert plan["trailing_stage"] == 3
+    assert plan["current_sl"] == plan["tp2"]
+    assert plan["current_tp"] == plan["tp5"]
+
+    # Test 5: Price hits TP4 (2622.00 >= 2621.85) -> Amend SL to TP3 (2603.89) and TP to TP6 (2668.03)
+    positions["ETH-USDT-SWAP"]["mark_price"] = 2622.00
+    await worker._manage_live_trailing_stops(positions)
+    assert worker.client.amend_algo_order.call_count == 4
+    call_args4 = worker.client.amend_algo_order.call_args[0][0]
+    assert call_args4["newSlTriggerPx"] == str(plan["tp3"])
+    assert call_args4["newTpTriggerPx"] == str(plan["tp6"])
+    assert plan["trailing_stage"] == 4
+    assert plan["current_sl"] == plan["tp3"]
+    assert plan["current_tp"] == plan["tp6"]
 
 
 @pytest.mark.asyncio
-async def test_manage_live_trailing_stops_short_tp1_and_tp2():
+async def test_manage_live_trailing_stops_short_multistage():
     settings = Settings(
         trading_mode=TradingMode.live,
         enable_live_trading=True,
         live_execution_enabled=True,
         live_dry_run=False,
         okx_read_only=False,
+        okx_demo_trading=False,
+        okx_api_key="mock_key",
+        okx_secret_key="mock_secret",
+        okx_passphrase="mock_passphrase",
         live_execution_confirmation="I_UNDERSTAND_LIVE_TRADING_RISK",
         live_trailing_stop_enabled=True,
         breakeven_offset_pct=0.0015,
         tp1_pct=0.004,
         tp2_pct=0.010,
+        tp3_pct=0.015,
+        tp4_pct=0.022,
+        tp5_pct=0.030,
+        tp6_pct=0.040,
     )
     worker = PaperWorker(settings)
     worker.client = MagicMock()
@@ -118,7 +158,7 @@ async def test_manage_live_trailing_stops_short_tp1_and_tp2():
         "data": [{"sCode": "0", "algoId": "algo_btc_short"}]
     })
 
-    # Short entry at 84000.0. TP1 = 84000 * 0.996 = 83664.0. TP2 = 84000 * 0.990 = 83160.0.
+    # Short entry at 84000.0.
     positions = {
         "BTC-USDT-SWAP": {
             "symbol": "BTC-USDT-SWAP",
@@ -141,10 +181,24 @@ async def test_manage_live_trailing_stops_short_tp1_and_tp2():
     plan = worker.live_trade_plans["BTC-USDT-SWAP"]
     assert plan["trailing_stage"] == 1
 
-    # Price drops to 83100 <= 83160 (TP2) -> SL to TP1 (83664.0)
+    # Price drops to 83100 <= 83160 (TP2) -> SL to TP1 (83664.0), TP to TP4 (82152.0)
     positions["BTC-USDT-SWAP"]["mark_price"] = 83100.0
     await worker._manage_live_trailing_stops(positions)
     assert worker.client.amend_algo_order.call_count == 2
     call_args2 = worker.client.amend_algo_order.call_args[0][0]
     assert call_args2["newSlTriggerPx"] == "83664.0"
+    assert call_args2["newTpTriggerPx"] == str(plan["tp4"])
     assert plan["trailing_stage"] == 2
+    assert plan["current_sl"] == 83664.0
+    assert plan["current_tp"] == plan["tp4"]
+
+    # Price drops to 82700 <= 82740 (TP3) -> SL to TP2 (83160.0), TP to TP5 (81480.0)
+    positions["BTC-USDT-SWAP"]["mark_price"] = 82700.0
+    await worker._manage_live_trailing_stops(positions)
+    assert worker.client.amend_algo_order.call_count == 3
+    call_args3 = worker.client.amend_algo_order.call_args[0][0]
+    assert call_args3["newSlTriggerPx"] == str(plan["tp2"])
+    assert call_args3["newTpTriggerPx"] == str(plan["tp5"])
+    assert plan["trailing_stage"] == 3
+    assert plan["current_sl"] == plan["tp2"]
+    assert plan["current_tp"] == plan["tp5"]

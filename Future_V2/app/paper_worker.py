@@ -322,7 +322,7 @@ class PaperWorker:
                     if (side == "long" and exit_price <= stop) or (side == "short" and exit_price >= stop):
                         if stage == 1:
                             reason = "breakeven_exit"
-                        elif stage == 2:
+                        elif stage >= 2:
                             reason = "trailing_profit_exit"
                         else:
                             reason = "stop_loss"
@@ -349,7 +349,7 @@ class PaperWorker:
                 log.warning("okx_trade_close_audit_failed", extra={"symbol": symbol, "error_type": type(exc).__name__})
 
     async def _manage_live_trailing_stops(self, current_positions: dict) -> None:
-        """Evaluate open live positions against TP milestones and amend OKX SL orders dynamically."""
+        """Evaluate open live positions against TP milestones and amend OKX SL and TP orders dynamically."""
         if not getattr(self.settings, "live_trailing_stop_enabled", True):
             return
         if getattr(self.settings, "trading_mode", None) != TradingMode.live or getattr(self.settings, "live_dry_run", False):
@@ -368,6 +368,22 @@ class PaperWorker:
 
                 decimals = 1 if "BTC" in symbol else 2
 
+                tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
+                tp2_pct = getattr(self.settings, "tp2_pct", 0.010)
+                tp3_pct = getattr(self.settings, "tp3_pct", 0.015)
+                tp4_pct = getattr(self.settings, "tp4_pct", 0.022)
+                tp5_pct = getattr(self.settings, "tp5_pct", 0.030)
+                tp6_pct = getattr(self.settings, "tp6_pct", 0.040)
+                tp7_pct = getattr(self.settings, "tp7_pct", 0.050)
+
+                tp1 = round(entry_px * (1 + tp1_pct if pos_side == "long" else 1 - tp1_pct), decimals)
+                tp2 = round(entry_px * (1 + tp2_pct if pos_side == "long" else 1 - tp2_pct), decimals)
+                tp3 = round(entry_px * (1 + tp3_pct if pos_side == "long" else 1 - tp3_pct), decimals)
+                tp4 = round(entry_px * (1 + tp4_pct if pos_side == "long" else 1 - tp4_pct), decimals)
+                tp5 = round(entry_px * (1 + tp5_pct if pos_side == "long" else 1 - tp5_pct), decimals)
+                tp6 = round(entry_px * (1 + tp6_pct if pos_side == "long" else 1 - tp6_pct), decimals)
+                tp7 = round(entry_px * (1 + tp7_pct if pos_side == "long" else 1 - tp7_pct), decimals)
+
                 if not plan or not plan.get("algo_id"):
                     algo_res = await self.client.pending_algo_orders(symbol, ord_type="oco")
                     algos = (algo_res.get("data") or []) if isinstance(algo_res, dict) else []
@@ -377,19 +393,27 @@ class PaperWorker:
                     algo = matching[0]
                     current_sl = self._finite(algo.get("slTriggerPx")) or 0.0
                     current_tp = self._finite(algo.get("tpTriggerPx")) or 0.0
-                    tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
-                    tp2_pct = getattr(self.settings, "tp2_pct", 0.010)
-                    tp1 = round(entry_px * (1 + tp1_pct if pos_side == "long" else 1 - tp1_pct), decimals)
-                    tp2 = round(entry_px * (1 + tp2_pct if pos_side == "long" else 1 - tp2_pct), decimals)
 
                     stage = 0
                     if pos_side == "long":
-                        if current_sl >= tp1 and tp1 > entry_px:
+                        if current_sl >= tp4 and tp4 > entry_px:
+                            stage = 5
+                        elif current_sl >= tp3 and tp3 > entry_px:
+                            stage = 4
+                        elif current_sl >= tp2 and tp2 > entry_px:
+                            stage = 3
+                        elif current_sl >= tp1 and tp1 > entry_px:
                             stage = 2
                         elif current_sl >= entry_px:
                             stage = 1
                     else:
-                        if current_sl <= tp1 and tp1 < entry_px and current_sl > 0:
+                        if current_sl <= tp4 and tp4 < entry_px and current_sl > 0:
+                            stage = 5
+                        elif current_sl <= tp3 and tp3 < entry_px and current_sl > 0:
+                            stage = 4
+                        elif current_sl <= tp2 and tp2 < entry_px and current_sl > 0:
+                            stage = 3
+                        elif current_sl <= tp1 and tp1 < entry_px and current_sl > 0:
                             stage = 2
                         elif current_sl <= entry_px and current_sl > 0:
                             stage = 1
@@ -407,8 +431,13 @@ class PaperWorker:
                         "current_tp": current_tp,
                         "tp1": tp1,
                         "tp2": tp2,
+                        "tp3": tp3,
+                        "tp4": tp4,
+                        "tp5": tp5,
+                        "tp6": tp6,
+                        "tp7": tp7,
                         "trailing_stage": stage,
-                        "opened_at_ms": int(time.time() * 1000),
+                        "opened_at_ms": (plan.get("opened_at_ms") if plan else None) or int(time.time() * 1000),
                         "size": str(pos.get("quantity") or "0"),
                     }
                     self.live_trade_plans[symbol] = plan
@@ -416,45 +445,87 @@ class PaperWorker:
                 if not plan.get("algo_id"):
                     continue
 
-                if not plan.get("tp1") or not plan.get("tp2"):
-                    tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
-                    tp2_pct = getattr(self.settings, "tp2_pct", 0.010)
-                    plan["tp1"] = round(entry_px * (1 + tp1_pct if pos_side == "long" else 1 - tp1_pct), decimals)
-                    plan["tp2"] = round(entry_px * (1 + tp2_pct if pos_side == "long" else 1 - tp2_pct), decimals)
+                plan["tp1"] = tp1
+                plan["tp2"] = tp2
+                plan["tp3"] = tp3
+                plan["tp4"] = tp4
+                plan["tp5"] = tp5
+                plan["tp6"] = tp6
+                plan["tp7"] = tp7
 
                 stage = plan.get("trailing_stage", 0)
                 target_stage = stage
                 new_sl = None
+                new_tp = None
                 reason = ""
 
                 be_offset = getattr(self.settings, "breakeven_offset_pct", 0.0015)
+
                 if pos_side == "long":
-                    if stage < 1 and mark_px >= plan["tp1"]:
-                        target_stage = 1
-                        new_sl = round(entry_px * (1 + be_offset), decimals)
-                        reason = "hit_tp1_moved_sl_to_breakeven_plus_fee"
-                    if mark_px >= plan["tp2"]:
+                    be_price = round(entry_px * (1 + be_offset), decimals)
+                    if mark_px >= tp5:
+                        target_stage = 5
+                        new_sl = tp4
+                        new_tp = tp7
+                        reason = "hit_tp5_locked_sl_at_tp4_trailed_tp_to_tp7"
+                    elif mark_px >= tp4:
+                        target_stage = 4
+                        new_sl = tp3
+                        new_tp = tp6
+                        reason = "hit_tp4_locked_sl_at_tp3_trailed_tp_to_tp6"
+                    elif mark_px >= tp3:
+                        target_stage = 3
+                        new_sl = tp2
+                        new_tp = tp5
+                        reason = "hit_tp3_locked_sl_at_tp2_trailed_tp_to_tp5"
+                    elif mark_px >= tp2:
                         target_stage = 2
-                        new_sl = round(plan["tp1"], decimals)
-                        reason = "hit_tp2_locked_profit_at_tp1"
+                        new_sl = tp1
+                        new_tp = tp4
+                        reason = "hit_tp2_locked_sl_at_tp1_trailed_tp_to_tp4"
+                    elif mark_px >= tp1:
+                        target_stage = 1
+                        new_sl = be_price
+                        new_tp = plan.get("current_tp") or tp3
+                        reason = "hit_tp1_moved_sl_to_breakeven_plus_fee"
                 else:
-                    if stage < 1 and mark_px <= plan["tp1"]:
-                        target_stage = 1
-                        new_sl = round(entry_px * (1 - be_offset), decimals)
-                        reason = "hit_tp1_moved_sl_to_breakeven_plus_fee"
-                    if mark_px <= plan["tp2"]:
+                    be_price = round(entry_px * (1 - be_offset), decimals)
+                    if mark_px <= tp5:
+                        target_stage = 5
+                        new_sl = tp4
+                        new_tp = tp7
+                        reason = "hit_tp5_locked_sl_at_tp4_trailed_tp_to_tp7"
+                    elif mark_px <= tp4:
+                        target_stage = 4
+                        new_sl = tp3
+                        new_tp = tp6
+                        reason = "hit_tp4_locked_sl_at_tp3_trailed_tp_to_tp6"
+                    elif mark_px <= tp3:
+                        target_stage = 3
+                        new_sl = tp2
+                        new_tp = tp5
+                        reason = "hit_tp3_locked_sl_at_tp2_trailed_tp_to_tp5"
+                    elif mark_px <= tp2:
                         target_stage = 2
-                        new_sl = round(plan["tp1"], decimals)
-                        reason = "hit_tp2_locked_profit_at_tp1"
+                        new_sl = tp1
+                        new_tp = tp4
+                        reason = "hit_tp2_locked_sl_at_tp1_trailed_tp_to_tp4"
+                    elif mark_px <= tp1:
+                        target_stage = 1
+                        new_sl = be_price
+                        new_tp = plan.get("current_tp") or tp3
+                        reason = "hit_tp1_moved_sl_to_breakeven_plus_fee"
 
                 if new_sl is not None and target_stage > stage:
                     old_sl = plan.get("current_sl") or plan.get("stop_loss")
+                    old_tp = plan.get("current_tp") or plan.get("take_profit")
+                    amend_tp = new_tp if new_tp is not None else old_tp
                     amend_body = {
                         "instId": symbol,
                         "algoId": plan["algo_id"],
                         "newSlTriggerPx": str(new_sl),
                         "newSlOrdPx": "-1",
-                        "newTpTriggerPx": str(plan.get("current_tp") or plan.get("take_profit")),
+                        "newTpTriggerPx": str(amend_tp),
                         "newTpOrdPx": "-1",
                     }
                     res = await self.client.amend_algo_order(amend_body)
@@ -462,6 +533,7 @@ class PaperWorker:
                     if str(data.get("sCode", "0")) == "0":
                         plan["trailing_stage"] = target_stage
                         plan["current_sl"] = new_sl
+                        plan["current_tp"] = amend_tp
                         log.info(
                             "live_trade_trailing_stop_updated",
                             extra={
@@ -472,6 +544,8 @@ class PaperWorker:
                                 "mark_price": mark_px,
                                 "old_sl": old_sl,
                                 "new_sl": new_sl,
+                                "old_tp": old_tp,
+                                "new_tp": amend_tp,
                             },
                         )
                         await self.audit.append("live_trade_trailing_stop", {
@@ -485,9 +559,14 @@ class PaperWorker:
                             "mark_price": mark_px,
                             "old_sl": old_sl,
                             "new_sl": new_sl,
-                            "tp1": plan["tp1"],
-                            "tp2": plan["tp2"],
-                            "current_tp": plan.get("current_tp") or plan.get("take_profit"),
+                            "old_tp": old_tp,
+                            "new_tp": amend_tp,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "tp3": tp3,
+                            "tp4": tp4,
+                            "tp5": tp5,
+                            "current_tp": amend_tp,
                         })
                     else:
                         log.warning(
@@ -907,6 +986,8 @@ class PaperWorker:
                     getattr(self.settings, "tp2_close_pct", 0.30),
                     getattr(self.settings, "tp3_pct", 0.015),
                     getattr(self.settings, "tp3_close_pct", 0.30),
+                    getattr(self.settings, "tp4_pct", 0.022),
+                    getattr(self.settings, "tp5_pct", 0.030),
                     htf_trend=htf_trend,
                     candles=candles,
                 )
@@ -1045,6 +1126,11 @@ class PaperWorker:
                                 pos_side = plan.get("posSide", "long")
                                 tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
                                 tp2_pct = getattr(self.settings, "tp2_pct", 0.010)
+                                tp3_pct = getattr(self.settings, "tp3_pct", 0.015)
+                                tp4_pct = getattr(self.settings, "tp4_pct", 0.022)
+                                tp5_pct = getattr(self.settings, "tp5_pct", 0.030)
+                                tp6_pct = getattr(self.settings, "tp6_pct", 0.040)
+                                tp7_pct = getattr(self.settings, "tp7_pct", 0.050)
                                 trade = {
                                     "symbol": plan.get("instId"),
                                     "order_id": result.get("ordId"),
@@ -1057,6 +1143,11 @@ class PaperWorker:
                                     "current_tp": proposal_data.get("take_profit"),
                                     "tp1": round(entry_px * (1 + tp1_pct if pos_side == "long" else 1 - tp1_pct), decimals),
                                     "tp2": round(entry_px * (1 + tp2_pct if pos_side == "long" else 1 - tp2_pct), decimals),
+                                    "tp3": round(entry_px * (1 + tp3_pct if pos_side == "long" else 1 - tp3_pct), decimals),
+                                    "tp4": round(entry_px * (1 + tp4_pct if pos_side == "long" else 1 - tp4_pct), decimals),
+                                    "tp5": round(entry_px * (1 + tp5_pct if pos_side == "long" else 1 - tp5_pct), decimals),
+                                    "tp6": round(entry_px * (1 + tp6_pct if pos_side == "long" else 1 - tp6_pct), decimals),
+                                    "tp7": round(entry_px * (1 + tp7_pct if pos_side == "long" else 1 - tp7_pct), decimals),
                                     "trailing_stage": 0,
                                     "opened_at_ms": int(time.time() * 1000),
                                     "size": plan.get("sz"),
