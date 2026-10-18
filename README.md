@@ -100,7 +100,7 @@ Các hệ thống được cấu hình trên các cổng dịch vụ độc lậ
 | Bot | Cổng Dịch Vụ | Lệnh Khởi Chạy UI | Đường Dẫn Truy Cập |
 | :--- | :--- | :--- | :--- |
 | **bot_spot** | Port 8000 | `python -m uvicorn spot_ai_bot.main:app --port 8000` | http://localhost:8000 |
-| **bot-FX / xauusd** | Port 8000 *(hoặc đổi port)* | `python -m uvicorn app.api.main:app --port 8000` | http://127.0.0.1:8000/dashboard |
+| **bot-FX / xauusd** | Port 8000 *(hoặc đổi port)* | `python -m uvicorn app.main:app --port 8000` | http://127.0.0.1:8000/dashboard |
 | **Crypto_Bunny** | Port 8013 | `python -m crypto_trader ui --config config.demo.yaml --port 8013` | http://localhost:8013 |
 | **Future_V2** | Port 8014 | `python -m uvicorn app.api.main:app --port 8014` | http://localhost:8014/dashboard |
 | **OKX-P2P-Profit-Bot** | Port 8501 | `streamlit run app.py --server.port 8501` | http://localhost:8501 |
