@@ -1,0 +1,528 @@
+mode: live
+report_path: /tmp/latest_decision.json
+ledger_path: /tmp/trades.jsonl
+
+runtime:
+  instance_role: primary
+
+runtime_sync:
+  position_close_grace_seconds: 120
+  manual_target_fast_sync_enabled: true
+  manual_target_fast_sync_interval_seconds: 20
+
+dashboard:
+  post_cycle_force_refresh_enabled: false
+
+active_position_manager:
+  bad_cut_once_per_position: true
+  bad_cut_reset_on_scale_in: true
+  protected_positions:
+    - enabled: true
+      symbol: XRP/USDT:USDT
+      side: LONG
+      trade_execution_id: 6
+      exchange_position_id: "3765765730300190720"
+      reason: protect_current_xrp_position_only
+
+trailing_stop:
+  enabled: true
+  activation_r_multiple: 1.0
+  atr_timeframe: 5m
+  atr_period: 14
+  atr_multiplier: 3.0
+  min_improvement_price: 0.0
+  trigger_price_type: last
+  algo_order_types:
+  - oco
+  - conditional
+  - trigger
+  partial_take_profit:
+    enabled: true
+    trigger_tp_progress: 0.7
+    close_fraction: 0.3
+    remaining_sl_buffer_r: 0.1
+    tp_extension_fraction: 0.3
+  symbol_overrides:
+    BTC:
+      min_improvement_points: 2000
+      point_value: 0.01
+
+database:
+  backend: atlas
+  atlas:
+    uri_env: MONGODB_URI
+    database_env: MONGODB_DATABASE
+    database: Bunny_Runtime_Live
+    ai_database_env: MONGODB_AI_DATABASE
+    ai_database: AI_Bunny_Live
+    app_name: Crypto_Bunny
+    server_selection_timeout_ms: 15000
+    connect_timeout_ms: 8000
+    socket_timeout_ms: 20000
+    wait_queue_timeout_ms: 15000
+    operation_retry_attempts: 3
+    operation_retry_delay_seconds: 0.35
+    circuit_breaker_seconds: 8
+    api_read_timeout_seconds: 6
+    journal_state_cache_ttl_seconds: 60
+    journal_state_stale_fallback_seconds: 21600
+    delete_dashboard_snapshots_on_clear: false
+
+exchange:
+  simulated_trading: false
+  td_mode: cross
+  leverage: 25
+  position_side_mode: long_short
+  leverage_presets:
+  - 5
+  - 10
+  - 15
+  - 20
+  - 25
+
+automation:
+  enabled: true
+  scan_interval_seconds: 60
+  execute_demo: false
+  execute_live: true
+  initial_delay_seconds: 5
+
+risk:
+  order_usdt: 50
+  max_active_trades: 5
+  max_daily_orders: 20
+  max_daily_planned_risk_usdt: 150
+  cooldown_minutes: 0
+  max_spread_pct: 0.15
+  min_stop_distance_pct: 0.35
+  max_stop_distance_pct: 6.0
+  news_conflict_threshold: 2.0
+
+trade_memory:
+  limit: 500
+
+paper_trading:
+  enabled: true
+  auto_scan_enabled: false
+  scan_interval_seconds: 60
+  max_active_trades: 5
+
+trading_risk:
+  max_concurrent_positions: 5
+  hard_to_soft_transition_cooldown_seconds: 900
+  soft_recovery_risk_percent: 0.75
+  soft_recovery_min_rule_score: 87
+  soft_recovery_min_gpt_confidence: 87
+  soft_recovery_min_win_probability_pct: 75
+  soft_recovery_min_risk_reward: 2.2
+  normal_min_gpt_confidence: 70
+  normal_min_win_probability_pct: 64
+  normal_min_risk_reward: 1.5
+  rr_hard_block_enabled: false
+  rr_absolute_hard_block_enabled: false
+  rr_low_warning_threshold: 1.2
+  recovery_min_gpt_confidence: 92
+  recovery_min_win_probability_pct: 80
+  recovery_min_risk_reward: 2.5
+  dynamic_win_probability_thresholds:
+    enabled: true
+    low_volatility:
+      min_win_probability_pct: 63
+      min_confidence: 72
+      min_risk_reward: 1.5
+    high_volatility:
+      min_win_probability_pct: 70
+    health_warning_floor_pct: 68
+  probation_entry:
+    enabled: true
+    min_win_probability_pct: 58
+    min_confidence: 68
+    min_risk_reward: 1.5
+    margin_usdt: 1.0
+  confidence_fallback:
+    enabled: true
+    floor: 55
+    ceiling: 82
+  data_quality:
+    exclude_insufficient_history_symbols: true
+    exclude_rate_limited_symbols: false
+
+bunny_health_monitor:
+  # Tranh khoa he thong vi mau thong ke qua nho hoac drawdown % bi meo boi peak PnL nho.
+  lookback_trades: 20
+  min_trades_for_evaluation: 5
+  min_win_rate: 50.0
+  min_profit_factor: 1.2
+  max_drawdown_percent: 20.0
+  min_drawdown_usdt_for_warning: 2.0
+  risk_reduction_percent: 40.0
+  score_increase_step: 4.0
+  confidence_increase_step: 4.0
+  critical_win_rate: 35.0
+  critical_profit_factor: 0.8
+  critical_drawdown_percent: 35.0
+  min_drawdown_usdt_for_critical: 5.0
+  min_effective_peak_usdt: 10.0
+  critical_requires_multiple_breaches: true
+  critical_pause_hours: 3
+
+pending_orders:
+  enabled: true
+  max_age_days: 3
+  local_max_age_hours: 6
+  exchange_max_age_days: 1.5
+  order_type: limit
+  review:
+    enabled: true
+    min_confidence: 70
+    min_win_probability_pct: 50
+    max_confidence_drop: 12
+    max_win_probability_drop_pct: 8
+    min_risk_reward: 1.5
+    max_entry_drift_pct: 1.2
+    use_market_guard_memory: true
+    cancel_on_guard_avoid: true
+    cancel_on_opposite_guard_direction: true
+    opposite_guard_min_risk_score: 4.0
+ai:
+  enabled: true
+  manual_only: false
+  allow_api_calls: true #gọi AI
+  api_key_env: OPENAI_API_KEY
+  internal:
+    provider: openai
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY_INTERNAL
+    market_scan_enabled: true
+    market_scan_interval_seconds: 14400
+    market_scan_fixed_schedule: true
+    market_scan_slot_tolerance_minutes: 3
+    market_scan_timezone: Asia/Ho_Chi_Minh
+    market_scan_source_symbols: 50
+    market_scan_max_symbols: 3
+    market_scan_min_approved_symbols: 1
+    market_scan_min_win_probability_pct: 62
+    # gọi AI
+    market_scan_use_ai: true 
+    market_scan_use_shortlist: true
+    market_scan_to_pending: true
+    market_scan_pending_limit: 2
+    market_scan_require_ai_for_pending: true
+    compact_ai_payload: true
+    lc_pipeline_enabled: true
+    lc_pipeline_top_limit: 3
+    lc_pipeline_undecided_max: 6
+    lc_pipeline_undecided_prune_floor: 6
+    lc_pipeline_undecided_prune_drop: 3
+    lc_pipeline_internal_lc_max: 3
+    lc_pipeline_promote_after_hours: 6
+    lc_pipeline_recheck_interval_minutes: 90
+    lc_pipeline_slot_tolerance_minutes: 3
+    lc_pipeline_one_hour_min_win_probability_pct: 55
+    lc_pipeline_two_hour_min_win_probability_pct: 57
+    lc_pipeline_four_hour_min_win_probability_pct: 60
+    lc_pipeline_relaxed_min_win_probability_pct: 53
+    lc_pipeline_relaxed_min_confidence: 70
+    lc_pipeline_relaxed_min_risk_reward: 1.5
+    lc_pipeline_notify_one_hour_summary: true
+    lc_pipeline_notify_two_hour_summary: true
+    lc_pipeline_notify_undecided_recheck_summary: true
+    lc_pipeline_notify_mini_pool_summary: true
+    lc_pipeline_two_hour_icon: "🟡"
+    lc_pipeline_promote_survivors: true
+    lc_pipeline_promote_to_pending: true
+    trend_scan_log_interval_seconds: 900
+    trend_scan_top_limit: 50
+    trend_scan_strong_threshold: 55.0
+    trend_scan_htf_watch_threshold: 60.0
+    trend_scan_htf_immediate_threshold: 75.0
+    trend_scan_htf_required_confirmations: 2
+    trend_scan_entry_setup_threshold: 42.0
+    trend_scan_entry_ai_threshold: 50.0
+    trend_scan_fast_entry_enabled: true
+    trend_scan_fast_entry_htf_threshold: 68.0
+    trend_scan_fast_entry_score_threshold: 42.0
+    trend_scan_fast_entry_volume_ratio: 1.2
+    trend_scan_adaptive_ai_ready_enabled: true
+    trend_scan_adaptive_ai_strong_htf_threshold: 78.0
+    trend_scan_adaptive_ai_entry_threshold: 40.0
+    trend_scan_flexible_entry_enabled: true
+    trend_scan_flexible_entry_htf_threshold: 60.0
+    trend_scan_flexible_entry_score_threshold: 35.0
+    trend_scan_flexible_entry_min_rr: 1.5
+    trend_scan_flexible_entry_min_confidence: 68.0
+    trend_scan_flexible_entry_min_entry_quality: 45.0
+    trend_scan_flexible_entry_min_continuation: 45.0
+    trend_scan_flexible_entry_size_multiplier: 0.35
+    trend_scan_flexible_entry_ttl_minutes: 45
+    trend_scan_countertrend_entry_threshold: 42.0
+    trend_setup_overextended_score_threshold: 58.0
+    trend_setup_hot_rsi_threshold: 72.0
+    trend_setup_price_vs_ema_overextended_pct: 3.0
+    post_move_watch_enabled: true
+    post_move_watch_htf_min_score: 48.0
+    post_move_watch_near_threshold_gap: 12.0
+    post_move_watch_entry_max_score: 35.0
+    post_move_watch_default_ttl_minutes: 60
+    post_move_watch_max_ttl_minutes: 120
+    post_move_watch_retest_entry_score: 36.0
+    trend_watchlist_ttl_minutes: 120
+    trend_watchlist_min_keep_score: 50.0
+    trend_watchlist_ai_review_extend_minutes: 30
+    trend_watchlist_reject_cooldown_minutes: 60
+    trend_approved_hold_ttl_minutes: 30
+    trend_approved_hold_recheck_seconds: 120
+    trend_approved_hold_notify_enabled: true
+    trend_priority_rewatch_ttl_minutes: 30
+    trend_approved_hold_max_entry_drift_pct: 1.2
+    trend_approved_hold_stale_minutes: 45
+    trend_setup_review_ai_enabled: true
+    trend_setup_review_ai_cooldown_seconds: 900
+    trend_setup_review_same_fingerprint_block_enabled: true
+    trend_setup_review_review_cooldown_minutes: 30
+    trend_setup_review_reject_setup_only_cooldown_minutes: 60
+    trend_setup_review_reject_watchlist_remove_cooldown_minutes: 240
+    trend_setup_review_approve_cooldown_minutes: 15
+    trend_setup_review_price_change_pct: 3.0
+    trend_setup_review_score_change: 15.0
+    trend_setup_review_trend_score_change: 12.0
+    trend_setup_review_same_class_second_cooldown_minutes: 60
+    trend_setup_review_same_class_third_cooldown_minutes: 120
+    trend_setup_review_daily_budget_per_class: 3
+    trend_auto_shadow_review_enabled: true
+    trend_auto_shadow_review_limit: 5
+    timeout_seconds: 15
+  okx:
+    provider: local_policy
+    model: gpt-5.5
+    api_key_env: OPENAI_API_KEY_OKX
+    approval_enabled: true
+    auto_openai_enabled: true
+    auto_lc_okx_review_once_enabled: true
+    manual_openai_enabled: false
+    ask_internal_before_entry: true
+    require_external_approval: false
+    timeout_seconds: 20
+
+market_guard:
+  enabled: true
+  interval_seconds: 60
+  notify_telegram: false
+  notify_interval_seconds: 600
+  timeframe: 1m
+  ohlcv_limit: 40
+  lookback_candles: 5
+  price_move_5m_pct: 0.8
+  critical_price_move_5m_pct: 1.4
+  candle_range_pct: 0.9
+  critical_candle_range_pct: 1.8
+  wick_pct: 0.45
+  wick_body_ratio: 2.5
+  volume_ratio: 2.5
+  pause_new_entries_seconds: 900
+  max_symbols: 30
+  layer_5m_samples: 5
+  layer_20m_samples: 20
+  memory_keep_hours: 12
+  use_memory_in_strategy: true
+
+market_scan_memory:
+  keep_hours: 12
+  max_rows_per_symbol_timeframe: 60
+  max_json_bytes: 4096
+  max_saved_candidates_per_scan: 50
+  compact_batch_limit: 100
+  prune_overflow_batch_limit: 500
+  emergency_keep_hours: 6
+  emergency_max_rows_per_symbol_timeframe: 30
+decision_history:
+  keep_hours: 24
+  max_rows: 120
+  emergency_keep_hours: 6
+  emergency_max_rows: 30
+storage_maintenance:
+  enabled: true
+  interval_seconds: 900
+  emergency: false
+
+journal_state_retention:
+  enabled: true
+  system_checklist_keep_days: 30
+  daily_start_balance_keep_days: 10
+  wait_slot_notification_history_keep_days: 7
+  lc_pipeline_candidate_cache_keep_hours: 6
+  telegram_message_id_keep_days: 10
+  dashboard_snapshot_keep_days: 1
+  mini_setup_keep_days: 7
+
+storage_retention:
+  pending_orders_keep_days: 5
+  internal_pending_orders_keep_days: 5
+  trade_candidates_keep_days: 1
+  ai_trade_decisions_keep_days: 180
+  trade_executions_keep_days: 365
+  prompt_versions_keep_days: 365
+  strategy_versions_keep_days: 365
+  ai_experiments_keep_days: 365
+  replay_history_keep_days: 30
+  paper_trades_keep_days: 30
+  market_regime_history_keep_days: 1
+
+market_pattern_engine:
+  enabled: true
+  max_snapshots_per_scan: 3
+  max_candles: 220
+  requested_detectors:
+  - candlestick
+  - market_structure
+  - support_resistance
+  - chart_patterns
+  - smart_money
+
+strategy:
+  timeframe: 1m
+  ohlcv_limit: 180
+  min_confidence: 72
+  min_win_probability_pct: 68
+  min_risk_reward: 2.0
+  target:
+    mode: risk_reward
+    take_profit_pct: 75
+    stop_loss_pct: 50
+    risk_reward_ratio: 2.0
+    percent_basis: roi_percent
+  confirmation_timeframes:
+    enabled: true
+    frames:
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+    ohlcv_limit: 180
+    weights:
+      5m: 5
+      15m: 7
+      1h: 8
+      4h: 11
+  candlestick_patterns:
+    enabled: true
+    weights:
+      1m: 3
+      5m: 5
+      15m: 7
+      1h: 8
+      4h: 11
+  universe:
+    enabled: true
+    mode: top_volume_24h
+    quote: USDT
+    max_symbols: 50
+    asset_class: crypto
+    priority_symbols_enabled: true
+    priority_symbols:
+    - BTC/USDT:USDT
+    - SOL/USDT:USDT
+    - ETH/USDT:USDT
+    - BNB/USDT:USDT
+    - XRP/USDT:USDT
+    - ETC/USDT:USDT
+    weekday_priority_enabled: true
+    weekday_priority_symbols:
+    - XAU/USDT:USDT
+    weekday_priority_timezone: Asia/Ho_Chi_Minh
+  long_short_bias:
+    enabled: true
+    target_long_ratio: 0.6
+    strength: 10
+
+position_sizing:
+  enabled: true
+  cycle_start_at: '2026-08-28T01:32:12+07:00'
+  cycle_start_pnl_fallback_usdt: 0.0
+  cycle_pnl_use_trade_executions_fallback: true
+  base_margin_usdt: 2.0
+  normal_risk_percent: 1.0
+  warning_risk_percent: 0.7
+  recovery_risk_percent: 0.5
+  critical_risk_percent: 0.0
+  min_order_size: 1.0
+  max_order_size_percent_of_trading_capital: 20.0
+  min_leverage: 1.0
+  max_leverage: 25.0
+  quality_margin_enabled: true
+  quality_margin_percent_by_grade:
+    S: 10.0
+    A: 7.0
+    B: 5.0
+    C: 2.0
+    D: 0.0
+  quality_margin_mode_multiplier:
+    HEALTHY: 1.0
+    WARNING: 0.75
+    RECOVERY: 0.5
+    CRITICAL: 0.0
+  quality_margin_max_loss_percent_by_mode:
+    HEALTHY: 5.0
+    WARNING: 3.75
+    RECOVERY: 2.5
+    CRITICAL: 0.0
+  rr_sizing_enabled: true
+  rr_sizing_low_threshold: 1.5
+  rr_sizing_good_threshold: 2.0
+  rr_sizing_excellent_threshold: 2.5
+  rr_sizing_multiplier_low: 0.6
+  rr_sizing_multiplier_base: 1.0
+  rr_sizing_multiplier_good: 1.15
+  rr_sizing_multiplier_excellent: 1.3
+  target_profit_usdt: 0.30
+  tp_roi: 0.75
+  sl_roi: 0.50
+  open_fee: 0.0005
+  close_fee: 0.0005
+  safety_buffer: 0.02
+  max_recovery_step: 4
+  max_margin_usdt: 50
+  max_cycle_loss_usdt: 50
+  hard_loss_streak_threshold: 2
+  hard_loss_usdt_threshold: 10
+  min_recovery_confidence: 88
+  min_recovery_win_probability_pct: 58
+  block_recovery_on_market_guard: true
+  block_recovery_same_symbol_side: true
+  max_recovery_4h_rsi_long: 76
+  min_recovery_4h_rsi_short: 24
+  base_margin_presets_usdt:
+  - 2
+  - 3
+  - 5
+  - 10
+  - 15
+  - 20
+  - 30
+  - 50
+  history_limit: 100
+  bootstrap_existing_history: false
+
+notifications:
+  telegram:
+    enabled: true
+    notify_scans: false
+    notify_ai_api_calls: true
+    timeout_seconds: 8
+    retry_count: 2
+    buttons_enabled: true
+    replace_previous_message: false
+    polling_enabled: true
+    poll_timeout_seconds: 1
+    button_cache_ttl_seconds: 15
+    account_report_interval_seconds: 0
+    daily_summary_enabled: false
+    startup_message_enabled: true
+    startup_quiet_seconds: 300
+    trade_memory_limit: 100
+
+execution:
+  order_type: market
+  attach_tp_sl: true
+  live_confirm_file: config/railway-live-trading.enabled
+  enable_live: true

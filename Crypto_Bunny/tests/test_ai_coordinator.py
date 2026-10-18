@@ -1,0 +1,1217 @@
+from __future__ import annotations
+
+import json
+import tempfile
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from unittest import TestCase
+from unittest.mock import patch
+
+from crypto_trader.ai_coordinator import (
+    OKX_REVIEW_CACHE_STATE_KEY,
+    _compact_lc_memory,
+    _candidate_summary,
+    _candidate_market_summary,
+    _internal_market_scan_slot_id,
+    _local_market_scan_result,
+    _mini_ai_reason_vi,
+    _validated_ai_symbols,
+    internal_market_scan_due,
+    internal_lc_memory,
+    okx_ai_approval,
+    review_candidate_for_lc_okx,
+    run_internal_market_scan,
+)
+from crypto_trader.config import DEFAULT_CONFIG
+from crypto_trader.lc_pipeline import latest_lc_pipeline_mini_scan, save_lc_pipeline_mini_scan
+from crypto_trader.models import RiskCheck, TradeCandidate
+from crypto_trader.storage import recent_market_scan_memory, save_market_scan_observations, save_pending_order, set_journal_state
+
+
+def _candidate(symbol: str = "BTC/USDT:USDT", side: str = "long", win: float = 82.0) -> TradeCandidate:
+    return TradeCandidate(
+        symbol=symbol,
+        base=symbol.split("/")[0],
+        side=side,  # type: ignore[arg-type]
+        confidence=82.0,
+        win_probability_pct=win,
+        entry=100.0,
+        stop_loss=97.5,
+        take_profit=103.75,
+        risk_reward=1.5,
+        order_usdt=20.0,
+        quantity=1.0,
+        spread_pct=0.01,
+        news_score=0.0,
+        news_count=1,
+        take_profit_pct=75,
+        stop_loss_pct=50,
+    )
+
+
+class AiCoordinatorTest(TestCase):
+    def _config(self) -> dict:
+        self.tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        config = deepcopy(DEFAULT_CONFIG)
+        config["_config_dir"] = self.tmpdir.name
+        config["_atlas_test_mode"] = True
+        config["ledger_path"] = "ledger.jsonl"
+        config["news"]["require_symbol_news"] = False
+        config["ai"]["internal"]["provider"] = "local_policy"
+        config["ai"]["okx"]["provider"] = "local_policy"
+        return config
+
+    def tearDown(self) -> None:
+        tmpdir = getattr(self, "tmpdir", None)
+        if tmpdir:
+            tmpdir.cleanup()
+
+    def test_internal_memory_prioritizes_lc_okx_before_local_lc(self) -> None:
+        config = self._config()
+        save_pending_order(config, _candidate("ETH/USDT:USDT", win=95.0), None, journal_id=21)
+        save_pending_order(config, _candidate("BTC/USDT:USDT", win=80.0), "limit-1", journal_id=12)
+
+        memory = internal_lc_memory(config)
+
+        self.assertEqual(memory["pending_total"], 2)
+        self.assertEqual(memory["lc_okx_count"], 1)
+        self.assertEqual(memory["local_lc_count"], 1)
+        self.assertEqual(memory["preferred"]["status"], "LC_OKX")
+        self.assertEqual(memory["preferred"]["lc_id"], 12)
+
+    def test_okx_lc_memory_compacts_to_priority_and_same_symbol_summary(self) -> None:
+        compact = _compact_lc_memory(
+            {
+                "pending_total": 3,
+                "lc_okx_count": 1,
+                "wait_slot_count": 1,
+                "local_lc_count": 1,
+                "preferred": {
+                    "status": "LC_OKX",
+                    "lc_id": 12,
+                    "symbol": "LIT/USDT:USDT",
+                    "side": "long",
+                    "win_probability_pct": 62.0,
+                    "entry": 100.0,
+                },
+                "orders": [
+                    {"status": "LC_OKX", "lc_id": 12, "symbol": "LIT/USDT:USDT", "side": "long"},
+                    {"status": "WAIT_SLOT", "lc_id": 13, "symbol": "LIT/USDT:USDT", "side": "short"},
+                    {"status": "OPEN", "lc_id": 14, "symbol": "BTC/USDT:USDT", "side": "long"},
+                ],
+            }
+        )
+
+        self.assertNotIn("preferred", compact)
+        self.assertNotIn("orders", compact)
+        self.assertEqual(
+            compact["highest_priority"],
+            {
+                "status": "LC_OKX",
+                "lc_id": 12,
+                "symbol": "LIT/USDT:USDT",
+                "side": "long",
+                "win_probability_pct": 62.0,
+            },
+        )
+        self.assertEqual(compact["same_symbol_pending"]["LIT/USDT:USDT"]["count"], 2)
+        self.assertEqual(compact["same_symbol_pending"]["LIT/USDT:USDT"]["sides"], ["long", "short"])
+        self.assertEqual(compact["same_symbol_pending"]["LIT/USDT:USDT"]["statuses"], ["LC_OKX", "WAIT_SLOT"])
+
+    def test_candidate_summary_treats_missing_news_count_as_clean(self) -> None:
+        config = self._config()
+        candidate = _candidate("ETC/USDT:USDT", side="short")
+        candidate.news_count = None  # type: ignore[assignment]
+        candidate.news_score = None  # type: ignore[assignment]
+
+        summary = _candidate_summary(candidate, config=config)
+
+        news_check = summary["setup_checks"]["news"]
+        self.assertEqual(news_check["status"], "clean")
+        self.assertEqual(news_check["news_count"], 0)
+
+    def test_okx_ai_defers_new_vt_when_internal_lc_exists(self) -> None:
+        config = self._config()
+        save_pending_order(config, _candidate("BTC/USDT:USDT"), "limit-1", journal_id=12)
+        candidate = _candidate("SOL/USDT:USDT")
+        check = RiskCheck(True, [], [])
+
+        new_vt = okx_ai_approval(config, candidate, check, context={"route": "new_vt"})
+        pending_release = okx_ai_approval(config, candidate, check, context={"route": "lc_okx_release"})
+
+        self.assertFalse(new_vt["approved"])
+        self.assertEqual(new_vt["decision"], "defer_to_internal_lc")
+        self.assertTrue(pending_release["approved"])
+
+    def test_okx_approval_disabled_uses_local_policy_without_calling_openai(self) -> None:
+        config = self._config()
+        config["ai"]["okx"]["manual_openai_enabled"] = True
+        config["ai"]["okx"]["approval_enabled"] = False
+        candidate = _candidate("SOL/USDT:USDT")
+        check = RiskCheck(True, [], [])
+
+        with patch("crypto_trader.ai_coordinator._openai_json_decision") as approval:
+            decision = okx_ai_approval(
+                config,
+                candidate,
+                check,
+                context={"route": "new_vt", "manual_openai_once": True},
+            )
+
+        approval.assert_not_called()
+        self.assertTrue(decision["approved"])
+        self.assertEqual(decision["decision"], "manual_openai_blocked")
+        self.assertEqual(decision["provider"], "local_policy")
+
+    def test_okx_auto_flow_never_calls_openai_even_if_auto_config_is_enabled(self) -> None:
+        config = self._config()
+        config["ai"]["okx"]["provider"] = "openai"
+        config["ai"]["okx"]["auto_openai_enabled"] = True
+        config["ai"]["okx"]["manual_openai_enabled"] = True
+        config["ai"]["okx"]["approval_enabled"] = True
+        candidate = _candidate("SOL/USDT:USDT")
+        check = RiskCheck(True, [], [])
+
+        with patch("crypto_trader.ai_coordinator._openai_json_decision") as approval:
+            decision = okx_ai_approval(config, candidate, check, context={"route": "new_vt"})
+
+        approval.assert_not_called()
+        self.assertTrue(decision["approved"])
+        self.assertEqual(decision["decision"], "approve")
+        self.assertEqual(decision["provider"], "local_policy")
+
+    def test_okx_manual_openai_once_is_blocked_even_when_manual_is_enabled(self) -> None:
+        config = self._config()
+        config["ai"]["okx"]["provider"] = "local_policy"
+        config["ai"]["okx"]["auto_openai_enabled"] = False
+        config["ai"]["okx"]["manual_openai_enabled"] = True
+        config["ai"]["okx"]["approval_enabled"] = True
+        candidate = _candidate("SOL/USDT:USDT")
+        check = RiskCheck(True, [], [])
+        approved = {
+            "approved": True,
+            "decision": "APPROVE",
+            "reason": "Manual one-shot approval",
+            "provider": "openai",
+            "model": "gpt-5.5",
+        }
+
+        with patch("crypto_trader.ai_coordinator._openai_json_decision", return_value=approved) as approval:
+            decision = okx_ai_approval(
+                config,
+                candidate,
+                check,
+                context={"route": "lc_okx_setup_review", "manual_openai_once": True},
+            )
+
+        approval.assert_not_called()
+        self.assertTrue(decision["approved"])
+        self.assertEqual(decision["decision"], "manual_openai_blocked")
+        self.assertEqual(decision["provider"], "local_policy")
+
+    def test_lc_okx_setup_review_auto_one_shot_calls_openai_once_gate(self) -> None:
+        config = self._config()
+        config["ai"]["okx"]["provider"] = "local_policy"
+        config["ai"]["okx"]["auto_openai_enabled"] = False
+        config["ai"]["okx"]["auto_lc_okx_review_once_enabled"] = True
+        config["ai"]["okx"]["approval_enabled"] = True
+        candidate = _candidate("SOL/USDT:USDT")
+        check = RiskCheck(True, [], [])
+        approved = {
+            "approved": True,
+            "decision": "APPROVE",
+            "reason": "LC_OKX setup is valid",
+            "provider": "openai",
+            "model": "gpt-5.5",
+        }
+
+        with patch("crypto_trader.ai_coordinator._openai_json_decision", return_value=approved) as approval:
+            reviewed, decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                check,
+                context={
+                    "route": "lc_okx_setup_review",
+                    "lc_id": 88,
+                    "source": "mini_lc_okx",
+                    "from_status": "MINI_APPROVED",
+                },
+            )
+            reused, second_decision = review_candidate_for_lc_okx(
+                config,
+                reviewed,
+                check,
+                context={
+                    "route": "lc_okx_setup_review",
+                    "lc_id": 88,
+                    "source": "mini_lc_okx",
+                    "from_status": "MINI_APPROVED",
+                },
+            )
+
+        approval.assert_called_once()
+        self.assertFalse(approval.call_args.kwargs["manual_trigger"])
+        self.assertTrue(approval.call_args.kwargs["lc_okx_review_once"])
+        self.assertTrue(decision["approved"])
+        self.assertEqual(second_decision["decision"], "APPROVE")
+        self.assertIs(reused, reviewed)
+
+    def test_initial_mini_5_5_timeout_never_falls_back_to_local_approval(self) -> None:
+        config = self._config()
+        config["ai"]["okx"]["auto_lc_okx_review_once_enabled"] = True
+        config["ai"]["okx"]["approval_enabled"] = True
+
+        with patch(
+            "crypto_trader.ai_coordinator._openai_json_decision",
+            side_effect=TimeoutError("GPT-5.5 timed out"),
+        ):
+            decision = okx_ai_approval(
+                config,
+                _candidate("SOL/USDT:USDT"),
+                RiskCheck(True, [], []),
+                context={
+                    "route": "lc_okx_setup_review",
+                    "source": "mini_lc_okx",
+                    "from_status": "MINI_APPROVED",
+                    "mini_setup_id": "setup-08",
+                },
+            )
+
+        self.assertFalse(decision["approved"])
+        self.assertEqual(decision["decision"], "external_ai_unavailable")
+        self.assertFalse(decision["gpt55_checked"])
+        self.assertNotEqual(decision["provider"], "local_policy")
+
+    def test_reuses_recent_keep_monitor_okx_setup_review_without_recalling_ai(self) -> None:
+        config = self._config()
+        candidate = _candidate("SUI/USDT:USDT")
+        check = RiskCheck(True, [], [])
+        rejected = {
+            "approved": False,
+            "decision": "REJECT",
+            "reason": "Missing 4h bias and 15m confirmation; keep watching",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "model_version": "gpt-5.5",
+            "prompt_version": "prompt-v1",
+            "prompt_hash": "abc123",
+            "experiment_name": None,
+        }
+
+        with (
+            patch("crypto_trader.ai_coordinator.okx_ai_approval", return_value=rejected) as approval,
+            patch("crypto_trader.ai_coordinator.reject_lc_pipeline_setup") as reject_setup,
+        ):
+            first_candidate, first_decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                check,
+                context={
+                    "route": "lc_okx_setup_review",
+                    "lc_id": 63,
+                    "source": "mini_lc_okx",
+                    "from_status": "MINI_APPROVED",
+                },
+            )
+            second_candidate, second_decision = review_candidate_for_lc_okx(
+                config,
+                _candidate("SUI/USDT:USDT"),
+                check,
+                context={
+                    "route": "lc_okx_setup_review",
+                    "lc_id": 64,
+                    "source": "mini_lc_okx",
+                    "from_status": "MINI_APPROVED",
+                },
+            )
+
+        approval.assert_called_once()
+        reject_setup.assert_not_called()
+        self.assertFalse(first_decision["approved"])
+        self.assertFalse(second_decision["approved"])
+        self.assertTrue(second_decision.get("cached"))
+        self.assertEqual(second_decision.get("rejection_policy"), "keep_monitor")
+        self.assertTrue(second_decision.get("accepted_for_okx"))
+        self.assertEqual(second_decision.get("review_state"), "GPT55_KEEP_SETUP")
+        self.assertEqual(second_decision["reason"], rejected["reason"])
+        self.assertIsNotNone(first_candidate.decision_metadata.get("okx_review"))
+        self.assertIsNotNone(second_candidate.decision_metadata.get("okx_review"))
+
+    def test_distinct_mini_setup_ids_never_reuse_symbol_side_review_cache(self) -> None:
+        config = self._config()
+        first = _candidate("SUI/USDT:USDT")
+        second = _candidate("SUI/USDT:USDT")
+        first.decision_metadata = {"mini_setup": {"setup_id": "slot-04-sui"}}
+        second.decision_metadata = {"mini_setup": {"setup_id": "slot-08-sui"}}
+        check = RiskCheck(True, [], [])
+        decisions = [
+            {
+                "approved": False,
+                "decision": "KEEP_SETUP",
+                "reason": "Keep the 04:00 setup",
+                "rejection_policy": "keep_monitor",
+            },
+            {
+                "approved": False,
+                "decision": "DELETE_SETUP",
+                "reason": "Delete the 08:00 setup",
+                "rejection_policy": "hard_delete",
+            },
+        ]
+
+        with (
+            patch("crypto_trader.ai_coordinator.okx_ai_approval", side_effect=decisions) as approval,
+            patch("crypto_trader.ai_coordinator.reject_lc_pipeline_setup"),
+        ):
+            _, first_decision = review_candidate_for_lc_okx(
+                config,
+                first,
+                check,
+                context={"route": "lc_okx_setup_review", "source": "mini_lc_okx", "from_status": "MINI_APPROVED"},
+            )
+            _, second_decision = review_candidate_for_lc_okx(
+                config,
+                second,
+                check,
+                context={"route": "lc_okx_setup_review", "source": "mini_lc_okx", "from_status": "MINI_APPROVED"},
+            )
+
+        self.assertEqual(approval.call_count, 2)
+        self.assertEqual(first_decision["reason"], "Keep the 04:00 setup")
+        self.assertEqual(second_decision["reason"], "Delete the 08:00 setup")
+        self.assertFalse(second_decision.get("cached", False))
+
+    def test_reuses_old_hard_rejected_okx_setup_review_without_recalling_ai(self) -> None:
+        config = self._config()
+        candidate = _candidate("CRV/USDT:USDT")
+        check = RiskCheck(True, [], [])
+        rejected = {
+            "approved": False,
+            "decision": "REJECT",
+            "reason": "Thiếu bias 4h/confirm 15m, entry xung đột và volume quá yếu",
+            "reason": "Entry conflict with higher timeframe and volume 0",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "reviewed_at": "2026-07-14T01:02:50+00:00",
+        }
+        set_journal_state(
+            config,
+            OKX_REVIEW_CACHE_STATE_KEY,
+            json.dumps({"lc_okx_setup_review|CRV/USDT:USDT|LONG": rejected}, ensure_ascii=False),
+        )
+
+        with (
+            patch("crypto_trader.ai_coordinator.okx_ai_approval") as approval,
+            patch("crypto_trader.ai_coordinator.reject_lc_pipeline_setup") as reject_setup,
+        ):
+            reviewed, decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                check,
+                context={"route": "lc_okx_setup_review", "lc_id": 26},
+            )
+
+        approval.assert_not_called()
+        reject_setup.assert_called_once()
+        self.assertFalse(decision["approved"])
+        self.assertTrue(decision.get("cached"))
+        self.assertEqual(decision["reason"], rejected["reason"])
+        self.assertIsNotNone(reviewed.decision_metadata.get("okx_review"))
+
+    def test_old_keep_monitor_okx_setup_review_does_not_recheck_after_cooldown(self) -> None:
+        config = self._config()
+        candidate = _candidate("AAVE/USDT:USDT")
+        check = RiskCheck(True, [], [])
+        rejected = {
+            "approved": False,
+            "decision": "REJECT",
+            "reason": "Missing 4h bias and 15m confirmation; keep watching",
+            "rejection_policy": "keep_monitor",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "reviewed_at": "2026-07-14T01:02:50+00:00",
+        }
+        set_journal_state(
+            config,
+            OKX_REVIEW_CACHE_STATE_KEY,
+            json.dumps({"lc_okx_setup_review|AAVE/USDT:USDT|LONG": rejected}, ensure_ascii=False),
+        )
+
+        with patch("crypto_trader.ai_coordinator.okx_ai_approval") as approval:
+            _, decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                check,
+                context={"route": "lc_okx_setup_review", "lc_id": 27},
+            )
+
+        approval.assert_not_called()
+        self.assertFalse(decision["approved"])
+        self.assertEqual(decision.get("rejection_policy"), "keep_monitor")
+        self.assertTrue(decision.get("accepted_for_okx"))
+
+    def test_recent_keep_monitor_metadata_does_not_reask_or_refresh_reviewed_at(self) -> None:
+        config = self._config()
+        candidate = _candidate("INJ/USDT:USDT")
+        reviewed_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        candidate.decision_metadata = {
+            "okx_review": {
+                "route": "lc_okx_setup_review",
+                "approved": False,
+                "decision": "GIU_THEO_DOI",
+                "reason": "5.5 giu setup de theo doi them",
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "rejection_policy": "keep_monitor",
+                "review_state": "GPT55_KEEP_SETUP",
+                "accepted_for_okx": True,
+                "reviewed_at": reviewed_at,
+            }
+        }
+
+        with patch("crypto_trader.ai_coordinator.okx_ai_approval") as approval:
+            reviewed, decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                RiskCheck(True, [], []),
+                context={"route": "lc_okx_setup_review", "lc_id": 28},
+            )
+
+        approval.assert_not_called()
+        self.assertFalse(decision["approved"])
+        self.assertTrue(decision.get("accepted_for_okx"))
+        self.assertEqual(decision.get("review_state"), "GPT55_KEEP_SETUP")
+        self.assertEqual(decision["reviewed_at"], reviewed_at)
+        self.assertEqual(reviewed.decision_metadata["okx_review"]["reviewed_at"], reviewed_at)
+
+    def test_old_keep_monitor_metadata_does_not_reask_after_recheck_cooldown(self) -> None:
+        config = self._config()
+        candidate = _candidate("INJ/USDT:USDT")
+        candidate.decision_metadata = {
+            "okx_review": {
+                "route": "lc_okx_setup_review",
+                "approved": False,
+                "decision": "GIU_THEO_DOI",
+                "reason": "5.5 giu setup de theo doi them",
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "rejection_policy": "keep_monitor",
+                "review_state": "GPT55_KEEP_SETUP",
+                "accepted_for_okx": True,
+                "reviewed_at": (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat(),
+            }
+        }
+
+        with patch("crypto_trader.ai_coordinator.okx_ai_approval") as approval:
+            _, decision = review_candidate_for_lc_okx(
+                config,
+                candidate,
+                RiskCheck(True, [], []),
+                context={"route": "lc_okx_setup_review", "lc_id": 29},
+            )
+
+        approval.assert_not_called()
+        self.assertFalse(decision["approved"])
+        self.assertEqual(decision.get("rejection_policy"), "keep_monitor")
+        self.assertTrue(decision.get("accepted_for_okx"))
+
+    def test_internal_market_scan_runs_once_per_fixed_slot(self) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+        config["ai"]["internal"]["market_scan_interval_seconds"] = 14400
+        now = datetime(2026, 7, 4, 13, 30, tzinfo=timezone.utc)
+        slot_id = datetime(2026, 7, 4, 13, 0, tzinfo=timezone.utc).isoformat()
+        save_lc_pipeline_mini_scan(
+            config,
+            {"created_at": now.isoformat(), "slot_id": slot_id, "status": "done", "approved_symbols": []},
+        )
+
+        self.assertFalse(internal_market_scan_due(config, now=now))
+
+    @patch("crypto_trader.ai_coordinator._openai_internal_market_scan")
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    def test_internal_market_scan_force_reuses_existing_fixed_slot(self, fetch_top_volume_symbols, openai_internal_market_scan) -> None:
+        config = self._config()
+        config["ai"]["internal"]["provider"] = "openai"
+        config["ai"]["internal"]["market_scan_use_ai"] = True
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+        config["ai"]["internal"]["market_scan_interval_seconds"] = 14400
+        now = datetime.now(timezone.utc)
+        slot_id = _internal_market_scan_slot_id(config, now)
+        save_lc_pipeline_mini_scan(
+            config,
+            {
+                "created_at": now.isoformat(),
+                "slot_id": slot_id,
+                "status": "done",
+                "pool_symbols": ["BTC/USDT:USDT"],
+                "selected_symbols": ["BTC/USDT:USDT"],
+                "approved_symbols": ["BTC/USDT:USDT"],
+                "ai_review": {
+                    "decision": "LC",
+                    "approved_symbols": ["BTC/USDT:USDT"],
+                },
+            },
+        )
+
+        result = run_internal_market_scan(config, force=True)
+
+        fetch_top_volume_symbols.assert_not_called()
+        openai_internal_market_scan.assert_not_called()
+        self.assertTrue(result["skipped"])
+        self.assertTrue(result["duplicate_slot_guard"])
+        self.assertEqual(result["skip_reason"], f"mini scan already ran for slot {slot_id}")
+        self.assertEqual(result["selected_symbols"], ["BTC/USDT:USDT"])
+
+    @patch("crypto_trader.ai_coordinator._openai_internal_market_scan")
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    @patch("crypto_trader.ai_coordinator.acquire_journal_lease", return_value=False)
+    def test_internal_market_scan_slot_lease_blocks_duplicate_ai_call(
+        self,
+        acquire_journal_lease,
+        fetch_top_volume_symbols,
+        openai_internal_market_scan,
+    ) -> None:
+        config = self._config()
+        config["ai"]["internal"]["provider"] = "openai"
+        config["ai"]["internal"]["market_scan_use_ai"] = True
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+
+        result = run_internal_market_scan(config, force=True)
+
+        acquire_journal_lease.assert_called_once()
+        fetch_top_volume_symbols.assert_not_called()
+        openai_internal_market_scan.assert_not_called()
+        self.assertTrue(result["skipped"])
+        self.assertTrue(result["slot_lease_guard"])
+
+    @patch("crypto_trader.ai_coordinator.notify_mini_pool_summary")
+    @patch("crypto_trader.ai_coordinator.release_journal_lease", side_effect=RuntimeError("release timeout"))
+    @patch("crypto_trader.ai_coordinator.acquire_journal_lease", return_value=True)
+    @patch("crypto_trader.ai_coordinator.recent_market_scan_memory")
+    @patch("crypto_trader.ai_coordinator.enrich_quantities")
+    @patch("crypto_trader.ai_coordinator.apply_position_sizing")
+    @patch("crypto_trader.ai_coordinator.build_candidates")
+    @patch("crypto_trader.ai_coordinator.market_guard_symbol_layers")
+    @patch("crypto_trader.ai_coordinator.fetch_market_snapshots")
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    @patch("crypto_trader.ai_coordinator.collect_news")
+    def test_internal_market_scan_ignores_slot_lease_release_error(
+        self,
+        collect_news,
+        fetch_top_volume_symbols,
+        fetch_market_snapshots,
+        market_guard_symbol_layers,
+        build_candidates,
+        apply_position_sizing,
+        enrich_quantities,
+        recent_market_scan_memory_mock,
+        acquire_journal_lease,
+        release_journal_lease,
+        notify_mini_pool_summary,
+    ) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+        collect_news.return_value = {}
+        fetch_top_volume_symbols.return_value = (["BTC/USDT:USDT"], [])
+        fetch_market_snapshots.return_value = ([], [])
+        market_guard_symbol_layers.return_value = {}
+        build_candidates.return_value = []
+        apply_position_sizing.return_value = None
+        enrich_quantities.return_value = []
+        recent_market_scan_memory_mock.return_value = {}
+
+        result = run_internal_market_scan(config, force=True)
+
+        self.assertIn(result["status"], {"waiting_lc", "ai_rejected"})
+        acquire_journal_lease.assert_called_once()
+        release_journal_lease.assert_called_once()
+        notify_mini_pool_summary.assert_called_once()
+
+    def test_internal_market_scan_not_due_when_current_four_hour_pool_is_empty(self) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+        config["ai"]["internal"]["market_scan_interval_seconds"] = 14400
+        config["ai"]["internal"]["market_scan_timezone"] = "UTC"
+        now = datetime(2026, 7, 4, 12, 1, tzinfo=timezone.utc)
+        set_journal_state(
+            config,
+            "lc_internal_pipeline_state",
+            json.dumps(
+                {
+                    "state_version": 3,
+                    "day_key": "2026-07-04",
+                    "four_hour_history": [
+                        {
+                            "frame": "4h",
+                            "slot": "2026-07-04T12:00:00+00:00",
+                            "approved": [],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        self.assertFalse(internal_market_scan_due(config, now=now))
+
+    def test_internal_market_scan_due_after_slot_tolerance_when_four_hour_pool_has_candidates(self) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_fixed_schedule"] = True
+        config["ai"]["internal"]["market_scan_interval_seconds"] = 14400
+        config["ai"]["internal"]["market_scan_slot_tolerance_minutes"] = 3
+        config["ai"]["internal"]["market_scan_timezone"] = "UTC"
+        now = datetime(2026, 7, 4, 12, 55, tzinfo=timezone.utc)
+        set_journal_state(
+            config,
+            "lc_internal_pipeline_state",
+            json.dumps(
+                {
+                    "state_version": 3,
+                    "day_key": "2026-07-04",
+                    "latest_mini_scan": {
+                        "slot_id": "2026-07-04T08:00:00+00:00",
+                        "created_at": "2026-07-04T08:02:00+00:00",
+                    },
+                    "four_hour_history": [
+                        {
+                            "frame": "4h",
+                            "slot": "2026-07-04T12:00:00+00:00",
+                            "approved": [{"symbol": "UB/USDT:USDT", "side": "long"}],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        self.assertTrue(internal_market_scan_due(config, now=now))
+
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    def test_internal_market_scan_skips_without_fetching_when_four_hour_pool_is_empty(self, fetch_top_volume_symbols) -> None:
+        config = self._config()
+
+        with patch(
+            "crypto_trader.ai_coordinator._empty_current_four_hour_event_for_market_scan",
+            return_value={"slot": "2026-07-04T12:00:00+00:00", "index": 5, "approved": []},
+        ):
+            result = run_internal_market_scan(config, force=True)
+
+        fetch_top_volume_symbols.assert_not_called()
+        self.assertTrue(result["skipped"])
+        self.assertTrue(result["suppress_pending_notification"])
+        self.assertEqual(result["approved_symbols"], [])
+
+    def test_saved_no_trade_scan_cannot_reach_lc_okx(self) -> None:
+        config = self._config()
+        set_journal_state(
+            config,
+            "lc_internal_pipeline_state",
+            json.dumps(
+                {
+                    "state_version": 3,
+                    "day_key": "2026-07-12",
+                    "four_hour_history": [
+                        {
+                            "frame": "4h",
+                            "slot": "2026-07-12T00:00:00+07:00",
+                            "approved": [{"symbol": "CRV/USDT:USDT"}],
+                        }
+                    ],
+                    "latest_mini_scan": {
+                        "created_at": "2026-07-11T17:00:56+00:00",
+                        "slot_id": "2026-07-11T17:00:00+00:00",
+                        "status": "done",
+                        "pool_symbols": ["CRV/USDT:USDT"],
+                        "selected_symbols": ["CRV/USDT:USDT"],
+                        "approved_symbols": ["CRV/USDT:USDT"],
+                        "ai_review": {
+                            "decision": "NO_TRADE",
+                            "approved_symbols": [],
+                            "reason": "Setup rejected",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        scan = latest_lc_pipeline_mini_scan(config)
+
+        self.assertEqual(scan["status"], "ai_rejected")
+        self.assertEqual(scan["selected_symbols"], [])
+        self.assertEqual(scan["approved_symbols"], [])
+        self.assertIn("NO_TRADE", scan["skip_reason"])
+
+    @patch("crypto_trader.ai_coordinator.notify_mini_pool_summary")
+    @patch("crypto_trader.ai_coordinator.recent_market_scan_memory")
+    @patch("crypto_trader.ai_coordinator.enrich_quantities")
+    @patch("crypto_trader.ai_coordinator.apply_position_sizing")
+    @patch("crypto_trader.ai_coordinator.build_candidates")
+    @patch("crypto_trader.ai_coordinator.market_guard_symbol_layers")
+    @patch("crypto_trader.ai_coordinator.fetch_market_snapshots")
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    @patch("crypto_trader.ai_coordinator.collect_news")
+    def test_internal_market_scan_sends_latest_four_hour_symbols_directly_to_mini(
+        self,
+        collect_news,
+        fetch_top_volume_symbols,
+        fetch_market_snapshots,
+        market_guard_symbol_layers,
+        build_candidates,
+        apply_position_sizing,
+        enrich_quantities,
+        recent_market_scan_memory_mock,
+        notify_mini_pool_summary,
+    ) -> None:
+        config = self._config()
+        now = datetime.now(timezone.utc)
+        slot_id = _internal_market_scan_slot_id(config, now)
+        set_journal_state(
+            config,
+            "lc_internal_pipeline_state",
+            json.dumps(
+                {
+                    "state_version": 3,
+                    "day_key": now.astimezone(timezone(timedelta(hours=7))).date().isoformat(),
+                    "four_hour_history": [
+                        {
+                            "frame": "4h",
+                            "slot": slot_id,
+                            "created_at": slot_id,
+                            "index": 1,
+                            "approved": [{"symbol": "LIT/USDT:USDT", "side": "LONG", "win_probability_pct": 65.0}],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        result = run_internal_market_scan(config, force=True)
+
+        collect_news.assert_not_called()
+        fetch_top_volume_symbols.assert_not_called()
+        fetch_market_snapshots.assert_not_called()
+        market_guard_symbol_layers.assert_not_called()
+        build_candidates.assert_not_called()
+        apply_position_sizing.assert_not_called()
+        enrich_quantities.assert_not_called()
+        recent_market_scan_memory_mock.assert_not_called()
+        self.assertEqual(result["source"], "latest_lc_4h")
+        self.assertEqual(result["pool_symbols"], ["LIT/USDT:USDT"])
+        self.assertEqual(result["selected_symbols"], ["LIT/USDT:USDT"])
+        notify_mini_pool_summary.assert_called_once()
+
+    @patch("crypto_trader.ai_coordinator.notify_mini_pool_summary")
+    @patch("crypto_trader.ai_coordinator.recent_market_scan_memory")
+    @patch("crypto_trader.ai_coordinator.enrich_quantities")
+    @patch("crypto_trader.ai_coordinator.apply_position_sizing")
+    @patch("crypto_trader.ai_coordinator.build_candidates")
+    @patch("crypto_trader.ai_coordinator.market_guard_symbol_layers")
+    @patch("crypto_trader.ai_coordinator.fetch_market_snapshots")
+    @patch("crypto_trader.ai_coordinator.fetch_top_volume_symbols")
+    @patch("crypto_trader.ai_coordinator.collect_news")
+    def test_internal_market_scan_no_longer_runs_position_sizing_prefilter(
+        self,
+        collect_news,
+        fetch_top_volume_symbols,
+        fetch_market_snapshots,
+        market_guard_symbol_layers,
+        build_candidates,
+        apply_position_sizing,
+        enrich_quantities,
+        recent_market_scan_memory_mock,
+        notify_mini_pool_summary,
+    ) -> None:
+        config = self._config()
+        now = datetime.now(timezone.utc)
+        slot_id = _internal_market_scan_slot_id(config, now)
+        set_journal_state(
+            config,
+            "lc_internal_pipeline_state",
+            json.dumps(
+                {
+                    "state_version": 3,
+                    "day_key": now.astimezone(timezone(timedelta(hours=7))).date().isoformat(),
+                    "four_hour_history": [
+                        {
+                            "frame": "4h",
+                            "slot": slot_id,
+                            "created_at": slot_id,
+                            "index": 1,
+                            "approved": [{"symbol": "BTC/USDT:USDT", "side": "LONG", "win_probability_pct": 88.0}],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        apply_position_sizing.side_effect = RuntimeError("read operation timed out")
+
+        result = run_internal_market_scan(config, force=True)
+
+        collect_news.assert_not_called()
+        fetch_top_volume_symbols.assert_not_called()
+        fetch_market_snapshots.assert_not_called()
+        market_guard_symbol_layers.assert_not_called()
+        build_candidates.assert_not_called()
+        apply_position_sizing.assert_not_called()
+        enrich_quantities.assert_not_called()
+        recent_market_scan_memory_mock.assert_not_called()
+        self.assertEqual(result["pool_symbols"], ["BTC/USDT:USDT"])
+        self.assertEqual(result["warnings"], [])
+        notify_mini_pool_summary.assert_called_once()
+
+    def test_candidate_summary_separates_4h_context_from_code_timeframes(self) -> None:
+        candidate = _candidate("BTC/USDT:USDT")
+        candidate.higher_timeframes = {
+            "5m": {
+                "trend": "up",
+                "candlestick_patterns": {
+                    "patterns": ["bullish_marubozu"],
+                    "bullish_score": 1.4,
+                    "bearish_score": 0.0,
+                    "direction": "bullish",
+                    "strongest_pattern": "bullish_marubozu",
+                    "signal_summary": "bullish_marubozu supports a bullish read against up trend context",
+                },
+            },
+            "15m": {
+                "trend": "up",
+                "candlestick_patterns": {
+                    "patterns": ["hammer"],
+                    "bullish_score": 1.8,
+                    "bearish_score": 0.0,
+                    "direction": "bullish",
+                    "strongest_pattern": "hammer",
+                    "signal_summary": "hammer supports a bullish read against down trend context",
+                },
+            },
+            "1h": {
+                "trend": "up",
+                "candlestick_patterns": {
+                    "patterns": ["morning_star"],
+                    "bullish_score": 3.5,
+                    "bearish_score": 0.0,
+                    "direction": "bullish",
+                    "strongest_pattern": "morning_star",
+                    "signal_summary": "morning_star supports a bullish read against down trend context",
+                },
+            },
+            "4h": {
+                "trend": "down",
+                "rsi": 41.0,
+                "candlestick_patterns": {
+                    "patterns": ["inverted_hammer"],
+                    "bullish_score": 1.7,
+                    "bearish_score": 0.0,
+                    "direction": "bullish",
+                    "trend_context": "down",
+                    "strongest_pattern": "inverted_hammer",
+                    "signal_summary": "inverted_hammer supports a bullish read against down trend context",
+                },
+            },
+        }
+
+        summary = _candidate_market_summary(candidate)
+
+        self.assertEqual(summary["mini_context_4h"]["timeframe"], "4h")
+        self.assertEqual(summary["mini_context_4h"]["strongest_pattern"], "inverted_hammer")
+        self.assertEqual({item["timeframe"] for item in summary["code_timeframe_analysis"]}, {"5m", "15m", "1h"})
+
+    def test_local_market_scan_always_keeps_at_least_one_top_candidate(self) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_max_symbols"] = 3
+        config["ai"]["internal"]["market_scan_min_approved_symbols"] = 1
+        config["ai"]["internal"]["market_scan_min_win_probability_pct"] = 90
+
+        result = _local_market_scan_result(
+            config,
+            [
+                _candidate("BTC/USDT:USDT", win=64.0),
+                _candidate("ETH/USDT:USDT", win=70.0),
+                _candidate("SOL/USDT:USDT", win=68.0),
+            ],
+            [],
+        )
+
+        self.assertEqual(result["qualified_symbols"], [])
+        self.assertEqual(result["approved_symbols"], ["ETH/USDT:USDT"])
+        self.assertEqual(
+            result["selection_checks"],
+            ["win_rate", "setup_quality", "trend_alignment", "indicator_strength"],
+        )
+
+    def test_local_market_scan_ranks_by_setup_trend_and_indicators_not_only_win_rate(self) -> None:
+        config = self._config()
+        config["ai"]["internal"]["market_scan_max_symbols"] = 1
+        config["ai"]["internal"]["market_scan_min_approved_symbols"] = 1
+        config["ai"]["internal"]["market_scan_min_win_probability_pct"] = 60
+
+        weak_high_win = _candidate("BTC/USDT:USDT", win=72.0)
+        weak_high_win.rule_score = 70.0
+        weak_high_win.indicator_summary = {"volume_ratio": 0.6, "rsi": 79.0, "spread_pct": 0.05, "trend": "down"}
+        weak_high_win.higher_timeframes = {
+            "1h": {"trend": "down", "candlestick_patterns": {"direction": "bearish", "patterns": ["shooting_star"]}},
+            "4h": {"trend": "down", "candlestick_patterns": {"direction": "bearish", "patterns": ["engulfing"]}},
+        }
+        weak_high_win.candlestick_patterns = {"1m": {"direction": "bearish", "patterns": ["doji"]}}
+
+        strong_lower_win = _candidate("ETH/USDT:USDT", win=69.0)
+        strong_lower_win.rule_score = 96.0
+        strong_lower_win.indicator_summary = {"volume_ratio": 2.4, "rsi": 58.0, "spread_pct": 0.01, "trend": "up"}
+        strong_lower_win.higher_timeframes = {
+            "1h": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["morning_star"]}},
+            "4h": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["hammer"]}},
+        }
+        strong_lower_win.candlestick_patterns = {"1m": {"direction": "bullish", "patterns": ["bullish_engulfing"]}}
+
+        result = _local_market_scan_result(config, [weak_high_win, strong_lower_win], [])
+
+        self.assertEqual(result["approved_symbols"], ["ETH/USDT:USDT"])
+
+    def test_validated_ai_symbols_respects_single_pending_limit(self) -> None:
+        symbols = _validated_ai_symbols(
+            {"approved_symbols": ["ETH/USDT:USDT", "BTC/USDT:USDT"]},
+            {"ETH/USDT:USDT", "BTC/USDT:USDT"},
+            ["BTC/USDT:USDT"],
+            1,
+        )
+
+        self.assertEqual(symbols, ["ETH/USDT:USDT"])
+
+    def test_validated_ai_symbols_keeps_explicit_no_trade_empty(self) -> None:
+        symbols = _validated_ai_symbols(
+            {"approved_symbols": [], "decision": "NO_TRADE"},
+            {"CRV/USDT:USDT"},
+            ["CRV/USDT:USDT"],
+            1,
+        )
+
+        self.assertEqual(symbols, [])
+
+    def test_mini_no_trade_reason_names_pair_score_and_reasons_in_vietnamese(self) -> None:
+        reason = _mini_ai_reason_vi(
+            {
+                "approved_symbols": [],
+                "decision": "NO_TRADE",
+                "setup_scores": {"CRV/USDT:USDT": 34},
+                "reason": "Critical health state; 4h absent and 5m/1h conflict. RR 1.5 with missing volume support; reject.",
+            },
+            ["CRV/USDT:USDT"],
+            [],
+        )
+
+        self.assertIn("Mini loại CRV", reason)
+        self.assertIn("CRV 34/100", reason)
+        self.assertIn("sức khỏe hệ thống đang ở mức nghiêm trọng", reason)
+        self.assertIn("thiếu dữ liệu hoặc xác nhận xu hướng 4h", reason)
+        self.assertIn("xu hướng 5m và 1h xung đột", reason)
+        self.assertIn("thiếu volume xác nhận", reason)
+
+    def test_compact_candidate_summary_limits_payload_noise(self) -> None:
+        candidate = _candidate("BTC/USDT:USDT")
+        candidate.indicator_summary = {
+            "last": 100,
+            "ema_fast": 99,
+            "ema_slow": 98,
+            "rsi": 58.123,
+            "atr": 2.0,
+            "atr_pct": 1.23456,
+            "volume_ratio": 1.4567,
+            "support": 96,
+            "resistance": 104,
+            "spread_pct": 0.01234,
+            "candlestick_patterns": {
+                "1m": {"patterns": ["doji"], "pattern_details": ["raw"] * 20},
+                "4h": {
+                    "patterns": ["morning_star", "hammer", "dragonfly_doji", "extra"],
+                    "direction": "bullish",
+                    "strongest_pattern": "morning_star",
+                    "signal_summary": "4h bullish reversal",
+                    "pattern_details": ["raw"] * 20,
+                },
+            },
+            "market_pattern": {
+                "snapshot_id": "mp-1",
+                "timeframe": "4h",
+                "trend_regime": "bullish",
+                "structure_state": "HH/HL",
+                "confluence_bias": "bullish",
+                "confluence_score": 0.72,
+                "candlestick_count": 2,
+                "candlestick_patterns": [
+                    {"pattern": "bullish_engulfing", "direction": "bullish", "confidence": 0.81},
+                    {"pattern": "hammer", "direction": "bullish", "confidence": 0.74},
+                ],
+            },
+            "higher_timeframes": {
+                "1m": {"trend": "up", "candles": [1] * 100},
+                "1h": {"trend": "up", "rsi": 55.4, "range_position": "mid", "candles": [1] * 100},
+                "4h": {"trend": "up", "rsi": 61.2, "range_position": "low", "candles": [1] * 100},
+            },
+        }
+        candidate.reasons = ["r1", "r2", "r3", "r4"]
+        candidate.warnings = ["w1", "w2", "w3"]
+        memory = {
+            "BTC/USDT:USDT": {
+                "1m": [{"timeframe": "1m"}],
+                "5m": [{"timeframe": "5m"}, {"timeframe": "5m-old"}],
+                "1h": [{"timeframe": "1h"}],
+            }
+        }
+
+        summary = _candidate_market_summary(candidate, scan_memory_by_symbol=memory, compact=True)
+
+        self.assertNotIn("candlestick_patterns", summary)
+        self.assertNotIn("1m", summary["rolling_scan_memory"])
+        self.assertEqual(len(summary["rolling_scan_memory"]["5m"]), 1)
+        indicator = summary["indicator_summary"]
+        self.assertEqual(indicator["rsi"], 58.12)
+        self.assertEqual(indicator["volume_ratio"], 1.457)
+        self.assertIn("resistance_distance_pct", indicator)
+        self.assertNotIn("atr", indicator)
+        self.assertNotIn("1m", indicator["higher_timeframes"])
+        self.assertNotIn("candles", indicator["higher_timeframes"]["1h"])
+        self.assertNotIn("1m", indicator["candlestick_patterns"])
+        self.assertNotIn("pattern_details", indicator["candlestick_patterns"]["4h"])
+        self.assertEqual(indicator["candlestick_patterns"]["4h"]["patterns"], ["morning_star", "hammer", "dragonfly_doji"])
+        self.assertEqual(indicator["market_pattern"]["snapshot_id"], "mp-1")
+        self.assertEqual(indicator["market_pattern"]["candlestick_patterns"][0]["pattern"], "bullish_engulfing")
+        self.assertEqual(summary["reasons"], ["r1", "r2", "r3"])
+        self.assertEqual(summary["warnings"], ["w1", "w2"])
+
+    def test_okx_candidate_summary_reduces_trade_fields_and_adds_setup_checks(self) -> None:
+        config = self._config()
+        candidate = _candidate("SUI/USDT:USDT")
+        candidate.spread_pct = 0.09
+        candidate.news_score = 0.5
+        candidate.news_count = 1
+        candidate.indicator_summary = {
+            "volume_ratio": 0.774,
+            "spread_pct": 0.09,
+            "higher_timeframes": {
+                "5m": {"trend": "up"},
+                "1h": {"trend": "up"},
+                "4h": {"trend": "down"},
+            },
+            "candlestick_patterns": {
+                "5m": {"direction": "bullish", "patterns": ["bullish_engulfing"], "signal_summary": "5m supports long"},
+                "1h": {"direction": "bullish", "patterns": ["morning_star"], "signal_summary": "1h supports long"},
+                "4h": {"direction": "bearish", "patterns": ["bearish_engulfing"], "signal_summary": "4h opposes long"},
+            },
+            "market_pattern": {
+                "snapshot_id": "mp-okx-1",
+                "timeframe": "4h",
+                "trend_regime": "range",
+                "confluence_bias": "neutral",
+                "confluence_score": 0.44,
+                "candlestick_count": 1,
+                "chart_pattern_count": 1,
+                "candlestick_patterns": [
+                    {"pattern": "doji", "direction": "neutral", "confidence": 0.66},
+                ],
+                "chart_patterns": [
+                    {"pattern": "triangle", "direction": "neutral", "confidence": 0.58},
+                ],
+            },
+        }
+        candidate.higher_timeframes = {
+            "5m": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["bullish_engulfing"]}},
+            "1h": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["morning_star"]}},
+            "4h": {"trend": "down", "candlestick_patterns": {"direction": "bearish", "patterns": ["bearish_engulfing"]}},
+        }
+        candidate.reasons = ["r1", "r2", "r3"]
+        candidate.warnings = ["w1", "w2", "w3"]
+
+        summary = _candidate_summary(candidate, config=config)
+
+        self.assertNotIn("quantity", summary)
+        self.assertNotIn("order_usdt", summary)
+        self.assertNotIn("planned_risk_usdt", summary)
+        self.assertNotIn("entry", summary)
+        self.assertNotIn("stop_loss", summary)
+        self.assertNotIn("take_profit", summary)
+        self.assertNotIn("reasons", summary)
+        self.assertNotIn("warnings", summary)
+        indicator = summary["indicator_summary"]
+        self.assertEqual(indicator["volume_ratio"], 0.774)
+        self.assertEqual(indicator["spread_pct"], 0.09)
+        self.assertEqual(indicator["higher_timeframes"]["4h"], {"trend": "down"})
+        self.assertEqual(
+            indicator["candlestick_patterns"]["4h"],
+            {"direction": "bearish", "patterns": ["bearish_engulfing"], "signal_summary": "4h opposes long"},
+        )
+        self.assertEqual(indicator["market_pattern"]["snapshot_id"], "mp-okx-1")
+        self.assertEqual(indicator["market_pattern"]["candlestick_patterns"][0]["pattern"], "doji")
+        self.assertEqual(indicator["market_pattern"]["chart_patterns"][0]["pattern"], "triangle")
+        self.assertNotIn("support_distance_pct", indicator)
+        checks = summary["setup_checks"]
+        self.assertEqual(checks["bias_4h"]["status"], "conflict")
+        self.assertFalse(checks["bias_4h"]["acceptable"])
+        self.assertEqual(checks["confirm_15m"]["status"], "missing")
+        self.assertFalse(checks["entry_confirmation"]["acceptable"])
+        self.assertEqual(checks["entry_confirmation"]["supportive_frames"], ["1h", "5m"])
+        self.assertEqual(checks["volume"]["status"], "weak")
+        self.assertFalse(checks["volume"]["acceptable"])
+        self.assertEqual(checks["risk_reward"]["status"], "weak")
+        self.assertFalse(checks["risk_reward"]["acceptable"])
+        self.assertEqual(checks["spread"]["status"], "ok")
+        self.assertTrue(checks["news"]["acceptable"])
+
+    def test_okx_candidate_summary_marks_neutral_4h_as_acceptable_bias(self) -> None:
+        config = self._config()
+        candidate = _candidate("ETH/USDT:USDT")
+        candidate.indicator_summary = {
+            "volume_ratio": 1.3,
+            "higher_timeframes": {
+                "15m": {"trend": "up"},
+                "1h": {"trend": "up"},
+                "4h": {"trend": "mixed"},
+            },
+            "candlestick_patterns": {
+                "15m": {"direction": "bullish", "patterns": ["hammer"]},
+                "1h": {"direction": "bullish", "patterns": ["morning_star"]},
+                "4h": {"direction": "neutral", "patterns": ["doji"]},
+            },
+        }
+        candidate.higher_timeframes = {
+            "15m": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["hammer"]}},
+            "1h": {"trend": "up", "candlestick_patterns": {"direction": "bullish", "patterns": ["morning_star"]}},
+            "4h": {"trend": "mixed", "candlestick_patterns": {"direction": "neutral", "patterns": ["doji"]}},
+        }
+
+        summary = _candidate_summary(candidate, config=config)
+
+        self.assertEqual(summary["setup_checks"]["bias_4h"]["status"], "neutral")
+        self.assertTrue(summary["setup_checks"]["bias_4h"]["acceptable"])
+        self.assertEqual(summary["setup_checks"]["confirm_15m"]["status"], "confirmed")
+        self.assertTrue(summary["setup_checks"]["entry_confirmation"]["acceptable"])
+
+    def test_recent_market_scan_memory_reuses_previous_timeframe_scans(self) -> None:
+        config = self._config()
+        candidate = _candidate("BTC/USDT:USDT")
+        candidate.indicator_summary = {"timeframe": "1m", "trend": "up"}
+        candidate.higher_timeframes = {
+            "5m": {"trend": "up", "candlestick_patterns": {"patterns": ["bullish_marubozu"], "bullish_score": 1.4}},
+            "1h": {"trend": "up", "candlestick_patterns": {"patterns": ["morning_star"], "bullish_score": 3.5}},
+            "4h": {"trend": "down", "candlestick_patterns": {"patterns": ["hammer"], "bullish_score": 1.8}},
+        }
+
+        save_market_scan_observations(config, [candidate], source="scan-1", limit=10)
+        save_market_scan_observations(config, [candidate], source="scan-2", limit=10)
+
+        memory = recent_market_scan_memory(
+            config,
+            symbols=["BTC/USDT:USDT"],
+            timeframes=["1m", "5m", "1h", "4h"],
+            lookback_hours=12,
+            per_symbol_timeframe_limit=2,
+        )
+
+        self.assertIn("BTC/USDT:USDT", memory)
+        self.assertEqual(len(memory["BTC/USDT:USDT"]["1m"]), 2)
+        self.assertEqual(len(memory["BTC/USDT:USDT"]["5m"]), 2)
+        self.assertEqual(len(memory["BTC/USDT:USDT"]["1h"]), 2)
+        self.assertEqual(len(memory["BTC/USDT:USDT"]["4h"]), 2)

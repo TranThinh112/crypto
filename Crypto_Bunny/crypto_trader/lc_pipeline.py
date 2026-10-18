@@ -1,0 +1,4639 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from .market import fetch_market_snapshots
+from .market_guard import market_guard_symbol_layers
+from .models import TradeCandidate, to_jsonable
+from .news import collect_news
+from .risk import active_trades_summary
+from .sizing import apply_position_sizing
+from .storage import (
+    clear_dashboard_snapshot_cache,
+    get_journal_state,
+    get_trading_system_state_row,
+    is_retryable_storage_error,
+    latest_decision_payload,
+    open_pending_symbols,
+    purge_deprecated_journal_state,
+    set_journal_state,
+)
+from .strategy import build_candidates, enrich_quantities
+
+
+LOGGER = logging.getLogger(__name__)
+
+LC_PIPELINE_STATE_KEY = "lc_internal_pipeline_state"
+LC_PIPELINE_INTERNAL_SYMBOLS_KEY = "lc_internal_pipeline_internal_symbols"
+LC_PIPELINE_LATEST_FOUR_HOUR_KEY = "lc_internal_pipeline_latest_four_hour"
+LC_PIPELINE_LATEST_FOUR_HOUR_SYMBOLS_KEY = "lc_internal_pipeline_latest_four_hour_symbols"
+LC_PIPELINE_LATEST_MINI_SCAN_KEY = "lc_internal_pipeline_latest_mini_scan"
+LC_PIPELINE_STATE_VERSION = 3
+DEFAULT_TWO_HOUR_ICON = "🟡"
+ONE_HOUR_ICON = "🔵"
+FOUR_HOUR_ICON = "🔴"
+MINI_ICON = "🟣"
+ONE_HOUR_HISTORY_KEEP_DAYS = 3
+TWO_HOUR_HISTORY_KEEP_DAYS = 3
+FOUR_HOUR_HISTORY_KEEP_DAYS = 7
+ONE_HOUR_HISTORY_MAX_EVENTS = 12
+TWO_HOUR_HISTORY_MAX_EVENTS = 8
+FOUR_HOUR_HISTORY_MAX_EVENTS = 8
+LC_PIPELINE_WINDOW_MAX_EVENTS = 2
+LC_PIPELINE_TELEGRAM_MAX_EVENTS = 20
+LC_PIPELINE_INTERNAL_NOTIFICATION_MAX_EVENTS = 30
+LC_PIPELINE_EVENT_APPROVED_MAX_ROWS = 6
+LC_PIPELINE_EVENT_REJECTED_MAX_ROWS = 4
+RECHECK_STABLE_DELTA_PCT = 1.0
+_LC_PIPELINE_UPDATE_LOCK = threading.RLock()
+_SAMPLE_SYMBOL_PATTERN = re.compile(r"\b([A-Z])\1{2,}(?:/USDT:USDT)?\b")
+# DEMO_RULE_TEST:
+# Giữ lại rule cũ trong comment ở dưới; hiện dùng rule_test để demo luồng pipeline.
+rule_test = 57
+LC_PIPELINE_RECOVERY_MODE_STEP_PCT = 2.0
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _sample_symbol_filter_enabled(config: dict[str, Any]) -> bool:
+    # Hard-lock sample-symbol filtering outside test mode so production cannot
+    # accidentally replay AAA/BBB/CCC rows because of stale config/state.
+    if not bool(config.get("_atlas_test_mode")):
+        return True
+    internal = config.get("ai", {}).get("internal", {})
+    return bool(internal.get("lc_pipeline_drop_sample_symbols", False))
+
+
+def _symbol_base(symbol: Any) -> str:
+    return str(symbol or "").split("/")[0].strip().upper()
+
+
+def _is_sample_symbol(config: dict[str, Any], symbol: Any) -> bool:
+    if not _sample_symbol_filter_enabled(config):
+        return False
+    base = _symbol_base(symbol)
+    return bool(base) and bool(re.fullmatch(r"([A-Z])\1{2,}", base))
+
+
+def _contains_sample_symbol_text(config: dict[str, Any], value: Any) -> bool:
+    if not _sample_symbol_filter_enabled(config):
+        return False
+    text = str(value or "")
+    for match in _SAMPLE_SYMBOL_PATTERN.finditer(text):
+        if _is_sample_symbol(config, match.group(0)):
+            return True
+    return False
+
+
+def _filter_sample_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row for row in rows
+        if isinstance(row, dict) and not _is_sample_symbol(config, row.get("symbol"))
+    ]
+
+
+def _sanitize_event_sample_rows(config: dict[str, Any], event: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if not isinstance(event, dict):
+        return {}, False
+    sanitized = dict(event)
+    changed = False
+    for key in ("approved", "rejected", "top"):
+        value = sanitized.get(key)
+        if not isinstance(value, list):
+            continue
+        filtered = _filter_sample_rows(config, value)
+        if len(filtered) != len(value):
+            sanitized[key] = filtered
+            changed = True
+    return sanitized, changed
+
+
+def _sanitize_internal_notifications(config: dict[str, Any], rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    sanitized: list[dict[str, Any]] = []
+    changed = False
+    for item in rows:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        if _contains_sample_symbol_text(config, item.get("title")):
+            changed = True
+            continue
+        filtered_lines = [
+            line for line in list(item.get("lines") or [])
+            if not _contains_sample_symbol_text(config, line)
+        ]
+        if len(filtered_lines) != len(list(item.get("lines") or [])):
+            changed = True
+        if filtered_lines:
+            sanitized.append({**item, "lines": filtered_lines})
+        else:
+            changed = True
+    return sanitized, changed
+
+
+def _sanitize_mini_scan_sample_symbols(config: dict[str, Any], scan: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if not isinstance(scan, dict):
+        return {}, False
+    sanitized = dict(scan)
+    changed = False
+    for key in ("source_symbols", "pool_symbols", "selected_symbols", "approved_symbols"):
+        value = sanitized.get(key)
+        if not isinstance(value, list):
+            continue
+        filtered = [symbol for symbol in value if not _is_sample_symbol(config, symbol)]
+        if len(filtered) != len(value):
+            sanitized[key] = filtered
+            changed = True
+    candidates = sanitized.get("candidates")
+    if isinstance(candidates, list):
+        filtered_candidates = _filter_sample_rows(config, candidates)
+        if len(filtered_candidates) != len(candidates):
+            sanitized["candidates"] = filtered_candidates
+            changed = True
+    local_policy = sanitized.get("local_policy")
+    if isinstance(local_policy, dict):
+        local_policy_sanitized = dict(local_policy)
+        for key in ("qualified_symbols", "approved_symbols"):
+            value = local_policy_sanitized.get(key)
+            if not isinstance(value, list):
+                continue
+            filtered = [symbol for symbol in value if not _is_sample_symbol(config, symbol)]
+            if len(filtered) != len(value):
+                local_policy_sanitized[key] = filtered
+                local_policy_sanitized["approved_count"] = len(local_policy_sanitized.get("approved_symbols") or [])
+                changed = True
+        sanitized["local_policy"] = local_policy_sanitized
+    return sanitized, changed
+
+
+def _sanitize_pipeline_state_sample_symbols(config: dict[str, Any], state: dict[str, Any]) -> bool:
+    if not _sample_symbol_filter_enabled(config):
+        return False
+    changed = False
+    for key in ("undecided", "internal_lc"):
+        value = state.get(key)
+        if isinstance(value, list):
+            filtered = _filter_sample_rows(config, value)
+            if len(filtered) != len(value):
+                state[key] = filtered
+                changed = True
+    for key in ("one_hour_history", "two_hour_history", "four_hour_history", "two_hour_windows", "telegram_events"):
+        value = state.get(key)
+        if not isinstance(value, list):
+            continue
+        sanitized_events: list[dict[str, Any]] = []
+        event_changed = False
+        for item in value:
+            if not isinstance(item, dict):
+                event_changed = True
+                continue
+            sanitized_item, item_changed = _sanitize_event_sample_rows(config, item)
+            if item_changed:
+                event_changed = True
+            sanitized_events.append(sanitized_item)
+        if event_changed:
+            state[key] = sanitized_events
+            changed = True
+    hourly_windows = state.get("hourly_windows")
+    if isinstance(hourly_windows, list):
+        sanitized_windows: list[dict[str, Any]] = []
+        window_changed = False
+        for item in hourly_windows:
+            if not isinstance(item, dict):
+                window_changed = True
+                continue
+            top_rows = item.get("top") if isinstance(item.get("top"), list) else []
+            filtered_top = _filter_sample_rows(config, top_rows)
+            if len(filtered_top) != len(top_rows):
+                window_changed = True
+                sanitized_windows.append({**item, "top": filtered_top})
+            else:
+                sanitized_windows.append(item)
+        if window_changed:
+            state["hourly_windows"] = sanitized_windows
+            changed = True
+    notifications = state.get("internal_notifications")
+    if isinstance(notifications, list):
+        filtered_notifications, notification_changed = _sanitize_internal_notifications(config, notifications)
+        if notification_changed:
+            state["internal_notifications"] = filtered_notifications
+            changed = True
+    latest_mini_scan = state.get("latest_mini_scan")
+    if isinstance(latest_mini_scan, dict):
+        sanitized_mini_scan, mini_scan_changed = _sanitize_mini_scan_sample_symbols(config, latest_mini_scan)
+        if mini_scan_changed:
+            state["latest_mini_scan"] = sanitized_mini_scan
+            changed = True
+    return changed
+
+
+def _pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
+    internal = config.get("ai", {}).get("internal", {})
+    shared_min_win = float(internal.get("lc_pipeline_min_win_probability_pct", 60) or 60)
+    promote_after_hours = max(1.0, float(internal.get("lc_pipeline_promote_after_hours", 6) or 6))
+    undecided_max_age_hours = max(
+        promote_after_hours,
+        float(
+            internal.get(
+                "lc_pipeline_undecided_max_age_hours",
+                max(12.0, promote_after_hours * 2),
+            )
+            or max(12.0, promote_after_hours * 2)
+        ),
+    )
+    return {
+        "enabled": bool(internal.get("lc_pipeline_enabled", True)),
+        "top_limit": max(1, min(3, int(internal.get("lc_pipeline_top_limit", 3) or 3))),
+        "undecided_max": max(3, int(internal.get("lc_pipeline_undecided_max", 6) or 6)),
+        "undecided_prune_floor": max(3, int(internal.get("lc_pipeline_undecided_prune_floor", 6) or 6)),
+        "undecided_prune_drop": max(1, int(internal.get("lc_pipeline_undecided_prune_drop", 3) or 3)),
+        "internal_lc_max": max(1, min(3, int(internal.get("lc_pipeline_internal_lc_max", 3) or 3))),
+        "promote_after_hours": promote_after_hours,
+        "undecided_max_age_hours": undecided_max_age_hours,
+        "recheck_interval_minutes": max(15, int(internal.get("lc_pipeline_recheck_interval_minutes", 90) or 90)),
+        "slot_tolerance_minutes": max(1, min(10, int(internal.get("lc_pipeline_slot_tolerance_minutes", 3) or 3))),
+        "min_win_probability_pct": shared_min_win,
+        "one_hour_min_win_probability_pct": float(
+            internal.get("lc_pipeline_one_hour_min_win_probability_pct", 58) or 58
+        ),
+        "two_hour_min_win_probability_pct": float(
+            internal.get("lc_pipeline_two_hour_min_win_probability_pct", shared_min_win) or shared_min_win
+        ),
+        "four_hour_min_win_probability_pct": float(
+            internal.get("lc_pipeline_four_hour_min_win_probability_pct", 62) or 62
+        ),
+        "relaxed_min_win_probability_pct": float(internal.get("lc_pipeline_relaxed_min_win_probability_pct", 55) or 55),
+        "relaxed_min_confidence": float(internal.get("lc_pipeline_relaxed_min_confidence", 70) or 70),
+        "relaxed_min_risk_reward": float(internal.get("lc_pipeline_relaxed_min_risk_reward", 1.5) or 1.5),
+        "notify_one_hour_summary": bool(internal.get("lc_pipeline_notify_one_hour_summary", True)),
+        "notify_two_hour_summary": bool(internal.get("lc_pipeline_notify_two_hour_summary", False)),
+        "notify_undecided_recheck_summary": bool(internal.get("lc_pipeline_notify_undecided_recheck_summary", True)),
+        "notify_mini_pool_summary": bool(internal.get("lc_pipeline_notify_mini_pool_summary", False)),
+        "promote_survivors": bool(
+            internal.get("lc_pipeline_promote_survivors", internal.get("lc_pipeline_promote_to_pending", True))
+        ),
+        "exhaustion_guard_enabled": bool(internal.get("lc_pipeline_exhaustion_guard_enabled", True)),
+        "exhaustion_guard_1h_min_signals": max(
+            1,
+            int(internal.get("lc_pipeline_exhaustion_guard_1h_min_signals", 3) or 3),
+        ),
+        "exhaustion_guard_2h_min_signals": max(
+            1,
+            int(internal.get("lc_pipeline_exhaustion_guard_2h_min_signals", 3) or 3),
+        ),
+        "exhaustion_guard_4h_min_signals": max(
+            1,
+            int(internal.get("lc_pipeline_exhaustion_guard_4h_min_signals", 2) or 2),
+        ),
+        "exhaustion_guard_mini_min_signals": max(
+            1,
+            int(internal.get("lc_pipeline_exhaustion_guard_mini_min_signals", 2) or 2),
+        ),
+        "exhaustion_guard_rsi_hot": float(internal.get("lc_pipeline_exhaustion_guard_rsi_hot", 70) or 70),
+        "exhaustion_guard_rsi_extreme": float(internal.get("lc_pipeline_exhaustion_guard_rsi_extreme", 76) or 76),
+        "exhaustion_guard_rsi_cold": float(internal.get("lc_pipeline_exhaustion_guard_rsi_cold", 30) or 30),
+        "exhaustion_guard_rsi_oversold": float(internal.get("lc_pipeline_exhaustion_guard_rsi_oversold", 24) or 24),
+        "exhaustion_guard_range_position_hot": float(
+            internal.get("lc_pipeline_exhaustion_guard_range_position_hot", 0.82) or 0.82
+        ),
+        "exhaustion_guard_range_position_cold": float(
+            internal.get("lc_pipeline_exhaustion_guard_range_position_cold", 0.18) or 0.18
+        ),
+        "exhaustion_guard_price_above_ema_slow_pct": float(
+            internal.get("lc_pipeline_exhaustion_guard_price_above_ema_slow_pct", 0.8) or 0.8
+        ),
+        "exhaustion_guard_price_below_ema_slow_pct": float(
+            internal.get("lc_pipeline_exhaustion_guard_price_below_ema_slow_pct", 0.8) or 0.8
+        ),
+        "exhaustion_guard_near_resistance_pct": float(
+            internal.get("lc_pipeline_exhaustion_guard_near_resistance_pct", 0.3) or 0.3
+        ),
+        "exhaustion_guard_near_support_pct": float(
+            internal.get("lc_pipeline_exhaustion_guard_near_support_pct", 0.3) or 0.3
+        ),
+        "exhaustion_guard_volume_ratio": float(
+            internal.get("lc_pipeline_exhaustion_guard_volume_ratio", 2.0) or 2.0
+        ),
+        "exhaustion_guard_htf_rsi_hot": float(internal.get("lc_pipeline_exhaustion_guard_htf_rsi_hot", 70) or 70),
+        "exhaustion_guard_htf_rsi_cold": float(internal.get("lc_pipeline_exhaustion_guard_htf_rsi_cold", 30) or 30),
+        "exhaustion_guard_htf_range_position_hot": float(
+            internal.get("lc_pipeline_exhaustion_guard_htf_range_position_hot", 0.82) or 0.82
+        ),
+        "exhaustion_guard_htf_range_position_cold": float(
+            internal.get("lc_pipeline_exhaustion_guard_htf_range_position_cold", 0.18) or 0.18
+        ),
+    }
+
+
+def _two_hour_icon(config: dict[str, Any]) -> str:
+    internal = config.get("ai", {}).get("internal", {})
+    icon = str(internal.get("lc_pipeline_two_hour_icon") or DEFAULT_TWO_HOUR_ICON).strip()
+    return icon or DEFAULT_TWO_HOUR_ICON
+
+
+def _frame_icon(config: dict[str, Any], frame: str) -> str:
+    frame_name = str(frame or "").lower()
+    if frame_name == "1h":
+        return ONE_HOUR_ICON
+    if frame_name == "2h":
+        return _two_hour_icon(config)
+    if frame_name == "4h":
+        return FOUR_HOUR_ICON
+    if frame_name == "mini":
+        return MINI_ICON
+    return "🔹"
+
+
+def _local_time(config: dict[str, Any], now: datetime) -> datetime:
+    name = str(
+        config.get("ai", {}).get("internal", {}).get("market_scan_timezone")
+        or config.get("timezone")
+        or "Asia/Ho_Chi_Minh"
+    )
+    if name in {"Asia/Ho_Chi_Minh", "Asia/Saigon", "UTC+7", "+07:00"}:
+        return now.astimezone(timezone(timedelta(hours=7)))
+    return now.astimezone(timezone.utc)
+
+
+def _day_key(config: dict[str, Any], now: datetime) -> str:
+    return _local_time(config, now).date().isoformat()
+
+
+def _slot_key(config: dict[str, Any], now: datetime, hours: int) -> str:
+    local = _local_time(config, now)
+    slot_hour = (local.hour // hours) * hours
+    return local.replace(hour=slot_hour, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _aligned_source_slots(config: dict[str, Any], target_slot: str, *, parent_hours: int, child_hours: int) -> list[str]:
+    target_time = _parse_time(target_slot)
+    if target_time is None:
+        return []
+    local_target = _local_time(config, target_time)
+    offsets = range(parent_hours - child_hours, -1, -child_hours)
+    return [(local_target - timedelta(hours=offset)).isoformat() for offset in offsets]
+
+
+def _slot_is_open(config: dict[str, Any], now: datetime, *, hours: int, tolerance_minutes: int) -> bool:
+    local_now = _local_time(config, now)
+    slot_hour = (local_now.hour // hours) * hours
+    slot_start = local_now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+    elapsed = (local_now - slot_start).total_seconds()
+    # Keep the window wide enough for the normal `:05` execution cadence.
+    return 0 <= elapsed <= max(5, int(tolerance_minutes)) * 60
+
+
+def _fixed_interval_slot_key(config: dict[str, Any], now: datetime, *, minutes: int) -> str:
+    interval_minutes = max(1, int(minutes))
+    local_now = _local_time(config, now)
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_since_midnight = local_now.hour * 60 + local_now.minute
+    slot_minutes = (minutes_since_midnight // interval_minutes) * interval_minutes
+    slot_start = midnight + timedelta(minutes=slot_minutes)
+    return slot_start.isoformat()
+
+
+def _fixed_interval_slot_is_exact(config: dict[str, Any], now: datetime, *, minutes: int) -> bool:
+    interval_minutes = max(1, int(minutes))
+    local_now = _local_time(config, now)
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_since_midnight = local_now.hour * 60 + local_now.minute
+    slot_minutes = (minutes_since_midnight // interval_minutes) * interval_minutes
+    slot_start = midnight + timedelta(minutes=slot_minutes)
+    elapsed = (local_now - slot_start).total_seconds()
+    tolerance_seconds = max(5, int(_pipeline_config(config)["slot_tolerance_minutes"])) * 60
+    return 0 <= elapsed <= tolerance_seconds
+
+
+def _latest_events_for_slots(events: list[dict[str, Any]], slots: list[str]) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for slot in slots:
+        event = next(
+            (
+                item
+                for item in reversed(events)
+                if isinstance(item, dict) and str(item.get("slot") or "") == slot
+            ),
+            None,
+        )
+        if event is not None:
+            matched.append(event)
+    return matched
+
+
+def _event_source_slots(event: dict[str, Any]) -> list[str]:
+    source_windows = event.get("source_windows") if isinstance(event.get("source_windows"), list) else []
+    slots: list[str] = []
+    for item in source_windows:
+        if not isinstance(item, dict):
+            continue
+        slot = str(item.get("slot") or "").strip()
+        if slot and slot not in slots:
+            slots.append(slot)
+    return slots
+
+
+def _event_expected_source_slots(config: dict[str, Any], event: dict[str, Any]) -> list[str]:
+    frame = str(event.get("frame") or "").lower()
+    target_slot = str(event.get("slot") or "")
+    if frame == "2h":
+        return _aligned_source_slots(config, target_slot, parent_hours=2, child_hours=1)
+    if frame == "4h":
+        return _aligned_source_slots(config, target_slot, parent_hours=4, child_hours=2)
+    return []
+
+
+def _event_has_aligned_sources(config: dict[str, Any], event: dict[str, Any]) -> bool:
+    frame = str(event.get("frame") or "").lower()
+    if frame not in {"2h", "4h"}:
+        return True
+    actual_slots = _event_source_slots(event)
+    expected_slots = _event_expected_source_slots(config, event)
+    if not expected_slots or not actual_slots:
+        return True
+    return all(slot in expected_slots for slot in actual_slots)
+
+
+def _latest_event_for_slot(
+    events: list[dict[str, Any]],
+    slot: str,
+    *,
+    config: dict[str, Any] | None = None,
+    require_aligned_sources: bool = False,
+) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if not isinstance(event, dict) or str(event.get("slot") or "") != slot:
+            continue
+        if require_aligned_sources and config is not None and not _event_has_aligned_sources(config, event):
+            continue
+        return event
+    return None
+
+
+def _latest_events_for_slots_aligned(
+    config: dict[str, Any],
+    events: list[dict[str, Any]],
+    slots: list[str],
+) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for slot in slots:
+        event = _latest_event_for_slot(events, slot, config=config, require_aligned_sources=True)
+        if event is not None:
+            matched.append(event)
+    return matched
+
+
+def _replace_event_for_slot(events: list[dict[str, Any]], replacement: dict[str, Any]) -> list[dict[str, Any]]:
+    slot = str(replacement.get("slot") or "")
+    frame = str(replacement.get("frame") or "")
+    output: list[dict[str, Any]] = []
+    replaced = False
+    for event in events:
+        if (
+            isinstance(event, dict)
+            and str(event.get("slot") or "") == slot
+            and str(event.get("frame") or "") == frame
+        ):
+            if not replaced:
+                output.append(replacement)
+                replaced = True
+            continue
+        output.append(event)
+    if not replaced:
+        output.append(replacement)
+    return output
+
+
+def _latest_slot_from_events(config: dict[str, Any], events: list[dict[str, Any]], frame: str) -> str | None:
+    slots: list[datetime] = []
+    for event in events:
+        if not isinstance(event, dict) or str(event.get("frame") or "").lower() != frame:
+            continue
+        event_time = _parse_time(event.get("slot"))
+        if event_time is None:
+            continue
+        slots.append(event_time)
+    if not slots:
+        return None
+    latest = max(slots)
+    return _local_time(config, latest).isoformat()
+
+
+def _sanitize_current_day_aggregate_state(config: dict[str, Any], state: dict[str, Any], now: datetime) -> None:
+    current_day = _day_key(config, now)
+
+    def _keep_event(event: dict[str, Any]) -> bool:
+        if not isinstance(event, dict):
+            return False
+        frame = str(event.get("frame") or "").lower()
+        if frame not in {"2h", "4h"}:
+            return True
+        event_time = _parse_time(event.get("slot") or event.get("created_at"))
+        if event_time is None or _day_key(config, event_time) != current_day:
+            return True
+        return _event_has_aligned_sources(config, event)
+
+    state["two_hour_history"] = [
+        event for event in state.get("two_hour_history") or [] if isinstance(event, dict) and _keep_event(event)
+    ]
+    state["four_hour_history"] = [
+        event for event in state.get("four_hour_history") or [] if isinstance(event, dict) and _keep_event(event)
+    ]
+    state["two_hour_windows"] = [
+        event for event in state.get("two_hour_windows") or [] if isinstance(event, dict) and _keep_event(event)
+    ]
+    state["telegram_events"] = [
+        event for event in state.get("telegram_events") or [] if isinstance(event, dict) and _keep_event(event)
+    ]
+    state["last_two_hour_slot"] = _latest_slot_from_events(config, state.get("two_hour_history") or [], "2h")
+    state["last_four_hour_slot"] = _latest_slot_from_events(config, state.get("four_hour_history") or [], "4h")
+
+
+def _is_same_local_day(config: dict[str, Any], value: Any, current_day: str) -> bool:
+    event_time = _parse_time(value)
+    if event_time is None:
+        return False
+    return _day_key(config, event_time) == current_day
+
+
+def _candidate_score(candidate: TradeCandidate | dict[str, Any]) -> tuple[float, float, float]:
+    if isinstance(candidate, dict):
+        win_probability = candidate.get("win_probability_pct")
+        confidence = candidate.get("confidence")
+        volume_ratio = ((candidate.get("indicator_summary") or {}).get("volume_ratio"))
+    else:
+        win_probability = candidate.win_probability_pct
+        confidence = candidate.confidence
+        volume_ratio = (candidate.indicator_summary or {}).get("volume_ratio")
+    try:
+        win_value = float(win_probability or 0)
+    except (TypeError, ValueError):
+        win_value = 0.0
+    try:
+        confidence_value = float(confidence or 0)
+    except (TypeError, ValueError):
+        confidence_value = 0.0
+    try:
+        volume_value = float(volume_ratio or 0)
+    except (TypeError, ValueError):
+        volume_value = 0.0
+    return (win_value, confidence_value, volume_value)
+
+
+def _candidate_win_probability(candidate: TradeCandidate | dict[str, Any]) -> float:
+    raw = candidate.get("win_probability_pct") if isinstance(candidate, dict) else candidate.win_probability_pct
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _peak_win_probability(*values: Any) -> float:
+    valid = [_safe_float(value, float("-inf")) for value in values]
+    valid = [value for value in valid if value != float("-inf")]
+    if not valid:
+        return 0.0
+    return max(valid)
+
+
+def _latest_known_win_probability(row: dict[str, Any]) -> float:
+    ordered_candidates = (
+        row.get("current_win_probability_pct"),
+        row.get("win_probability_pct"),
+        row.get("previous_scan_win_probability_pct"),
+        row.get("peak_win_probability_pct"),
+    )
+    for value in ordered_candidates:
+        if value in (None, ""):
+            continue
+        parsed = _safe_float(value, float("-inf"))
+        if parsed == float("-inf"):
+            continue
+        if parsed > 0:
+            return parsed
+    for value in ordered_candidates:
+        if value in (None, ""):
+            continue
+        parsed = _safe_float(value, float("-inf"))
+        if parsed != float("-inf"):
+            return parsed
+    return 0.0
+
+
+def _row_age_hours(row: dict[str, Any], now: datetime) -> float | None:
+    first_seen = _parse_time(row.get("first_seen_at"))
+    if first_seen is None:
+        return None
+    return max(0.0, (now - first_seen).total_seconds() / 3600)
+
+
+def _recheck_strength(previous_win_probability: Any, current_win_probability: Any) -> tuple[str, str]:
+    previous = _safe_float(previous_win_probability)
+    current = _safe_float(current_win_probability)
+    delta = current - previous
+    if abs(delta) <= RECHECK_STABLE_DELTA_PCT:
+        return "stable", "->"
+    if delta > 0:
+        return "stronger", "up"
+    return "weaker", "down"
+
+
+def _phase_min_win_probability(settings: dict[str, Any], phase: str) -> float:
+    phase_key = str(phase or "2h").lower()
+    # OLD_RULE_DISABLED_FOR_DEMO:
+    # if phase_key == "1h":
+    #     return float(settings.get("one_hour_min_win_probability_pct", settings.get("min_win_probability_pct", 61)) or 61)
+    # if phase_key == "4h":
+    #     return float(settings.get("four_hour_min_win_probability_pct", settings.get("min_win_probability_pct", 63)) or 63)
+    # return float(settings.get("two_hour_min_win_probability_pct", settings.get("min_win_probability_pct", 62)) or 62)
+    #
+    # DEMO_RULE_ACTIVE:
+    # Giữ rule cũ cho 1h; chỉ dùng rule_test cho các pool sau recheck (2h/4h) để demo pipeline.
+    if phase_key == "1h":
+        return float(settings.get("one_hour_min_win_probability_pct", 58) or 58)
+    if phase_key == "4h":
+        return float(settings.get("four_hour_min_win_probability_pct", 62) or 62)
+    if phase_key == "2h":
+        return float(settings.get("two_hour_min_win_probability_pct", 60) or 60)
+    return float(settings.get("min_win_probability_pct", 62) or 62)
+
+
+def _phase_settings(settings: dict[str, Any], phase: str) -> dict[str, Any]:
+    output = dict(settings)
+    output["min_win_probability_pct"] = _phase_min_win_probability(settings, phase)
+    return output
+
+
+def _recovery_mode_threshold_offset_pct(config: dict[str, Any]) -> float:
+    try:
+        row = get_trading_system_state_row(config)
+    except Exception:
+        row = None
+    payload: dict[str, Any] = {}
+    if isinstance(row, dict):
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+    mode = str((payload or {}).get("recoveryMode") or "").strip().upper()
+    if not mode and isinstance(row, dict):
+        mode = "HARD_RECOVERY" if bool(row.get("is_recovery_mode")) else "NORMAL"
+    if mode == "HARD_RECOVERY":
+        return LC_PIPELINE_RECOVERY_MODE_STEP_PCT * 2.0
+    if mode == "SOFT_RECOVERY":
+        return LC_PIPELINE_RECOVERY_MODE_STEP_PCT
+    return 0.0
+
+
+def _pipeline_settings_with_recovery_mode(config: dict[str, Any]) -> dict[str, Any]:
+    settings = _pipeline_config(config)
+    settings["recovery_mode_threshold_offset_pct"] = _recovery_mode_threshold_offset_pct(config)
+    return settings
+
+
+def _candidate_passes_lc_threshold(
+    candidate: TradeCandidate | dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    phase: str = "2h",
+) -> bool:
+    raw = candidate.get("win_probability_pct") if isinstance(candidate, dict) else candidate.win_probability_pct
+    if raw in (None, ""):
+        return True
+    try:
+        return float(raw) >= _phase_min_win_probability(settings, phase) + float(
+            settings.get("recovery_mode_threshold_offset_pct", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        return True
+
+
+def _item_payload(item: TradeCandidate | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(item, TradeCandidate):
+        return {
+            "side": item.side,
+            "entry": item.entry,
+            "price": item.entry,
+            "indicator_summary": item.indicator_summary or {},
+            "higher_timeframes": item.higher_timeframes or {},
+            "candlestick_patterns": item.candlestick_patterns or {},
+            "reasons": list(item.reasons or []),
+            "warnings": list(item.warnings or []),
+        }
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _item_value(item: TradeCandidate | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(item, TradeCandidate):
+        if key == "price":
+            return item.entry
+        return getattr(item, key, default)
+    if key in item:
+        return item.get(key, default)
+    payload = _item_payload(item)
+    return payload.get(key, default)
+
+
+def _item_indicator_summary(item: TradeCandidate | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(item, TradeCandidate):
+        return item.indicator_summary or {}
+    direct = item.get("indicator_summary")
+    if isinstance(direct, dict):
+        return direct
+    payload_indicator = _item_payload(item).get("indicator_summary")
+    return payload_indicator if isinstance(payload_indicator, dict) else {}
+
+
+def _item_higher_timeframes(item: TradeCandidate | dict[str, Any]) -> dict[str, Any]:
+    frames: dict[str, Any] = {}
+    indicator = _item_indicator_summary(item)
+    indicator_frames = indicator.get("higher_timeframes")
+    if isinstance(indicator_frames, dict):
+        frames.update(indicator_frames)
+    payload_frames = _item_payload(item).get("higher_timeframes")
+    if isinstance(payload_frames, dict):
+        frames.update(payload_frames)
+    if isinstance(item, TradeCandidate):
+        frames.update(item.higher_timeframes or {})
+    elif isinstance(item.get("higher_timeframes"), dict):
+        frames.update(item.get("higher_timeframes") or {})
+    return frames
+
+
+def _item_candlestick_patterns(item: TradeCandidate | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(item, TradeCandidate):
+        return item.candlestick_patterns or {}
+    direct = item.get("candlestick_patterns")
+    if isinstance(direct, dict):
+        return direct
+    payload_patterns = _item_payload(item).get("candlestick_patterns")
+    return payload_patterns if isinstance(payload_patterns, dict) else {}
+
+
+def _item_text_values(item: TradeCandidate | dict[str, Any], key: str) -> list[str]:
+    if isinstance(item, TradeCandidate):
+        values = getattr(item, key, []) or []
+    else:
+        values = item.get(key)
+        if values is None:
+            values = _item_payload(item).get(key)
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if str(value).strip()]
+
+
+def _indicator_price(indicator: dict[str, Any], item: TradeCandidate | dict[str, Any]) -> float:
+    for value in (
+        indicator.get("last"),
+        indicator.get("price"),
+        _item_value(item, "price"),
+        _item_value(item, "entry"),
+    ):
+        parsed = _safe_float(value, float("nan"))
+        if parsed == parsed and parsed > 0:
+            return parsed
+    return 0.0
+
+
+def _indicator_range_position(indicator: dict[str, Any], price: float) -> float | None:
+    raw = indicator.get("range_position")
+    if raw not in (None, ""):
+        return _safe_float(raw)
+    support = _safe_float(indicator.get("support"), float("nan"))
+    resistance = _safe_float(indicator.get("resistance"), float("nan"))
+    if support == support and resistance == resistance and resistance > support and price > 0:
+        return max(0.0, min(1.2, (price - support) / max(resistance - support, 1e-12)))
+    return None
+
+
+def _indicator_price_vs_ema_slow_pct(indicator: dict[str, Any], price: float) -> float | None:
+    raw = indicator.get("price_vs_ema_slow_pct")
+    if raw not in (None, ""):
+        return _safe_float(raw)
+    ema_slow = _safe_float(indicator.get("ema_slow"), float("nan"))
+    if ema_slow == ema_slow and ema_slow > 0 and price > 0:
+        return ((price - ema_slow) / ema_slow) * 100.0
+    return None
+
+
+def _pattern_is_bearish(pattern_data: dict[str, Any]) -> bool:
+    if not isinstance(pattern_data, dict):
+        return False
+    direction = str(pattern_data.get("direction") or "").lower()
+    if direction == "bearish":
+        return True
+    bullish = _safe_float(pattern_data.get("bullish_score"))
+    bearish = _safe_float(pattern_data.get("bearish_score"))
+    if bearish > 0 and bearish >= bullish + 1.0:
+        return True
+    names = [
+        str(value).lower().replace(" ", "_")
+        for value in list(pattern_data.get("patterns") or []) + [pattern_data.get("strongest_pattern")]
+        if str(value).strip()
+    ]
+    bearish_names = (
+        "bearish",
+        "shooting_star",
+        "hanging_man",
+        "evening_star",
+        "dark_cloud",
+        "three_black_crows",
+    )
+    return any(any(token in name for token in bearish_names) for name in names)
+
+
+def _pattern_is_bullish(pattern_data: dict[str, Any]) -> bool:
+    if not isinstance(pattern_data, dict):
+        return False
+    direction = str(pattern_data.get("direction") or "").lower()
+    if direction == "bullish":
+        return True
+    bullish = _safe_float(pattern_data.get("bullish_score"))
+    bearish = _safe_float(pattern_data.get("bearish_score"))
+    if bullish > 0 and bullish >= bearish + 1.0:
+        return True
+    names = [
+        str(value).lower().replace(" ", "_")
+        for value in list(pattern_data.get("patterns") or []) + [pattern_data.get("strongest_pattern")]
+        if str(value).strip()
+    ]
+    bullish_names = (
+        "bullish",
+        "hammer",
+        "morning_star",
+        "piercing",
+        "three_white_soldiers",
+        "inverted_hammer",
+    )
+    return any(any(token in name for token in bullish_names) for name in names)
+
+
+def _bearish_candlestick_frames(item: TradeCandidate | dict[str, Any]) -> list[str]:
+    frames: dict[str, Any] = {}
+    for frame, data in _item_candlestick_patterns(item).items():
+        if isinstance(data, dict):
+            frames[str(frame)] = data
+    for frame, data in _item_higher_timeframes(item).items():
+        if not isinstance(data, dict):
+            continue
+        patterns = data.get("candlestick_patterns")
+        if isinstance(patterns, dict):
+            frames[str(frame)] = patterns
+    return [frame for frame, data in frames.items() if _pattern_is_bearish(data)]
+
+
+def _bullish_candlestick_frames(item: TradeCandidate | dict[str, Any]) -> list[str]:
+    frames: dict[str, Any] = {}
+    for frame, data in _item_candlestick_patterns(item).items():
+        if isinstance(data, dict):
+            frames[str(frame)] = data
+    for frame, data in _item_higher_timeframes(item).items():
+        if not isinstance(data, dict):
+            continue
+        patterns = data.get("candlestick_patterns")
+        if isinstance(patterns, dict):
+            frames[str(frame)] = patterns
+    return [frame for frame, data in frames.items() if _pattern_is_bullish(data)]
+
+
+def _long_exhaustion_required_signals(settings: dict[str, Any], phase: str) -> int:
+    phase_key = str(phase or "2h").lower()
+    if phase_key in {"1h", "one_hour"}:
+        return int(settings.get("exhaustion_guard_1h_min_signals", 3) or 3)
+    if phase_key in {"2h", "two_hour"}:
+        return int(settings.get("exhaustion_guard_2h_min_signals", 3) or 3)
+    if phase_key in {"4h", "four_hour"}:
+        return int(settings.get("exhaustion_guard_4h_min_signals", 2) or 2)
+    return int(settings.get("exhaustion_guard_mini_min_signals", 2) or 2)
+
+
+def _long_exhaustion_signal_reasons(
+    item: TradeCandidate | dict[str, Any],
+    settings: dict[str, Any],
+) -> list[str]:
+    if str(_item_value(item, "side", "") or "").lower() != "long":
+        return []
+    indicator = _item_indicator_summary(item)
+    price = _indicator_price(indicator, item)
+    reasons: list[str] = []
+    rsi = _safe_float(indicator.get("rsi"), float("nan"))
+    rsi_hot = float(settings.get("exhaustion_guard_rsi_hot", 70) or 70)
+    rsi_extreme = float(settings.get("exhaustion_guard_rsi_extreme", 76) or 76)
+    if rsi == rsi and rsi >= rsi_hot:
+        label = "RSI quá nóng" if rsi < rsi_extreme else "RSI cực nóng"
+        reasons.append(f"{label} {rsi:.1f}")
+
+    range_position = _indicator_range_position(indicator, price)
+    range_hot = float(settings.get("exhaustion_guard_range_position_hot", 0.82) or 0.82)
+    if range_position is not None and range_position >= range_hot:
+        reasons.append(f"giá ở vùng cao của range ({range_position * 100:.0f}%)")
+
+    price_vs_ema = _indicator_price_vs_ema_slow_pct(indicator, price)
+    ema_hot = float(settings.get("exhaustion_guard_price_above_ema_slow_pct", 0.8) or 0.8)
+    if price_vs_ema is not None and price_vs_ema >= ema_hot:
+        reasons.append(f"giá đã cách EMA chậm {price_vs_ema:+.2f}%")
+
+    resistance = _safe_float(indicator.get("resistance"), float("nan"))
+    near_resistance_pct = float(settings.get("exhaustion_guard_near_resistance_pct", 0.3) or 0.3)
+    if resistance == resistance and resistance > 0 and price > 0:
+        distance_pct = ((resistance - price) / resistance) * 100.0
+        if distance_pct <= near_resistance_pct:
+            reasons.append(f"áp sát kháng cự ({distance_pct:+.2f}%)")
+
+    volume_ratio = _safe_float(
+        indicator.get("volume_ratio", _item_value(item, "volume_ratio")),
+        float("nan"),
+    )
+    volume_hot = float(settings.get("exhaustion_guard_volume_ratio", 2.0) or 2.0)
+    if volume_ratio == volume_ratio and volume_ratio >= volume_hot:
+        reasons.append(f"volume spike {volume_ratio:.2f}x")
+
+    htf_hot_frames: list[str] = []
+    htf_rsi_hot = float(settings.get("exhaustion_guard_htf_rsi_hot", 70) or 70)
+    htf_range_hot = float(settings.get("exhaustion_guard_htf_range_position_hot", 0.82) or 0.82)
+    for frame, data in _item_higher_timeframes(item).items():
+        if not isinstance(data, dict):
+            continue
+        frame_rsi = _safe_float(data.get("rsi"), float("nan"))
+        frame_range = _safe_float(data.get("range_position"), float("nan"))
+        if frame_rsi == frame_rsi and frame_range == frame_range and frame_rsi >= htf_rsi_hot and frame_range >= htf_range_hot:
+            htf_hot_frames.append(str(frame))
+    if htf_hot_frames:
+        reasons.append("HTF cũng nóng: " + ", ".join(htf_hot_frames[:3]))
+
+    bearish_frames = _bearish_candlestick_frames(item)
+    if bearish_frames:
+        reasons.append("nến đảo chiều/áp lực bán: " + ", ".join(bearish_frames[:3]))
+
+    guard_text = " ".join(_item_text_values(item, "warnings") + _item_text_values(item, "reasons")).lower()
+    if "market guard" in guard_text and "action=avoid_new_entry" in guard_text:
+        reasons.append("Market Guard đang tránh mở lệnh mới")
+    return reasons
+
+
+def _short_exhaustion_signal_reasons(
+    item: TradeCandidate | dict[str, Any],
+    settings: dict[str, Any],
+) -> list[str]:
+    if str(_item_value(item, "side", "") or "").lower() != "short":
+        return []
+    indicator = _item_indicator_summary(item)
+    price = _indicator_price(indicator, item)
+    reasons: list[str] = []
+    rsi = _safe_float(indicator.get("rsi"), float("nan"))
+    rsi_cold = float(settings.get("exhaustion_guard_rsi_cold", 30) or 30)
+    rsi_oversold = float(settings.get("exhaustion_guard_rsi_oversold", 24) or 24)
+    if rsi == rsi and rsi <= rsi_cold:
+        label = "RSI quá bán" if rsi > rsi_oversold else "RSI cực quá bán"
+        reasons.append(f"{label} {rsi:.1f}")
+
+    range_position = _indicator_range_position(indicator, price)
+    range_cold = float(settings.get("exhaustion_guard_range_position_cold", 0.18) or 0.18)
+    if range_position is not None and range_position <= range_cold:
+        reasons.append(f"giá ở vùng thấp của range ({range_position * 100:.0f}%)")
+
+    price_vs_ema = _indicator_price_vs_ema_slow_pct(indicator, price)
+    ema_cold = float(settings.get("exhaustion_guard_price_below_ema_slow_pct", 0.8) or 0.8)
+    if price_vs_ema is not None and price_vs_ema <= -ema_cold:
+        reasons.append(f"giá đã thấp hơn EMA chậm {price_vs_ema:+.2f}%")
+
+    support = _safe_float(indicator.get("support"), float("nan"))
+    near_support_pct = float(settings.get("exhaustion_guard_near_support_pct", 0.3) or 0.3)
+    if support == support and support > 0 and price > 0:
+        distance_pct = ((price - support) / support) * 100.0
+        if distance_pct <= near_support_pct:
+            reasons.append(f"áp sát hỗ trợ ({distance_pct:+.2f}%)")
+
+    volume_ratio = _safe_float(
+        indicator.get("volume_ratio", _item_value(item, "volume_ratio")),
+        float("nan"),
+    )
+    volume_hot = float(settings.get("exhaustion_guard_volume_ratio", 2.0) or 2.0)
+    if volume_ratio == volume_ratio and volume_ratio >= volume_hot:
+        reasons.append(f"volume spike {volume_ratio:.2f}x")
+
+    htf_cold_frames: list[str] = []
+    htf_rsi_cold = float(settings.get("exhaustion_guard_htf_rsi_cold", 30) or 30)
+    htf_range_cold = float(settings.get("exhaustion_guard_htf_range_position_cold", 0.18) or 0.18)
+    for frame, data in _item_higher_timeframes(item).items():
+        if not isinstance(data, dict):
+            continue
+        frame_rsi = _safe_float(data.get("rsi"), float("nan"))
+        frame_range = _safe_float(data.get("range_position"), float("nan"))
+        if (
+            frame_rsi == frame_rsi
+            and frame_range == frame_range
+            and frame_rsi <= htf_rsi_cold
+            and frame_range <= htf_range_cold
+        ):
+            htf_cold_frames.append(str(frame))
+    if htf_cold_frames:
+        reasons.append("HTF cũng quá bán: " + ", ".join(htf_cold_frames[:3]))
+
+    bullish_frames = _bullish_candlestick_frames(item)
+    if bullish_frames:
+        reasons.append("nến hồi/áp lực mua: " + ", ".join(bullish_frames[:3]))
+
+    guard_text = " ".join(_item_text_values(item, "warnings") + _item_text_values(item, "reasons")).lower()
+    if "market guard" in guard_text and "action=avoid_new_entry" in guard_text:
+        reasons.append("Market Guard đang tránh mở lệnh mới")
+    return reasons
+
+
+def _long_exhaustion_guard_reasons(
+    item: TradeCandidate | dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    phase: str,
+) -> list[str]:
+    if not settings.get("exhaustion_guard_enabled", True):
+        return []
+    reasons = _long_exhaustion_signal_reasons(item, settings)
+    required = _long_exhaustion_required_signals(settings, phase)
+    if len(reasons) < required:
+        return []
+    return reasons
+
+
+def _exhaustion_guard_reasons(
+    item: TradeCandidate | dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    phase: str,
+) -> tuple[str, list[str]]:
+    if not settings.get("exhaustion_guard_enabled", True):
+        return "", []
+    side = str(_item_value(item, "side", "") or "").lower()
+    if side == "long":
+        return "long", _long_exhaustion_guard_reasons(item, settings, phase=phase)
+    if side == "short":
+        reasons = _short_exhaustion_signal_reasons(item, settings)
+        required = _long_exhaustion_required_signals(settings, phase)
+        if len(reasons) >= required:
+            return "short", reasons
+    return side, []
+
+
+def _annotate_exhaustion_guard_row(
+    row: dict[str, Any],
+    reasons: list[str],
+    *,
+    phase: str,
+    settings: dict[str, Any],
+    side: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    required = _long_exhaustion_required_signals(settings, phase)
+    side_key = str(side or row.get("side") or _item_payload(row).get("side") or "long").lower()
+    label = "Short exhaustion guard" if side_key == "short" else "Long exhaustion guard"
+    reason_text = label + ": " + "; ".join(reasons[:4])
+    payload = dict(row.get("payload") or {}) if isinstance(row.get("payload"), dict) else {}
+    payload["exhaustion_guard_blocked"] = True
+    payload["exhaustion_guard_phase"] = phase
+    payload["exhaustion_guard_reasons"] = list(reasons[:8])
+    payload_warnings = [str(value) for value in payload.get("warnings") or [] if str(value).strip()]
+    if reason_text not in payload_warnings:
+        payload_warnings.append(reason_text)
+    payload["warnings"] = payload_warnings[:8]
+    record = {
+        **row,
+        "payload": payload,
+        "state": "CHUA_DUYET",
+        "undecided_status": "exhaustion_guard",
+        "undecided_reason": reason_text,
+        "exhaustion_guard_blocked": True,
+        "exhaustion_guard_phase": phase,
+        "exhaustion_guard_signals": len(reasons),
+        "exhaustion_guard_required_signals": required,
+        "exhaustion_guard_reasons": list(reasons[:8]),
+    }
+    if now is not None:
+        record["last_seen_at"] = now.isoformat()
+    return record
+
+
+def _split_exhaustion_guard_rows(
+    rows: list[dict[str, Any]],
+    settings: dict[str, Any],
+    *,
+    phase: str,
+    source_slot: str,
+    source_index: int | None,
+    now: datetime,
+    local_now: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    approved: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        guard_side, reasons = _exhaustion_guard_reasons(row, settings, phase=phase)
+        if reasons:
+            rejected_row = _row_with_source_metadata(
+                row,
+                state_label="CHUA_DUYET",
+                source_slot=source_slot,
+                source_index=source_index,
+                now=now,
+                local_now=local_now,
+            )
+            rejected.append(
+                _annotate_exhaustion_guard_row(
+                    rejected_row,
+                    reasons,
+                    phase=phase,
+                    settings=settings,
+                    side=guard_side,
+                    now=now,
+                )
+            )
+            continue
+        approved.append(row)
+    return approved, rejected
+
+
+def _sort_saved_rows(rows: list[dict[str, Any]], settings: dict[str, Any], *, reverse: bool = True) -> list[dict[str, Any]]:
+    _ = settings
+    ranked = [row for row in rows if isinstance(row, dict)]
+    return sorted(ranked, key=_candidate_score, reverse=reverse)
+
+
+def _has_clear_candlestick(candidate: TradeCandidate) -> bool:
+    frames: list[Any] = []
+    frames.extend((candidate.candlestick_patterns or {}).values())
+    for frame_data in (candidate.higher_timeframes or {}).values():
+        if isinstance(frame_data, dict):
+            frames.append(frame_data.get("candlestick_patterns"))
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        direction = str(frame.get("direction") or "").lower()
+        strongest = frame.get("strongest_pattern")
+        patterns = frame.get("patterns")
+        if direction in {"bullish", "bearish"} and (strongest or patterns):
+            return True
+    return False
+
+
+def _active_symbol_blocklist(config: dict[str, Any]) -> set[str]:
+    _count, active_symbols, _warnings = active_trades_summary(config)
+    return {str(symbol) for symbol in active_symbols if str(symbol)}
+
+
+def _strip_blocked_symbols(rows: list[dict[str, Any]], blocked_symbols: set[str]) -> list[dict[str, Any]]:
+    if not blocked_symbols:
+        return list(rows)
+    return [row for row in rows if str(row.get("symbol") or "") not in blocked_symbols]
+
+
+def _undecided_drop_reason(row: dict[str, Any], settings: dict[str, Any], now: datetime) -> str:
+    if str(row.get("undecided_status") or "").lower() == "missing_setup":
+        return str(row.get("undecided_reason") or "khong tim thay setup hop le trong du lieu moi nhat")
+    age_hours = _row_age_hours(row, now)
+    if age_hours is not None and age_hours > float(settings["undecided_max_age_hours"]):
+        return f"qua han Chua duyet ({_age_label(age_hours)} > {float(settings['undecided_max_age_hours']):.0f}h)"
+    try:
+        win_probability = float(row.get("win_probability_pct") or 0)
+    except (TypeError, ValueError):
+        win_probability = 0.0
+    if win_probability < float(settings["relaxed_min_win_probability_pct"]):
+        return f"win {win_probability:.2f}% < relaxed {float(settings['relaxed_min_win_probability_pct']):.0f}%"
+    try:
+        confidence = float(row.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if row.get("confidence") not in (None, "") and confidence < float(settings["relaxed_min_confidence"]):
+        return f"confidence {confidence:.2f} < relaxed {float(settings['relaxed_min_confidence']):.0f}"
+    try:
+        risk_reward = float(row.get("risk_reward") or 0)
+    except (TypeError, ValueError):
+        risk_reward = 0.0
+    if row.get("risk_reward") not in (None, "") and risk_reward < float(settings["relaxed_min_risk_reward"]):
+        return f"RR {risk_reward:.2f} < relaxed {float(settings['relaxed_min_risk_reward']):.2f}"
+    return "khong con hop le trong Chua duyet"
+
+
+def _undecided_row_is_active(row: dict[str, Any], settings: dict[str, Any], now: datetime) -> bool:
+    age_hours = _row_age_hours(row, now)
+    if age_hours is not None and age_hours > float(settings["undecided_max_age_hours"]):
+        return False
+    if str(row.get("undecided_status") or "").lower() == "missing_setup":
+        return True
+    return _row_is_relaxed_valid(row, settings)
+
+
+def _undecided_row_is_visible(row: dict[str, Any], settings: dict[str, Any]) -> bool:
+    if str(row.get("undecided_status") or "").lower() == "missing_setup":
+        return True
+    return _row_meets_optional_floor(row.get("win_probability_pct"), float(settings["relaxed_min_win_probability_pct"]))
+
+
+def _prune_blocked_state(state: dict[str, Any], blocked_symbols: set[str]) -> None:
+    if not blocked_symbols:
+        return
+    state["internal_lc"] = _strip_blocked_symbols(list(state.get("internal_lc") or []), blocked_symbols)
+    state["undecided"] = _strip_blocked_symbols(list(state.get("undecided") or []), blocked_symbols)
+    hourly_windows = []
+    for window in state.get("hourly_windows") or []:
+        hourly_windows.append({**window, "top": _strip_blocked_symbols(list(window.get("top") or []), blocked_symbols)})
+    state["hourly_windows"] = hourly_windows
+
+
+def _prune_low_win_state(state: dict[str, Any], settings: dict[str, Any], now: datetime) -> None:
+    state["internal_lc"] = [
+        row for row in list(state.get("internal_lc") or []) if _candidate_passes_lc_threshold(row, settings, phase="2h")
+    ]
+    state["undecided"] = [
+        row
+        for row in list(state.get("undecided") or [])
+        if isinstance(row, dict) and _undecided_row_is_visible(row, settings)
+    ]
+    hourly_windows = []
+    for window in state.get("hourly_windows") or []:
+        top = [row for row in list(window.get("top") or []) if _candidate_passes_lc_threshold(row, settings, phase="1h")]
+        hourly_windows.append({**window, "top": top})
+    state["hourly_windows"] = hourly_windows
+    two_hour_windows = []
+    for event in state.get("two_hour_windows") or []:
+        if not isinstance(event, dict):
+            continue
+        approved = [
+            row for row in list(event.get("approved") or []) if _candidate_passes_lc_threshold(row, settings, phase="2h")
+        ]
+        rejected = [
+            row for row in list(event.get("rejected") or []) if _candidate_passes_lc_threshold(row, settings, phase="2h")
+        ]
+        two_hour_windows.append({**event, "approved": approved, "rejected": rejected})
+    state["two_hour_windows"] = two_hour_windows
+    four_hour_history = []
+    for event in state.get("four_hour_history") or []:
+        if not isinstance(event, dict):
+            continue
+        approved = [
+            row for row in list(event.get("approved") or []) if _candidate_passes_lc_threshold(row, settings, phase="4h")
+        ]
+        rejected = [
+            row for row in list(event.get("rejected") or []) if _candidate_passes_lc_threshold(row, settings, phase="4h")
+        ]
+        four_hour_history.append({**event, "approved": approved, "rejected": rejected})
+    state["four_hour_history"] = four_hour_history
+    telegram_events = []
+    for event in state.get("telegram_events") or []:
+        if not isinstance(event, dict):
+            continue
+        approved = [
+            row for row in list(event.get("approved") or []) if _candidate_passes_lc_threshold(row, settings, phase="2h")
+        ]
+        rejected = [
+            row for row in list(event.get("rejected") or []) if _candidate_passes_lc_threshold(row, settings, phase="2h")
+        ]
+        telegram_events.append({**event, "approved": approved, "rejected": rejected})
+    state["telegram_events"] = telegram_events
+
+
+def _rank_candidates(
+    candidates: list[TradeCandidate],
+    limit: int,
+    *,
+    blocked_symbols: set[str] | None = None,
+    settings: dict[str, Any] | None = None,
+    phase: str = "1h",
+) -> list[TradeCandidate]:
+    settings = settings or {"min_win_probability_pct": 62}
+    blocked_symbols = {str(symbol) for symbol in (blocked_symbols or set()) if str(symbol)}
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate.symbol not in blocked_symbols and _candidate_passes_lc_threshold(candidate, settings, phase=phase)
+    ]
+    clear = [candidate for candidate in eligible if _has_clear_candlestick(candidate)]
+    ranked = sorted(
+        clear or eligible,
+        key=lambda item: _candidate_score(
+            {
+                "win_probability_pct": item.win_probability_pct,
+                "confidence": item.confidence,
+                "indicator_summary": item.indicator_summary or {},
+            }
+        ),
+        reverse=True,
+    )
+    clean: list[TradeCandidate] = []
+    seen: set[str] = set()
+    for candidate in ranked:
+        if candidate.symbol in seen:
+            continue
+        clean.append(candidate)
+        seen.add(candidate.symbol)
+        if len(clean) >= limit:
+            break
+    return clean
+
+
+def _candidate_record(
+    candidate: TradeCandidate,
+    *,
+    state: str,
+    first_seen_at: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    timestamp = (now or datetime.now(timezone.utc)).isoformat()
+    payload = _candidate_payload(candidate)
+    indicator = payload.get("indicator_summary") if isinstance(payload, dict) else {}
+    return {
+        "symbol": candidate.symbol,
+        "base": candidate.base,
+        "side": candidate.side,
+        "state": state,
+        "first_seen_at": first_seen_at or timestamp,
+        "last_seen_at": timestamp,
+        "entry": candidate.entry,
+        "price": candidate.entry,
+        "confidence": candidate.confidence,
+        "win_probability_pct": candidate.win_probability_pct,
+        "current_win_probability_pct": candidate.win_probability_pct,
+        "peak_win_probability_pct": candidate.win_probability_pct,
+        "win_rate_trend": "->",
+        "recheck_state": "initial",
+        "risk_reward": candidate.risk_reward,
+        "volume_ratio": (indicator or {}).get("volume_ratio"),
+        "payload": payload,
+    }
+
+
+def _refresh_row_from_candidate(
+    row: dict[str, Any],
+    candidate: TradeCandidate,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    previous_win_probability = row.get("current_win_probability_pct", row.get("win_probability_pct"))
+    current_win_probability = candidate.win_probability_pct
+    recheck_state, win_rate_trend = _recheck_strength(previous_win_probability, current_win_probability)
+    refreshed = _candidate_record(
+        candidate,
+        state=str(row.get("state") or "HOUR_1"),
+        first_seen_at=row.get("first_seen_at"),
+        now=now,
+    )
+    for key in (
+        "source_slot",
+        "source_index",
+        "source_time",
+        "source_label",
+        "origin_source_slot",
+        "origin_source_index",
+        "origin_source_time",
+        "origin_source_label",
+        "revived_at",
+        "revived_label",
+        "revived_age_hours",
+        "revived_age_label",
+        "revived_target_rank",
+        "mini_index",
+        "recheck_daily_index",
+        "recheck_slot",
+        "recheck_time",
+        "recheck_label",
+    ):
+        if key in row:
+            refreshed[key] = row.get(key)
+    try:
+        refreshed["previous_scan_win_probability_pct"] = float(row.get("win_probability_pct") or 0)
+    except (TypeError, ValueError):
+        refreshed["previous_scan_win_probability_pct"] = row.get("win_probability_pct")
+    refreshed["current_win_probability_pct"] = _safe_float(current_win_probability)
+    refreshed["peak_win_probability_pct"] = _peak_win_probability(
+        row.get("peak_win_probability_pct"),
+        row.get("current_win_probability_pct"),
+        row.get("win_probability_pct"),
+        current_win_probability,
+    )
+    refreshed["win_rate_trend"] = win_rate_trend
+    refreshed["recheck_state"] = recheck_state
+    refreshed["last_recheck_at"] = now.isoformat()
+    return refreshed
+
+
+def _dropped_setup_keys(dropped: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for item in dropped:
+        if not isinstance(item, dict):
+            continue
+        keys.add((str(item.get("symbol") or ""), str(item.get("old_side") or "").lower()))
+    return keys
+
+
+def _merge_rechecked_row(existing_row: dict[str, Any], refreshed_row: dict[str, Any]) -> dict[str, Any]:
+    merged = {**existing_row, **refreshed_row}
+    previous_win_probability = existing_row.get("current_win_probability_pct", existing_row.get("win_probability_pct"))
+    current_win_probability = refreshed_row.get(
+        "current_win_probability_pct",
+        refreshed_row.get("win_probability_pct", merged.get("current_win_probability_pct", merged.get("win_probability_pct"))),
+    )
+    if "previous_scan_win_probability_pct" not in refreshed_row:
+        if "win_probability_pct" in existing_row:
+            merged["previous_scan_win_probability_pct"] = existing_row.get("win_probability_pct")
+        elif "previous_scan_win_probability_pct" in existing_row:
+            merged["previous_scan_win_probability_pct"] = existing_row.get("previous_scan_win_probability_pct")
+    merged["current_win_probability_pct"] = _safe_float(current_win_probability)
+    merged["peak_win_probability_pct"] = _peak_win_probability(
+        refreshed_row.get("peak_win_probability_pct"),
+        existing_row.get("peak_win_probability_pct"),
+        existing_row.get("current_win_probability_pct"),
+        existing_row.get("win_probability_pct"),
+        current_win_probability,
+    )
+    if "win_rate_trend" not in refreshed_row or "recheck_state" not in refreshed_row:
+        recheck_state, win_rate_trend = _recheck_strength(previous_win_probability, current_win_probability)
+        merged["win_rate_trend"] = win_rate_trend
+        merged["recheck_state"] = recheck_state
+    merged.setdefault("last_recheck_at", refreshed_row.get("last_seen_at", existing_row.get("last_recheck_at")))
+    return merged
+
+
+def _sync_rows_with_recheck(
+    rows: list[dict[str, Any]],
+    refreshed_rows: list[dict[str, Any]],
+    dropped: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refreshed_by_key = {_setup_key(row): row for row in refreshed_rows if isinstance(row, dict)}
+    dropped_keys = _dropped_setup_keys(dropped)
+    synced: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _setup_key(row)
+        if key in refreshed_by_key:
+            synced.append(_merge_rechecked_row(row, refreshed_by_key[key]))
+            continue
+        if key in dropped_keys:
+            continue
+        synced.append(row)
+    return synced
+
+
+def _merge_undecided_rows(
+    existing_rows: list[dict[str, Any]],
+    incoming_rows: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    merged = list(existing_rows)
+    existing_by_setup = {_setup_key(row): row for row in merged if isinstance(row, dict) and row.get("symbol")}
+    for row in incoming_rows:
+        if not isinstance(row, dict):
+            continue
+        previous = existing_by_setup.get(_setup_key(row))
+        first_seen = row.get("first_seen_at")
+        if previous and previous.get("first_seen_at"):
+            first_seen = previous.get("first_seen_at")
+        if not first_seen:
+            first_seen = now.isoformat()
+        updated = {**row, "first_seen_at": first_seen, "last_seen_at": now.isoformat()}
+        merged = _upsert_by_setup(merged, updated)
+        existing_by_setup[_setup_key(updated)] = updated
+    return merged
+
+
+def _soft_undecided_rows(
+    rows: list[dict[str, Any]],
+    *,
+    settings: dict[str, Any],
+    approved_keys: set[tuple[str, str]],
+    blocked_symbols: set[str],
+    source_slot: str,
+    source_index: int | None,
+    now: datetime,
+    local_now: datetime,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in _sort_saved_rows(list(rows), settings, reverse=True):
+        if not isinstance(row, dict):
+            continue
+        key = _setup_key(row)
+        symbol = str(row.get("symbol") or "")
+        if not symbol or symbol in blocked_symbols or key in approved_keys or key in seen:
+            continue
+        if not _row_is_relaxed_valid(row, settings):
+            continue
+        output.append(
+            _row_with_source_metadata(
+                row,
+                state_label="CHUA_DUYET",
+                source_slot=source_slot,
+                source_index=source_index,
+                now=now,
+                local_now=local_now,
+            )
+        )
+        seen.add(key)
+    return output
+
+
+def _sync_events_with_recheck(
+    events: list[dict[str, Any]],
+    *,
+    slots: list[str],
+    row_field: str,
+    refreshed_rows: list[dict[str, Any]],
+    dropped: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    slot_keys = {str(slot) for slot in slots if str(slot)}
+    synced_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("slot") or "") not in slot_keys:
+            synced_events.append(event)
+            continue
+        synced_events.append(
+            {
+                **event,
+                row_field: _sync_rows_with_recheck(list(event.get(row_field) or []), refreshed_rows, dropped),
+            }
+        )
+    return synced_events
+
+
+def _sync_state_after_recheck(
+    state: dict[str, Any],
+    *,
+    hourly_slots: list[str] | None = None,
+    two_hour_slots: list[str] | None = None,
+    refreshed_rows: list[dict[str, Any]],
+    dropped: list[dict[str, Any]],
+) -> None:
+    state["internal_lc"] = _sync_rows_with_recheck(list(state.get("internal_lc") or []), refreshed_rows, dropped)
+    state["undecided"] = _sync_rows_with_recheck(list(state.get("undecided") or []), refreshed_rows, dropped)
+    if hourly_slots:
+        state["hourly_windows"] = _sync_events_with_recheck(
+            list(state.get("hourly_windows") or []),
+            slots=hourly_slots,
+            row_field="top",
+            refreshed_rows=refreshed_rows,
+            dropped=dropped,
+        )
+        state["one_hour_history"] = _sync_events_with_recheck(
+            list(state.get("one_hour_history") or []),
+            slots=hourly_slots,
+            row_field="approved",
+            refreshed_rows=refreshed_rows,
+            dropped=dropped,
+        )
+    if two_hour_slots:
+        state["two_hour_windows"] = _sync_events_with_recheck(
+            list(state.get("two_hour_windows") or []),
+            slots=two_hour_slots,
+            row_field="approved",
+            refreshed_rows=refreshed_rows,
+            dropped=dropped,
+        )
+        state["two_hour_history"] = _sync_events_with_recheck(
+            list(state.get("two_hour_history") or []),
+            slots=two_hour_slots,
+            row_field="approved",
+            refreshed_rows=refreshed_rows,
+            dropped=dropped,
+        )
+
+
+def _recheck_rows_with_latest_market_data(
+    config: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    valid_rows = [row for row in rows if isinstance(row, dict) and str(row.get("symbol") or "")]
+    symbols: list[str] = []
+    for row in valid_rows:
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if not symbols:
+        return [], {"refreshed_count": 0, "dropped": [], "warnings": []}
+
+    warnings: list[str] = []
+    digest = collect_news(config)
+    snapshots, market_warnings = fetch_market_snapshots(config, symbols)
+    warnings.extend(market_warnings)
+    market_layers: dict[str, dict[str, Any]] = {}
+    if config.get("market_guard", {}).get("use_memory_in_strategy", True):
+        try:
+            market_layers = market_guard_symbol_layers(config, symbols)
+        except Exception as exc:
+            warnings.append(f"Market guard memory unavailable during LC recheck: {exc}")
+    refreshed_candidates = build_candidates(
+        config,
+        snapshots,
+        digest,
+        limit=None,
+        market_layers=market_layers,
+    )
+    enrich_quantities(config, refreshed_candidates)
+    candidates_by_key = {(candidate.symbol, candidate.side.lower()): candidate for candidate in refreshed_candidates}
+    candidate_sides_by_symbol: dict[str, set[str]] = {}
+    for candidate in refreshed_candidates:
+        candidate_sides_by_symbol.setdefault(candidate.symbol, set()).add(candidate.side.lower())
+
+    refreshed_rows: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for row in valid_rows:
+        symbol = str(row.get("symbol") or "")
+        side = str(row.get("side") or "").lower()
+        candidate = candidates_by_key.get((symbol, side))
+        if candidate is not None:
+            refreshed_rows.append(_refresh_row_from_candidate(row, candidate, now=now))
+            continue
+        available_sides = candidate_sides_by_symbol.get(symbol) or set()
+        if available_sides:
+            opposite_sides = sorted(side_name.upper() for side_name in available_sides if side_name and side_name != side)
+            opposite_text = f"; thi truong hien nghieng {', '.join(opposite_sides)}" if opposite_sides else ""
+            dropped.append(
+                {
+                    "symbol": symbol,
+                    "old_side": side,
+                    "reason": (
+                        f"setup goc {side.upper()} khong con hop le trong du lieu moi nhat"
+                        f"{opposite_text}; re-check giu nguyen setup goc, khong doi chieu"
+                    ),
+                }
+            )
+            continue
+        dropped.append(
+            {
+                "symbol": symbol,
+                "old_side": side,
+                "reason": "không còn setup hợp lệ trong dữ liệu mới nhất",
+            }
+        )
+    return refreshed_rows, {"refreshed_count": len(refreshed_rows), "dropped": dropped, "warnings": warnings, "fallback": False}
+
+
+def _compact_patterns(frame: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(frame, dict):
+        return {}
+    patterns = frame.get("candlestick_patterns") or {}
+    if not isinstance(patterns, dict):
+        patterns = {}
+    return {
+        "direction": patterns.get("direction"),
+        "strongest_pattern": patterns.get("strongest_pattern"),
+        "signal_summary": patterns.get("signal_summary"),
+        "patterns": list(patterns.get("patterns") or [])[:4],
+    }
+
+
+def _compact_higher_timeframes(frames: dict[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    if not isinstance(frames, dict):
+        return output
+    for frame, data in frames.items():
+        if not isinstance(data, dict):
+            continue
+        output[str(frame)] = {
+            "timeframe": data.get("timeframe") or frame,
+            "last": data.get("last"),
+            "ema_gap_pct": data.get("ema_gap_pct"),
+            "price_vs_ema_slow_pct": data.get("price_vs_ema_slow_pct"),
+            "rsi": data.get("rsi"),
+            "atr_pct": data.get("atr_pct"),
+            "volume_ratio": data.get("volume_ratio"),
+            "range_position": data.get("range_position"),
+            "trend": data.get("trend"),
+            "candlestick_patterns": _compact_patterns(data),
+        }
+    return output
+
+
+def _compact_payload_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "symbol": payload.get("symbol"),
+        "base": payload.get("base"),
+        "side": payload.get("side"),
+        "confidence": payload.get("confidence"),
+        "entry": payload.get("entry"),
+        "stop_loss": payload.get("stop_loss"),
+        "take_profit": payload.get("take_profit"),
+        "risk_reward": payload.get("risk_reward"),
+        "order_usdt": payload.get("order_usdt"),
+        "quantity": payload.get("quantity"),
+        "spread_pct": payload.get("spread_pct"),
+        "news_score": payload.get("news_score"),
+        "news_count": payload.get("news_count"),
+        "higher_timeframes": _compact_higher_timeframes(payload.get("higher_timeframes") or {}),
+        "indicator_summary": to_jsonable(payload.get("indicator_summary") or {}),
+        "candlestick_patterns": to_jsonable(payload.get("candlestick_patterns") or {}),
+        "rule_score": payload.get("rule_score"),
+        "margin_usdt": payload.get("margin_usdt"),
+        "recovery_margin_usdt": payload.get("recovery_margin_usdt"),
+        "recovery_source_key": payload.get("recovery_source_key"),
+        "win_probability_pct": payload.get("win_probability_pct"),
+        "target_mode": payload.get("target_mode"),
+        "take_profit_pct": payload.get("take_profit_pct"),
+        "stop_loss_pct": payload.get("stop_loss_pct"),
+        "price_take_profit_pct": payload.get("price_take_profit_pct"),
+        "price_stop_loss_pct": payload.get("price_stop_loss_pct"),
+        "reasons": list(payload.get("reasons") or [])[:6],
+        "warnings": list(payload.get("warnings") or [])[:4],
+        "scan_source": payload.get("scan_source"),
+        "setup_quality": payload.get("setup_quality"),
+        "position_slot": payload.get("position_slot"),
+        "risk_percent": payload.get("risk_percent"),
+        "market_regime": payload.get("market_regime"),
+        "regime_confidence": payload.get("regime_confidence"),
+        "exhaustion_guard_blocked": payload.get("exhaustion_guard_blocked"),
+        "exhaustion_guard_phase": payload.get("exhaustion_guard_phase"),
+        "exhaustion_guard_reasons": list(payload.get("exhaustion_guard_reasons") or [])[:8],
+    }
+
+
+def _candidate_payload(candidate: TradeCandidate) -> dict[str, Any]:
+    return {
+        "symbol": candidate.symbol,
+        "base": candidate.base,
+        "side": candidate.side,
+        "confidence": candidate.confidence,
+        "entry": candidate.entry,
+        "stop_loss": candidate.stop_loss,
+        "take_profit": candidate.take_profit,
+        "risk_reward": candidate.risk_reward,
+        "order_usdt": candidate.order_usdt,
+        "quantity": candidate.quantity,
+        "spread_pct": candidate.spread_pct,
+        "news_score": candidate.news_score,
+        "news_count": candidate.news_count,
+        "higher_timeframes": _compact_higher_timeframes(candidate.higher_timeframes),
+        "indicator_summary": to_jsonable(candidate.indicator_summary or {}),
+        "candlestick_patterns": to_jsonable(candidate.candlestick_patterns or {}),
+        "rule_score": candidate.rule_score,
+        "margin_usdt": candidate.margin_usdt,
+        "recovery_margin_usdt": candidate.recovery_margin_usdt,
+        "recovery_source_key": candidate.recovery_source_key,
+        "win_probability_pct": candidate.win_probability_pct,
+        "target_mode": candidate.target_mode,
+        "take_profit_pct": candidate.take_profit_pct,
+        "stop_loss_pct": candidate.stop_loss_pct,
+        "price_take_profit_pct": candidate.price_take_profit_pct,
+        "price_stop_loss_pct": candidate.price_stop_loss_pct,
+        "reasons": list(candidate.reasons or [])[:6],
+        "warnings": list(candidate.warnings or [])[:4],
+        "scan_source": candidate.scan_source,
+        "setup_quality": candidate.setup_quality,
+        "position_slot": candidate.position_slot,
+        "risk_percent": candidate.risk_percent,
+        "market_regime": candidate.market_regime,
+        "regime_confidence": candidate.regime_confidence,
+    }
+
+
+def _load_state(config: dict[str, Any], now: datetime, *, reset_for_new_day: bool = True) -> dict[str, Any]:
+    try:
+        purge_deprecated_journal_state(config)
+    except Exception as exc:
+        LOGGER.warning("Skipping deprecated LC journal_state purge after storage issue: %s", exc)
+    try:
+        raw = get_journal_state(config, LC_PIPELINE_STATE_KEY)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Using empty LC pipeline state after transient storage issue: %s", exc)
+        raw = None
+    if raw:
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError:
+            state = {}
+    else:
+        state = {}
+    if state.get("state_version") != LC_PIPELINE_STATE_VERSION:
+        state["latest_mini_scan"] = {}
+        state["state_version"] = LC_PIPELINE_STATE_VERSION
+    day = _day_key(config, now)
+    if reset_for_new_day and state.get("day_key") != day:
+        state["day_key"] = day
+        state["daily_one_hour_counter"] = 0
+        state["daily_two_hour_counter"] = 0
+        state["daily_undecided_recheck_counter"] = 0
+        state["daily_mini_counter"] = 0
+        state["last_undecided_recheck_slot"] = None
+        state["hourly_windows"] = []
+        state["two_hour_windows"] = []
+        state["telegram_events"] = []
+        state["internal_notifications"] = []
+    state.setdefault("one_hour_history", [])
+    state.setdefault("two_hour_history", [])
+    state.setdefault("four_hour_history", [])
+    state.setdefault("hourly_windows", [])
+    state.setdefault("two_hour_windows", [])
+    state.setdefault("undecided", [])
+    state.setdefault("internal_lc", [])
+    state.setdefault("telegram_events", [])
+    state.setdefault("internal_notifications", [])
+    state.setdefault("rejected_setups", [])
+    state.setdefault("daily_one_hour_counter", 0)
+    state.setdefault("daily_two_hour_counter", 0)
+    state.setdefault("daily_undecided_recheck_counter", 0)
+    state.setdefault("four_hour_counter", 0)
+    state.setdefault("daily_mini_counter", 0)
+    state.setdefault("last_undecided_recheck_slot", None)
+    state.setdefault("latest_mini_scan", {})
+    state.setdefault("state_version", LC_PIPELINE_STATE_VERSION)
+    history_now = now
+    if not reset_for_new_day:
+        raw_day_key = str(state.get("day_key") or "").strip()
+        if raw_day_key:
+            try:
+                anchored_day = datetime.fromisoformat(raw_day_key).date()
+            except ValueError:
+                anchored_day = None
+            if anchored_day is not None:
+                local_now = _local_time(config, now)
+                if anchored_day < local_now.date():
+                    history_now = datetime.combine(
+                        anchored_day,
+                        datetime.max.time(),
+                        tzinfo=local_now.tzinfo,
+                    ).astimezone(timezone.utc)
+    state["one_hour_history"] = _prune_history(
+        state.get("one_hour_history") or [],
+        now=history_now,
+        keep_days=ONE_HOUR_HISTORY_KEEP_DAYS,
+    )
+    state["two_hour_history"] = _prune_history(
+        state.get("two_hour_history") or [],
+        now=history_now,
+        keep_days=TWO_HOUR_HISTORY_KEEP_DAYS,
+    )
+    state["four_hour_history"] = _prune_history(
+        state.get("four_hour_history") or [],
+        now=history_now,
+        keep_days=FOUR_HOUR_HISTORY_KEEP_DAYS,
+    )
+    sample_rows_changed = _sanitize_pipeline_state_sample_symbols(config, state)
+    _sanitize_current_day_aggregate_state(config, state, now)
+    _backfill_one_hour_source_metadata(state)
+    _prune_low_win_state(state, _pipeline_config(config), now)
+    if sample_rows_changed:
+        try:
+            _save_state(config, state)
+        except Exception:
+            pass
+    return state
+
+
+def _compact_saved_row(row: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    keep = {
+        "symbol",
+        "base",
+        "side",
+        "state",
+        "first_seen_at",
+        "last_seen_at",
+        "entry",
+        "price",
+        "confidence",
+        "win_probability_pct",
+        "current_win_probability_pct",
+        "peak_win_probability_pct",
+        "previous_scan_win_probability_pct",
+        "win_rate_trend",
+        "recheck_state",
+        "risk_reward",
+        "volume_ratio",
+        "source_slot",
+        "source_index",
+        "source_time",
+        "source_label",
+        "origin_source_slot",
+        "origin_source_index",
+        "origin_source_time",
+        "origin_source_label",
+        "revived_at",
+        "revived_label",
+        "revived_age_hours",
+        "revived_age_label",
+        "revived_target_rank",
+        "undecided_status",
+        "undecided_reason",
+        "last_recheck_at",
+        "mini_index",
+        "recheck_daily_index",
+        "recheck_slot",
+        "recheck_time",
+        "recheck_label",
+        "exhaustion_guard_blocked",
+        "exhaustion_guard_phase",
+        "exhaustion_guard_signals",
+        "exhaustion_guard_required_signals",
+        "exhaustion_guard_reasons",
+    }
+    compact = {key: row.get(key) for key in keep if key in row}
+    payload = row.get("payload")
+    if isinstance(payload, dict):
+        compact["payload"] = _compact_payload_dict(payload)
+    elif payload is not None:
+        compact["payload"] = payload
+    return compact
+
+
+def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        return {}
+    compact = {
+        "frame": event.get("frame"),
+        "slot": event.get("slot"),
+        "created_at": event.get("created_at"),
+        "index": event.get("index"),
+        "sequence_index": event.get("sequence_index"),
+        "daily_index": event.get("daily_index"),
+        "date": event.get("date"),
+        "time": event.get("time"),
+        "recheck": event.get("recheck"),
+        "source_windows": event.get("source_windows"),
+    }
+    compact["approved"] = [
+        _compact_saved_row(row)
+        for row in list(event.get("approved") or [])[:LC_PIPELINE_EVENT_APPROVED_MAX_ROWS]
+        if isinstance(row, dict)
+    ]
+    compact["rejected"] = [
+        _compact_saved_row(row)
+        for row in list(event.get("rejected") or [])[:LC_PIPELINE_EVENT_REJECTED_MAX_ROWS]
+        if isinstance(row, dict)
+    ]
+    return compact
+
+def _tail_dicts(values: Any, limit: int) -> list[dict[str, Any]]:
+    return [item for item in list(values or []) if isinstance(item, dict)][-max(0, int(limit)):]
+
+
+def _prune_history(events: list[dict[str, Any]], *, now: datetime, keep_days: int) -> list[dict[str, Any]]:
+    local_now = _local_time({"timezone": "Asia/Ho_Chi_Minh"}, now)
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        created_at = _parse_time(event.get("created_at"))
+        if created_at is not None:
+            event_day = _local_time({"timezone": "Asia/Ho_Chi_Minh"}, created_at).date()
+            if (local_now.date() - event_day).days > max(1, int(keep_days)):
+                continue
+        kept.append(event)
+    return kept
+
+
+def _compact_mini_candidate(item: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    keep = {
+        "symbol",
+        "side",
+        "confidence",
+        "win_probability_pct",
+        "risk_reward",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "spread_pct",
+        "news_score",
+        "news_count",
+        "indicator_summary",
+        "code_timeframe_analysis",
+        "mini_context_4h",
+        "reasons",
+        "warnings",
+    }
+    return {key: item.get(key) for key in keep if key in item}
+
+
+def _symbol_list(values: Any, *, limit: int = 3) -> list[str]:
+    symbols: list[str] = []
+    if not isinstance(values, list):
+        return symbols
+    for item in values:
+        symbol = str(item or "").strip()
+        if not symbol or symbol in symbols:
+            continue
+        symbols.append(symbol)
+        if len(symbols) >= max(1, int(limit)):
+            break
+    return symbols
+
+
+def _compact_local_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {}
+    return {
+        "provider": policy.get("provider"),
+        "decision": policy.get("decision"),
+        "threshold_win_probability_pct": policy.get("threshold_win_probability_pct"),
+        "qualified_symbols": _symbol_list(policy.get("qualified_symbols"), limit=3),
+        "approved_symbols": _symbol_list(policy.get("approved_symbols"), limit=3),
+        "approved_count": policy.get("approved_count"),
+        "candidate_count": policy.get("candidate_count"),
+        "selection_source": policy.get("selection_source"),
+        "skip_reason": policy.get("skip_reason"),
+        "warnings": list(policy.get("warnings") or [])[:8],
+    }
+
+
+def _compact_ai_review(review: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(review, dict):
+        return {}
+    if not review:
+        return {}
+    return {
+        "approved_symbols": _symbol_list(review.get("approved_symbols"), limit=3),
+        "decision": review.get("decision"),
+        "confidence": review.get("confidence"),
+        "setup_scores": review.get("setup_scores") if isinstance(review.get("setup_scores"), dict) else {},
+        "reason": review.get("reason"),
+        "model_version": review.get("model_version") or review.get("model"),
+        "prompt_version": review.get("prompt_version"),
+        "prompt_hash": review.get("prompt_hash"),
+        "prompt_tokens": review.get("prompt_tokens"),
+        "completion_tokens": review.get("completion_tokens"),
+        "latency_ms": review.get("latency_ms"),
+    }
+
+
+def _compact_mini_scan(scan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(scan, dict) or not scan:
+        return {}
+    pool_symbols = _symbol_list(scan.get("pool_symbols"), limit=3)
+    if not pool_symbols:
+        pool_symbols = _symbol_list(((scan.get("local_policy") or {}).get("approved_symbols")), limit=3)
+    selected_symbols = _symbol_list(scan.get("selected_symbols"), limit=3)
+    if not selected_symbols:
+        selected_symbols = _symbol_list(scan.get("approved_symbols"), limit=3)
+    compact = {
+        "enabled": bool(scan.get("enabled", True)),
+        "agent": scan.get("agent"),
+        "created_at": scan.get("created_at"),
+        "mini_index": scan.get("mini_index"),
+        "slot_id": scan.get("slot_id"),
+        "slot_start": scan.get("slot_start"),
+        "status": scan.get("status"),
+        "interval_seconds": scan.get("interval_seconds"),
+        "provider": scan.get("provider"),
+        "model": scan.get("model"),
+        "source": scan.get("source"),
+        "source_symbols": list(scan.get("source_symbols") or [])[:20],
+        "candidate_count": scan.get("candidate_count"),
+        "local_policy": _compact_local_policy(scan.get("local_policy") or {}),
+        "pool_symbols": pool_symbols,
+        "selected_symbols": selected_symbols,
+        "compact_ai_payload": bool(scan.get("compact_ai_payload", True)),
+        "warnings": list(scan.get("warnings") or [])[:20],
+        "ai_review": _compact_ai_review(scan.get("ai_review") or {}),
+        "ai_review_error": scan.get("ai_review_error"),
+        "fallback": scan.get("fallback"),
+        "skip_reason": scan.get("skip_reason"),
+        "selection_reason_vi": scan.get("selection_reason_vi"),
+        "rejection_reason_vi": scan.get("rejection_reason_vi"),
+        "decision_reason_vi": scan.get("decision_reason_vi"),
+    }
+    compact["candidates"] = [
+        _compact_mini_candidate(item)
+        for item in scan.get("candidates") or []
+        if isinstance(item, dict)
+    ][:3]
+    return compact
+
+
+def _save_state(config: dict[str, Any], state: dict[str, Any]) -> None:
+    state["state_version"] = LC_PIPELINE_STATE_VERSION
+    state["one_hour_history"] = [
+        _compact_event(event) for event in _tail_dicts(state.get("one_hour_history"), ONE_HOUR_HISTORY_MAX_EVENTS)
+    ]
+    state["two_hour_history"] = [
+        _compact_event(event) for event in _tail_dicts(state.get("two_hour_history"), TWO_HOUR_HISTORY_MAX_EVENTS)
+    ]
+    state["four_hour_history"] = [
+        _compact_event(event) for event in _tail_dicts(state.get("four_hour_history"), FOUR_HOUR_HISTORY_MAX_EVENTS)
+    ]
+    state["internal_lc"] = [_compact_saved_row(row) for row in state.get("internal_lc") or [] if isinstance(row, dict)]
+    state["undecided"] = [_compact_saved_row(row) for row in state.get("undecided") or [] if isinstance(row, dict)]
+    state["hourly_windows"] = [
+        {
+            **window,
+            "top": [_compact_saved_row(row) for row in window.get("top") or [] if isinstance(row, dict)],
+        }
+        for window in _tail_dicts(state.get("hourly_windows"), LC_PIPELINE_WINDOW_MAX_EVENTS)
+    ]
+    state["two_hour_windows"] = [
+        _compact_event(event) for event in _tail_dicts(state.get("two_hour_windows"), LC_PIPELINE_WINDOW_MAX_EVENTS)
+    ]
+    state["telegram_events"] = [
+        _compact_event(event) for event in _tail_dicts(state.get("telegram_events"), LC_PIPELINE_TELEGRAM_MAX_EVENTS)
+    ]
+    state["internal_notifications"] = _tail_dicts(
+        state.get("internal_notifications"),
+        LC_PIPELINE_INTERNAL_NOTIFICATION_MAX_EVENTS,
+    )
+    state["latest_mini_scan"] = _compact_mini_scan(state.get("latest_mini_scan") or {})
+    set_journal_state(config, LC_PIPELINE_STATE_KEY, json.dumps(state, ensure_ascii=False))
+    _persist_compact_state_views(config, state)
+    try:
+        clear_dashboard_snapshot_cache(config)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Skipping LC dashboard snapshot clear after transient storage issue: %s", exc)
+
+
+def _persist_compact_state_views(config: dict[str, Any], state: dict[str, Any]) -> None:
+    latest_four_hour_event = (
+        state["four_hour_history"][-1]
+        if state.get("four_hour_history") and isinstance(state["four_hour_history"][-1], dict)
+        else {}
+    )
+    latest_four_hour_symbols = [
+        str(row.get("symbol") or "")
+        for row in (latest_four_hour_event.get("approved") or [])
+        if isinstance(row, dict) and str(row.get("symbol") or "")
+    ]
+    internal_symbols = [
+        str(row.get("symbol") or "")
+        for row in state.get("internal_lc") or []
+        if isinstance(row, dict) and str(row.get("symbol") or "")
+    ]
+    set_journal_state(
+        config,
+        LC_PIPELINE_INTERNAL_SYMBOLS_KEY,
+        json.dumps({"symbols": internal_symbols}, ensure_ascii=False),
+    )
+    set_journal_state(
+        config,
+        LC_PIPELINE_LATEST_FOUR_HOUR_KEY,
+        json.dumps(latest_four_hour_event, ensure_ascii=False),
+    )
+    set_journal_state(
+        config,
+        LC_PIPELINE_LATEST_FOUR_HOUR_SYMBOLS_KEY,
+        json.dumps(latest_four_hour_symbols, ensure_ascii=False),
+    )
+    set_journal_state(
+        config,
+        LC_PIPELINE_LATEST_MINI_SCAN_KEY,
+        json.dumps(state["latest_mini_scan"], ensure_ascii=False),
+    )
+
+
+def _load_compact_state_value(config: dict[str, Any], key: str) -> Any | None:
+    try:
+        raw = get_journal_state(config, key)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Using empty compact LC state for key '%s' after transient storage issue: %s", key, exc)
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def lc_pipeline_internal_symbols(config: dict[str, Any], *, limit: int | None = None) -> list[str]:
+    compact = _load_compact_state_value(config, LC_PIPELINE_INTERNAL_SYMBOLS_KEY)
+    if isinstance(compact, dict):
+        compact_symbols = [str(symbol) for symbol in compact.get("symbols") or [] if str(symbol)]
+        if limit is None:
+            return compact_symbols
+        return compact_symbols[: max(1, int(limit))]
+    state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+    try:
+        _persist_compact_state_views(config, state)
+    except Exception:
+        pass
+    symbols: list[str] = []
+    for row in state.get("internal_lc") or []:
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if limit is None:
+        return symbols
+    return symbols[: max(1, int(limit))]
+
+
+def lc_pipeline_four_hour_symbols(config: dict[str, Any], *, limit: int | None = None) -> list[str]:
+    compact = _load_compact_state_value(config, LC_PIPELINE_LATEST_FOUR_HOUR_SYMBOLS_KEY)
+    if isinstance(compact, list):
+        compact_symbols = [str(symbol) for symbol in compact if str(symbol)]
+        if limit is None:
+            return compact_symbols
+        return compact_symbols[: max(1, int(limit))]
+    state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+    try:
+        _persist_compact_state_views(config, state)
+    except Exception:
+        pass
+    symbols: list[str] = []
+    for row in _latest_four_hour_rows(state):
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if limit is None:
+        return symbols
+    return symbols[: max(1, int(limit))]
+
+
+def latest_lc_pipeline_four_hour_event(config: dict[str, Any]) -> dict[str, Any] | None:
+    compact = _load_compact_state_value(config, LC_PIPELINE_LATEST_FOUR_HOUR_KEY)
+    if isinstance(compact, dict) and compact:
+        return compact
+    state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+    try:
+        _persist_compact_state_views(config, state)
+    except Exception:
+        pass
+    four_hour_history = state.get("four_hour_history") or []
+    if not four_hour_history:
+        return None
+    latest_event = four_hour_history[-1]
+    return latest_event if isinstance(latest_event, dict) else None
+
+
+def latest_lc_pipeline_mini_scan(config: dict[str, Any]) -> dict[str, Any] | None:
+    compact = _load_compact_state_value(config, LC_PIPELINE_LATEST_MINI_SCAN_KEY)
+    scan = compact if isinstance(compact, dict) else {}
+    if not scan:
+        state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+        try:
+            _persist_compact_state_views(config, state)
+        except Exception:
+            pass
+        scan = state.get("latest_mini_scan") if isinstance(state.get("latest_mini_scan"), dict) else {}
+    if not scan:
+        return None
+    current_symbols = lc_pipeline_four_hour_symbols(config, limit=10)
+    scan_pool_symbols = _symbol_list(scan.get("pool_symbols"), limit=10)
+    if not scan_pool_symbols:
+        scan_pool_symbols = _symbol_list((scan.get("local_policy") or {}).get("approved_symbols"), limit=10)
+    if not scan_pool_symbols:
+        scan_pool_symbols = list(current_symbols)
+    original_selected_symbols = _symbol_list(
+        scan.get("selected_symbols") if isinstance(scan.get("selected_symbols"), list) else scan.get("approved_symbols"),
+        limit=10,
+    )
+    latest_four_hour = latest_lc_pipeline_four_hour_event(config) or {}
+    current_slot = _parse_time(latest_four_hour.get("slot") or latest_four_hour.get("created_at"))
+    scan_slot = _parse_time(scan.get("slot_id") or scan.get("slot_start"))
+    selection_slot_stale = bool(scan_slot and current_slot and current_slot > scan_slot)
+    ai_review = scan.get("ai_review") if isinstance(scan.get("ai_review"), dict) else {}
+    ai_decision = str(ai_review.get("decision") or "").strip().upper()
+    scan_status = str(scan.get("status") or "")
+    setup_deleted_by_5_5 = scan_status == "setup_deleted_by_5_5"
+    ai_explicitly_rejected = (
+        not setup_deleted_by_5_5
+        and (
+            ai_decision in {"NO_TRADE", "NONE", "REJECTED", "REJECT"}
+            or isinstance(ai_review.get("approved_symbols"), list) and not ai_review.get("approved_symbols")
+        )
+    )
+    selected_symbols = (
+        []
+        if ai_explicitly_rejected or selection_slot_stale
+        else original_selected_symbols
+    )
+    selection_stale = bool(original_selected_symbols and selection_slot_stale)
+    current_pool_changed = bool(scan_pool_symbols and current_symbols and scan_pool_symbols != current_symbols)
+    selected_missing_from_current_pool = [
+        symbol for symbol in original_selected_symbols if current_symbols and symbol not in current_symbols
+    ]
+    status = "ai_rejected" if ai_explicitly_rejected else "stale_selection" if selection_stale else scan_status
+    skip_reason = scan.get("skip_reason")
+    if ai_explicitly_rejected:
+        skip_reason = "Mini AI returned NO_TRADE; no setup may continue to LC_OKX"
+    elif selection_stale and not selected_symbols:
+        skip_reason = "Mini selection is stale because a newer LC noi bo 4h slot is available"
+    approved_symbols = (
+        []
+        if ai_explicitly_rejected or selection_stale
+        else _symbol_list(scan.get("approved_symbols"), limit=10) or selected_symbols
+    )
+    return {
+        **scan,
+        "status": status,
+        "pool_symbols": scan_pool_symbols,
+        "pool_count": len(scan_pool_symbols),
+        "current_pool_symbols": current_symbols,
+        "current_pool_count": len(current_symbols),
+        "current_pool_changed": current_pool_changed,
+        "approved_symbols": approved_symbols,
+        "approved_count": len(approved_symbols),
+        "selected_symbols": selected_symbols,
+        "selected_count": len(selected_symbols),
+        "selected_original_symbols": original_selected_symbols,
+        "selected_missing_from_current_pool": selected_missing_from_current_pool,
+        "selection_stale": selection_stale,
+        "skip_reason": skip_reason,
+    }
+
+
+def save_lc_pipeline_mini_scan(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    state = _load_state(config, datetime.now(timezone.utc))
+    latest_scan = state.get("latest_mini_scan") if isinstance(state.get("latest_mini_scan"), dict) else {}
+    if payload.get("mini_index") in (None, ""):
+        same_slot = (
+            latest_scan
+            and str(latest_scan.get("slot_id") or "") == str(payload.get("slot_id") or "")
+            and str(latest_scan.get("created_at") or "") == str(payload.get("created_at") or "")
+        )
+        if same_slot and latest_scan.get("mini_index") not in (None, ""):
+            payload = {**payload, "mini_index": latest_scan.get("mini_index")}
+        else:
+            payload = {**payload, "mini_index": int(state.get("daily_mini_counter") or 0) + 1}
+    state["daily_mini_counter"] = max(int(state.get("daily_mini_counter") or 0), int(payload.get("mini_index") or 0))
+    state["latest_mini_scan"] = _compact_mini_scan(payload)
+    _save_state(config, state)
+    return latest_lc_pipeline_mini_scan(config) or {}
+
+
+def _upsert_by_symbol(rows: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
+    output = [row for row in rows if row.get("symbol") != record.get("symbol")]
+    output.append(record)
+    return output
+
+
+def _setup_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("symbol") or ""), str(row.get("side") or "").lower())
+
+
+def _setup_matches(row: dict[str, Any], symbol: str, side: str | None = None) -> bool:
+    if str(row.get("symbol") or "").strip().upper() != str(symbol or "").strip().upper():
+        return False
+    side_key = str(side or "").strip().lower()
+    if not side_key:
+        return True
+    row_side = str(row.get("side") or "").strip().lower()
+    return not row_side or row_side == side_key
+
+
+def _filter_setup_rows(rows: list[dict[str, Any]], symbol: str, side: str | None = None) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for row in rows:
+        if isinstance(row, dict) and _setup_matches(row, symbol, side):
+            removed += 1
+            continue
+        if isinstance(row, dict):
+            kept.append(row)
+    return kept, removed
+
+
+def _filter_symbol_values(values: Any, symbol: str) -> list[Any]:
+    if not isinstance(values, list):
+        return []
+    symbol_key = str(symbol or "").strip().upper()
+    return [value for value in values if str(value or "").strip().upper() != symbol_key]
+
+
+def _filter_mini_scan_setup(scan: dict[str, Any], symbol: str, side: str | None = None) -> tuple[dict[str, Any], int]:
+    if not isinstance(scan, dict):
+        return {}, 0
+    output = dict(scan)
+    removed = 0
+    for key in ("source_symbols", "pool_symbols", "selected_symbols", "approved_symbols"):
+        before = list(output.get(key) or []) if isinstance(output.get(key), list) else []
+        after = _filter_symbol_values(before, symbol)
+        if len(after) != len(before):
+            removed += len(before) - len(after)
+            output[key] = after
+    candidates, removed_candidates = _filter_setup_rows(
+        [row for row in list(output.get("candidates") or []) if isinstance(row, dict)],
+        symbol,
+        side,
+    )
+    if removed_candidates or isinstance(output.get("candidates"), list):
+        output["candidates"] = candidates
+        removed += removed_candidates
+    for nested_key in ("local_policy", "ai_review"):
+        nested = output.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        nested_output = dict(nested)
+        for key in ("qualified_symbols", "approved_symbols"):
+            before = list(nested_output.get(key) or []) if isinstance(nested_output.get(key), list) else []
+            after = _filter_symbol_values(before, symbol)
+            if len(after) != len(before):
+                removed += len(before) - len(after)
+                nested_output[key] = after
+        if "approved_count" in nested_output:
+            nested_output["approved_count"] = len(nested_output.get("approved_symbols") or [])
+        output[nested_key] = nested_output
+    if removed:
+        output["status"] = "setup_deleted_by_5_5"
+        output["skip_reason"] = "5.5 deleted this setup; removed from current Mini/LC pipeline"
+    return output, removed
+
+
+def _latest_four_hour_slot_from_state(state: dict[str, Any]) -> str | None:
+    four_hour_history = state.get("four_hour_history") or []
+    for event in reversed(four_hour_history):
+        if isinstance(event, dict) and str(event.get("slot") or "").strip():
+            return str(event.get("slot") or "")
+    return None
+
+
+def _active_rejected_setup_keys(state: dict[str, Any]) -> set[tuple[str, str]]:
+    latest_slot = _latest_four_hour_slot_from_state(state)
+    keys: set[tuple[str, str]] = set()
+    if not latest_slot:
+        return keys
+    for item in state.get("rejected_setups") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("four_hour_slot") or "") != latest_slot:
+            continue
+        symbol = str(item.get("symbol") or "")
+        side = str(item.get("side") or "").lower()
+        if symbol:
+            keys.add((symbol, side))
+    return keys
+
+
+def reject_lc_pipeline_setup(
+    config: dict[str, Any],
+    symbol: str,
+    *,
+    side: str | None = None,
+    reason: str | None = None,
+    lc_id: Any = None,
+    route: str = "lc_okx_setup_review",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    clean_symbol = str(symbol or "").strip()
+    if not clean_symbol:
+        return {"removed": 0, "reason": "missing_symbol"}
+    side_key = str(side or "").strip().lower()
+    now = now or datetime.now(timezone.utc)
+    state = _load_state(config, now, reset_for_new_day=False)
+    removed: dict[str, int] = {}
+
+    for key in ("undecided", "internal_lc"):
+        rows, count = _filter_setup_rows(list(state.get(key) or []), clean_symbol, side_key)
+        state[key] = rows
+        removed[key] = count
+    for key in ("one_hour_history", "two_hour_history", "four_hour_history", "two_hour_windows", "telegram_events"):
+        events = []
+        count = 0
+        for event in list(state.get(key) or []):
+            if not isinstance(event, dict):
+                continue
+            event = dict(event)
+            for rows_key in ("approved", "rejected", "top"):
+                rows, removed_count = _filter_setup_rows(list(event.get(rows_key) or []), clean_symbol, side_key)
+                if rows_key in event or removed_count:
+                    event[rows_key] = rows
+                count += removed_count
+            events.append(event)
+        state[key] = events
+        removed[key] = count
+    hourly_windows = []
+    hourly_removed = 0
+    for window in list(state.get("hourly_windows") or []):
+        if not isinstance(window, dict):
+            continue
+        rows, count = _filter_setup_rows(list(window.get("top") or []), clean_symbol, side_key)
+        hourly_windows.append({**window, "top": rows})
+        hourly_removed += count
+    state["hourly_windows"] = hourly_windows
+    removed["hourly_windows"] = hourly_removed
+    mini_scan, mini_removed = _filter_mini_scan_setup(state.get("latest_mini_scan") or {}, clean_symbol, side_key)
+    state["latest_mini_scan"] = mini_scan
+    removed["latest_mini_scan"] = mini_removed
+
+    four_hour_slot = _latest_four_hour_slot_from_state(state)
+    rejected_setups = [
+        item
+        for item in list(state.get("rejected_setups") or [])
+        if isinstance(item, dict)
+        and not (
+            str(item.get("symbol") or "").strip().upper() == clean_symbol.upper()
+            and str(item.get("side") or "").strip().lower() == side_key
+            and str(item.get("four_hour_slot") or "") == str(four_hour_slot or "")
+        )
+    ]
+    rejected_setups.append(
+        {
+            "symbol": clean_symbol,
+            "side": side_key,
+            "reason": str(reason or ""),
+            "route": route,
+            "lc_id": lc_id,
+            "four_hour_slot": four_hour_slot,
+            "mini_slot_id": (state.get("latest_mini_scan") or {}).get("slot_id"),
+            "rejected_at": now.isoformat(),
+        }
+    )
+    state["rejected_setups"] = rejected_setups[-50:]
+    _save_state(config, state)
+    total_removed = sum(int(value or 0) for value in removed.values())
+    return {"removed": total_removed, "removed_by_section": removed, "four_hour_slot": four_hour_slot}
+
+
+def _upsert_by_setup(rows: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
+    record_key = _setup_key(record)
+    output = [row for row in rows if _setup_key(row) != record_key]
+    output.append(record)
+    return output
+
+
+def _union_rows_by_setup(rows: list[dict[str, Any]], incoming_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output = list(rows)
+    for row in incoming_rows:
+        if not isinstance(row, dict):
+            continue
+        output = _upsert_by_setup(output, row)
+    return output
+
+
+def _prune_undecided(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    ranked = sorted(rows, key=_candidate_score, reverse=True)
+    return ranked[:limit]
+
+
+def _trim_undecided(rows: list[dict[str, Any]], settings: dict[str, Any]) -> list[dict[str, Any]]:
+    max_rows = int(settings["undecided_max"])
+    kept = _sort_saved_rows(list(rows), settings, reverse=True)
+    if len(kept) <= max_rows:
+        return kept
+    return kept[:max_rows]
+
+
+def _row_with_source_metadata(
+    row: dict[str, Any],
+    *,
+    state_label: str,
+    source_slot: str,
+    source_index: int | None,
+    now: datetime,
+    local_now: datetime,
+) -> dict[str, Any]:
+    source_time = now.isoformat()
+    source_label = local_now.strftime("%d/%m/%y %H:%M:%S")
+    record = {
+        **row,
+        "state": state_label,
+        "source_slot": source_slot,
+        "source_index": source_index,
+        "source_time": source_time,
+        "source_label": source_label,
+    }
+    if source_slot == "1h":
+        return record
+    origin_slot = row.get("origin_source_slot")
+    origin_index = row.get("origin_source_index")
+    origin_time = row.get("origin_source_time")
+    origin_label = row.get("origin_source_label")
+    if not origin_slot and row.get("source_index") is not None:
+        origin_slot = row.get("source_slot")
+        origin_index = row.get("source_index")
+        origin_time = row.get("source_time")
+        origin_label = row.get("source_label")
+    if not origin_slot and source_index is not None:
+        origin_slot = source_slot
+        origin_index = source_index
+        origin_time = source_time
+        origin_label = source_label
+    if origin_slot:
+        record["origin_source_slot"] = origin_slot
+        record["origin_source_index"] = origin_index
+        record["origin_source_time"] = origin_time
+        record["origin_source_label"] = origin_label
+    return record
+
+
+def _backfill_one_hour_source_metadata(state: dict[str, Any]) -> None:
+    metadata_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in state.get("one_hour_history") or []:
+        if not isinstance(event, dict):
+            continue
+        source_slot = str(event.get("frame") or "1h")
+        source_index = event.get("daily_index")
+        source_time = event.get("created_at")
+        source_label = None
+        created_at = _parse_time(source_time)
+        if created_at is not None:
+            source_label = _local_time({"timezone": "Asia/Ho_Chi_Minh"}, created_at).strftime("%d/%m/%y %H:%M:%S")
+        elif event.get("date") and event.get("time"):
+            source_label = f"{event.get('date')} {event.get('time')}"
+        for row in event.get("approved") or []:
+            if not isinstance(row, dict):
+                continue
+            metadata_by_key[_setup_key(row)] = {
+                "source_slot": source_slot,
+                "source_index": source_index,
+                "source_time": source_time,
+                "source_label": source_label,
+            }
+
+    def _apply(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("source_slot") or "") != "1h" or row.get("source_index") is not None:
+                output.append(row)
+                continue
+            metadata = metadata_by_key.get(_setup_key(row))
+            if not metadata:
+                output.append(row)
+                continue
+            output.append(
+                {
+                    **row,
+                    "source_slot": metadata.get("source_slot"),
+                    "source_index": metadata.get("source_index"),
+                    "source_time": metadata.get("source_time"),
+                    "source_label": metadata.get("source_label"),
+                }
+            )
+        return output
+
+    state["internal_lc"] = _apply(list(state.get("internal_lc") or []))
+    state["undecided"] = _apply(list(state.get("undecided") or []))
+    state["hourly_windows"] = [
+        {**window, "top": _apply(list(window.get("top") or []))}
+        for window in state.get("hourly_windows") or []
+        if isinstance(window, dict)
+    ]
+    state["one_hour_history"] = [
+        {**event, "approved": _apply(list(event.get("approved") or []))}
+        for event in state.get("one_hour_history") or []
+        if isinstance(event, dict)
+    ]
+
+
+def _latest_four_hour_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    four_hour_history = state.get("four_hour_history") or []
+    if not four_hour_history:
+        return []
+    latest_event = four_hour_history[-1]
+    if not isinstance(latest_event, dict):
+        return []
+    return [row for row in latest_event.get("approved") or [] if isinstance(row, dict)]
+
+
+def _living_hs_internal_lc_rows(
+    state: dict[str, Any],
+    *,
+    settings: dict[str, Any],
+    now: datetime,
+    blocked_symbols: set[str],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    max_age_hours = float(settings["undecided_max_age_hours"])
+    for row in _sort_saved_rows(list(state.get("internal_lc") or []), settings, reverse=True):
+        if not isinstance(row, dict):
+            continue
+        key = _setup_key(row)
+        symbol = str(row.get("symbol") or "")
+        if key in seen or not symbol or symbol in blocked_symbols:
+            continue
+        if not row.get("revived_at") and str(row.get("source_slot") or "").strip() != "HS":
+            continue
+        age_hours = _row_age_hours(row, now)
+        if age_hours is not None and age_hours > max_age_hours:
+            continue
+        if not _row_is_relaxed_valid(row, settings):
+            continue
+        output.append(row)
+        seen.add(key)
+    return output
+
+
+def _row_origin_label(row: dict[str, Any], *, config: dict[str, Any]) -> str | None:
+    origin_slot = str(row.get("origin_source_slot") or "").strip()
+    origin_index = row.get("origin_source_index")
+    origin_time = row.get("origin_source_time")
+    if not origin_slot:
+        source_slot = str(row.get("source_slot") or "").strip()
+        if source_slot == "1h":
+            origin_slot = source_slot
+            origin_index = row.get("source_index")
+            origin_time = row.get("source_time")
+    if origin_slot != "1h":
+        return None
+    origin_time_label = _event_clock_label(origin_time, config=config)
+    origin_icon = _frame_icon(config, origin_slot)
+    if origin_index in (None, ""):
+        return f"Gốc {origin_icon} {origin_slot} ({origin_time_label})"
+    return f"Gốc {origin_icon} {origin_slot} #{origin_index} ({origin_time_label})"
+
+
+def _base_source_label(row: dict[str, Any]) -> str:
+    source_slot = row.get("source_slot") or row.get("state") or "-"
+    source_index = row.get("source_index")
+    raw_label = str(row.get("source_label") or "").strip()
+    source_clock = None
+    if raw_label:
+        parts = raw_label.split()
+        source_clock = parts[-1] if parts else None
+    if not source_clock:
+        source_time = _parse_time(row.get("source_time"))
+        source_clock = source_time.strftime("%H:%M:%S") if source_time else None
+    if source_index:
+        return f"{source_slot} #{source_index} ({source_clock})" if source_clock else f"{source_slot} #{source_index}"
+    return str(source_slot)
+
+
+def _revived_target_label(row: dict[str, Any]) -> str:
+    rank = row.get("revived_target_rank")
+    if rank in (None, ""):
+        return "LC nội bộ hiện tại"
+    return f"LC nội bộ #{rank}"
+
+
+def _revived_time_label(row: dict[str, Any]) -> str | None:
+    raw_label = str(row.get("revived_label") or "").strip()
+    if raw_label:
+        parts = raw_label.split()
+        return parts[-1] if parts else raw_label
+    revived_at = _parse_time(row.get("revived_at"))
+    return revived_at.strftime("%H:%M:%S") if revived_at else None
+
+
+def _format_pair_line(
+    index: int,
+    row: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+    include_origin: bool = False,
+) -> str:
+    price = row.get("price") or row.get("entry") or "-"
+    volume = row.get("volume_ratio")
+    win_probability = row.get("win_probability_pct")
+    try:
+        volume_text = f"x{float(volume):.2f}"
+    except (TypeError, ValueError):
+        volume_text = "-"
+    try:
+        win_text = f"{float(win_probability):.2f}%"
+    except (TypeError, ValueError):
+        win_text = "-"
+    try:
+        price_text = f"{float(price):.6g}"
+    except (TypeError, ValueError):
+        price_text = str(price)
+    side_text = str(row.get("side") or "-").upper()
+    parts = [
+        f"{index}. {row.get('symbol', '-')}",
+        side_text,
+        f"Win {win_text}",
+        f"Giá {price_text}",
+        f"KLGD {volume_text}",
+    ]
+    if include_origin and config is not None:
+        origin_label = _row_origin_label(row, config=config)
+        if origin_label:
+            parts.append(origin_label)
+    if row.get("revived_at"):
+        parts.append("HS")
+    return " | ".join(parts)
+
+
+def _event_clock_label(value: Any, *, config: dict[str, Any] | None = None) -> str:
+    event_time = _parse_time(value)
+    if event_time is None:
+        return "-"
+    return _local_time(config or {}, event_time).strftime("%H:%M")
+
+
+def _source_window_payload(frame: str, event: dict[str, Any], *, config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "frame": frame,
+        "index": event.get("daily_index", event.get("index")),
+        "time": _event_clock_label(event.get("created_at") or event.get("slot"), config=config),
+        "slot": event.get("slot"),
+        "created_at": event.get("created_at"),
+    }
+
+
+def _source_window_label(item: dict[str, Any], *, config: dict[str, Any]) -> str:
+    frame = str(item.get("frame") or "-")
+    index = item.get("index")
+    time_label = str(item.get("time") or "-")
+    icon = _frame_icon(config, frame)
+    if index in (None, ""):
+        return f"{icon} {frame} ({time_label})"
+    return f"{icon} {frame} #{index} ({time_label})"
+
+
+def _raw_pipeline_state(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        raw = get_journal_state(config, LC_PIPELINE_STATE_KEY)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Using empty raw LC pipeline state after transient storage issue: %s", exc)
+        return {}
+    if not raw:
+        return {}
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    if _sanitize_pipeline_state_sample_symbols(config, state):
+        try:
+            _save_state(config, state)
+        except Exception:
+            pass
+    return state
+
+
+def _infer_source_windows(config: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    frame = str(event.get("frame") or "").lower()
+    history_key = ""
+    source_frame = ""
+    if frame == "2h":
+        history_key = "one_hour_history"
+        source_frame = "1h"
+    elif frame == "4h":
+        history_key = "two_hour_history"
+        source_frame = "2h"
+    else:
+        return []
+
+    state = _raw_pipeline_state(config)
+    history = state.get(history_key) if isinstance(state.get(history_key), list) else []
+    if not history:
+        return []
+    target_time = _parse_time(event.get("created_at") or event.get("slot"))
+    eligible: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        item_time = _parse_time(item.get("created_at") or item.get("slot"))
+        if target_time is not None and item_time is not None and item_time > target_time:
+            continue
+        eligible.append(item)
+    inferred = eligible[-2:]
+    return [_source_window_payload(source_frame, item, config=config) for item in inferred if isinstance(item, dict)]
+
+
+def _event_source_windows(config: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    source_windows = event.get("source_windows") if isinstance(event.get("source_windows"), list) else []
+    source_windows = [item for item in source_windows if isinstance(item, dict)]
+    if source_windows:
+        return source_windows
+    return _infer_source_windows(config, event)
+
+
+def _event_source_lines(event: dict[str, Any], *, config: dict[str, Any]) -> list[str]:
+    frame = str(event.get("frame") or "-")
+    frame_index = event.get("daily_index")
+    if frame_index in (None, ""):
+        frame_index = event.get("index")
+    frame_time = _event_clock_label(event.get("created_at") or event.get("slot"), config=config)
+    frame_icon = _frame_icon(config, frame)
+    if frame_index in (None, ""):
+        lines = [f"Khung {frame_icon} {frame}: ({frame_time})"]
+    else:
+        lines = [f"Khung {frame_icon} {frame}: #{frame_index} ({frame_time})"]
+    source_windows = _event_source_windows(config, event)
+    source_labels = [_source_window_label(item, config=config) for item in source_windows if isinstance(item, dict)]
+    if source_labels:
+        lines.append("Gộp từ: " + ", ".join(source_labels))
+    return lines
+
+
+def _mini_reason_vi(scan: dict[str, Any]) -> str:
+    selected_symbols = _symbol_list(scan.get("selected_symbols"), limit=3)
+    ai_review = scan.get("ai_review") if isinstance(scan.get("ai_review"), dict) else {}
+    local_policy = scan.get("local_policy") if isinstance(scan.get("local_policy"), dict) else {}
+    selection_source = str(local_policy.get("selection_source") or "")
+    status = str(scan.get("status") or "")
+    if selected_symbols:
+        if ai_review:
+            return (
+                "Mini đã đối chiếu nhóm LC 4h với đánh giá AI nội bộ, rồi giữ lại các cặp còn mạnh về Win Rate, "
+                "chất lượng setup, xu hướng và chỉ báo."
+            )
+        if selection_source == "lc_internal_pipeline":
+            return (
+                "Mini chọn trực tiếp từ nhóm LC 4h hiện tại vì các cặp này đang nổi bật nhất sau khi so sánh "
+                "Win Rate, chất lượng setup, xu hướng và chỉ báo."
+            )
+        return "Mini giữ lại các cặp đang phù hợp nhất trong nhóm LC 4h hiện tại."
+    if status == "waiting_lc":
+        return "Mini chưa chọn cặp nào vì hiện chưa có đủ LC 4h phù hợp để duyệt."
+    if status == "stale_selection":
+        return "Mini chưa chốt cặp vì dữ liệu LC 4h đã thay đổi, cần chờ lượt Mini mới."
+    skip_reason = str(scan.get("skip_reason") or "").strip()
+    if skip_reason:
+        return f"Mini chưa chọn cặp nào. Lý do: {skip_reason}."
+    return "Mini chưa chọn cặp nào sau khi rà lại nhóm LC 4h."
+
+
+def _mini_reason_notification_lines(scan: dict[str, Any]) -> list[str]:
+    selection_reason = str(scan.get("selection_reason_vi") or "").strip()
+    rejection_reason = str(scan.get("rejection_reason_vi") or "").strip()
+    if selection_reason or rejection_reason:
+        lines: list[str] = []
+        if selection_reason:
+            lines.append("Lý do chọn: " + selection_reason)
+        if rejection_reason:
+            lines.append("Lý do loại: " + rejection_reason)
+        return lines
+    return ["Lý do: " + str(scan.get("decision_reason_vi") or _mini_reason_vi(scan))]
+
+
+def _mini_ai_watch_notification_lines(scan: dict[str, Any], *, limit: int = 3) -> list[str]:
+    ai_review = scan.get("ai_review") if isinstance(scan.get("ai_review"), dict) else {}
+    result = _ai_watch_result_from_text(scan.get("status"), scan.get("skip_reason"), ai_review.get("decision"))
+    if not result:
+        return []
+    symbols = _symbol_list(scan.get("pool_symbols"), limit=limit) or _symbol_list(scan.get("current_pool_symbols"), limit=limit)
+    if not symbols:
+        symbols = _symbol_list(scan.get("selected_original_symbols"), limit=limit)
+    if not symbols:
+        symbols = _symbol_list(scan.get("selected_symbols"), limit=limit)
+    reason = str(scan.get("skip_reason") or ai_review.get("reason") or ai_review.get("decision") or "").strip()
+    suffix = f" | {reason}" if reason else ""
+    return [f"AI WATCH: {symbol} | MINI | {result.upper()}{suffix}" for symbol in symbols]
+
+
+def _build_internal_lc_rows(
+    rows: list[dict[str, Any]],
+    *,
+    source_slot: str,
+    source_index: int | None,
+    now: datetime,
+    local_now: datetime,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        output.append(
+            _row_with_source_metadata(
+                row,
+                state_label="LC_NOI_BO",
+                source_slot=source_slot,
+                source_index=source_index,
+                now=now,
+                local_now=local_now,
+            )
+        )
+    return output
+
+
+def _append_internal_notification(
+    state: dict[str, Any],
+    *,
+    frame: str,
+    icon: str,
+    title: str,
+    lines: list[str],
+    created_at: datetime,
+) -> None:
+    state.setdefault("internal_notifications", [])
+    state["internal_notifications"].append(
+        {
+            "frame": frame,
+            "icon": icon,
+            "title": title,
+            "created_at": created_at.isoformat(),
+            "lines": lines,
+        }
+    )
+    state["internal_notifications"] = sorted(
+        state["internal_notifications"],
+        key=lambda item: str(item.get("created_at") or ""),
+    )[-80:]
+
+
+def _internal_notification_text(item: dict[str, Any], config: dict[str, Any]) -> str:
+    created_at = _parse_time(item.get("created_at"))
+    created_label = _local_time(config, created_at).strftime("%d/%m/%y %H:%M:%S") if created_at else "-"
+    lines = [
+        f"{item.get('icon', '🔔')} {item.get('title', '-')}",
+        created_label,
+    ]
+    lines.extend(str(line) for line in item.get("lines") or [])
+    return "\n".join(lines)
+
+
+def _internal_notification_summary_line(item: dict[str, Any], config: dict[str, Any]) -> str:
+    created_at = _parse_time(item.get("created_at"))
+    created_label = _local_time(config, created_at).strftime("%d/%m/%y %H:%M:%S") if created_at else "-"
+    details = [str(line).strip() for line in item.get("lines") or [] if str(line).strip()]
+    header = f"{item.get('icon', '🔔')} {item.get('title', '-')} | {created_label}"
+    if not details:
+        return header
+    return " | ".join([header, *details])
+
+
+def _one_hour_notification_text(config: dict[str, Any], event: dict[str, Any]) -> str:
+    rows = [row for row in event.get("approved") or [] if isinstance(row, dict)]
+    daily_index = event.get("daily_index", event.get("index", "-"))
+    lines = [
+        f"{ONE_HOUR_ICON} 1h top {len(rows)} setup",
+        f"{event.get('date', '-')} {event.get('time', '-')}",
+        f"Khung {ONE_HOUR_ICON} 1h: #{daily_index} ({_event_clock_label(event.get('created_at') or event.get('slot'), config=config)})",
+    ]
+    if rows:
+        lines.extend(_format_pair_line(index, row, config=config) for index, row in enumerate(rows[:3], 1))
+    else:
+        lines.append("Khong co cap nao du dieu kien giu lai o 1h.")
+    return "\n".join(lines)
+
+
+def _two_hour_notification_text(config: dict[str, Any], event: dict[str, Any]) -> str:
+    rows = [row for row in event.get("approved") or [] if isinstance(row, dict)]
+    icon = _two_hour_icon(config)
+    lines = [
+        f"{icon} #{event.get('daily_index', '-')} LC nội bộ tổng hợp 2h",
+        f"{event.get('date', '-')} {event.get('time', '-')}",
+    ]
+    lines.extend(_event_source_lines(event, config=config))
+    lines.append("3 cặp duyệt lượt này:")
+    if rows:
+        lines.extend(_format_pair_line(index, row, config=config, include_origin=True) for index, row in enumerate(rows[:3], 1))
+    else:
+        lines.append("Khong co cap nao du dieu kien giu lai o 2h.")
+    return "\n".join(lines)
+
+
+def _four_hour_notification_text(config: dict[str, Any], event: dict[str, Any]) -> str:
+    rows = [row for row in event.get("approved") or [] if isinstance(row, dict)]
+    lines = [f"{FOUR_HOUR_ICON} #{event.get('index', '-')} LC nội bộ tổng hợp 4h"]
+    if event.get("date") or event.get("time"):
+        lines.append(f"{event.get('date', '-')} {event.get('time', '-')}".strip())
+    lines.extend(_event_source_lines(event, config=config))
+    lines.append("Các cặp giữ lại ở 4h:")
+    if rows:
+        lines.extend(_format_pair_line(index, row, config=config, include_origin=True) for index, row in enumerate(rows[:3], 1))
+    else:
+        lines.append("Không có cặp nào đủ điều kiện giữ lại ở 4h.")
+    return "\n".join(lines)
+
+
+def _mini_notification_text(
+    config: dict[str, Any],
+    scan: dict[str, Any],
+    latest_four_hour: dict[str, Any] | None,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+) -> str:
+    created_at = _parse_time(scan.get("created_at")) or datetime.now(timezone.utc)
+    local_now = _local_time(config, created_at)
+    selected_symbols = _symbol_list(scan.get("selected_symbols"), limit=3)
+    selected_count = len(selected_symbols)
+    mini_index = scan.get("mini_index") or "-"
+    display_rows = [row for row in (rows or []) if isinstance(row, dict)]
+    if not display_rows:
+        display_rows = lc_pipeline_pool_rows(config, list(selected_symbols))
+    lines = [
+        f"{MINI_ICON} Mini #{mini_index}" if mini_index != "-" else f"{MINI_ICON} Mini",
+        local_now.strftime("%d/%m/%y %H:%M:%S"),
+        f"Lần gọi Mini: #{mini_index} ({local_now.strftime('%H:%M')})" if mini_index != "-" else f"Lần gọi Mini: {local_now.strftime('%H:%M')}",
+        f"Mini chọn: {selected_count}/3 cặp",
+    ]
+    if isinstance(latest_four_hour, dict):
+        lines.extend(_event_source_lines(latest_four_hour, config=config))
+    if display_rows:
+        for index, row in enumerate(display_rows[:3], 1):
+            side = str(row.get("side") or "-").upper()
+            lines.append(f"{index}. {row.get('symbol', '-')} | {side} | {_source_label(row)}")
+    else:
+        lines.append("Mini chưa chọn được cặp nào.")
+    lines.extend(_mini_reason_notification_lines(scan))
+    lines.extend(_mini_ai_watch_notification_lines(scan))
+    if scan.get("slot_id"):
+        lines.append(f"Slot: {scan.get('slot_id')}")
+    return "\n".join(lines)
+
+
+def _rc_recheck_row_line(index: int, row: dict[str, Any], *, dropped: bool = False) -> str:
+    side = str(row.get("side") or "-").upper()
+    try:
+        win_text = f"{float(row.get('win_probability_pct') or 0):.2f}%"
+    except (TypeError, ValueError):
+        win_text = "-"
+    prefix = "Win trước" if dropped else "Win"
+    return f"{index}. {row.get('symbol', '-')} | {side} | {prefix} {win_text}"
+
+
+def _undecided_recheck_notification_text(
+    config: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    kept_rows: list[dict[str, Any]],
+    promoted_rows: list[dict[str, Any]],
+) -> str:
+    created_at = _parse_time(meta.get("recheck_time")) or datetime.now(timezone.utc)
+    local_now = _local_time(config, created_at)
+    recheck_index = meta.get("daily_index", "-")
+    dropped_rows = [row for row in meta.get("dropped_rows") or [] if isinstance(row, dict)]
+    lines = [
+        f"📋 RC #{recheck_index} Chưa Duyệt",
+        local_now.strftime("%d/%m/%y %H:%M:%S"),
+        f"Lần recheck: #{recheck_index} ({local_now.strftime('%H:%M:%S')})",
+        (
+            f"Kept {len(kept_rows)} | Dropped {len(dropped_rows)} | "
+            f"Promoted {len(promoted_rows)}"
+        ),
+    ]
+    if kept_rows:
+        lines.append("Giữ lại:")
+        lines.extend(_rc_recheck_row_line(index, row) for index, row in enumerate(kept_rows[:3], 1))
+    else:
+        lines.append("Giữ lại: không còn cặp nào.")
+    if dropped_rows:
+        lines.append("Bị loại:")
+        lines.extend(_rc_recheck_row_line(index, row, dropped=True) for index, row in enumerate(dropped_rows[:3], 1))
+    else:
+        lines.append("Bị loại: 0")
+    if promoted_rows:
+        lines.append("Đẩy lên LC nội bộ:")
+        lines.extend(_rc_recheck_row_line(index, row) for index, row in enumerate(promoted_rows[:3], 1))
+    else:
+        lines.append("Đẩy lên LC nội bộ: 0")
+    return "\n".join(lines)
+
+
+def _rc_row_age_label(row: dict[str, Any], now: datetime) -> str:
+    age_hours = _row_age_hours(row, now)
+    if age_hours is None:
+        return str(row.get("age_label") or "-")
+    label = _age_label(age_hours)
+    if age_hours >= 6.0:
+        return f"{label} (đủ slot LC)"
+    return label
+
+
+def _rc_row_source_label(config: dict[str, Any], row: dict[str, Any]) -> str:
+    origin_label = _row_origin_label(row, config=config)
+    if origin_label:
+        return origin_label
+    return f"Nguồn {_base_source_label(row)}"
+
+
+def _rc_recheck_row_line_v2(
+    config: dict[str, Any],
+    index: int,
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    dropped: bool = False,
+) -> str:
+    side = str(row.get("side") or "-").upper()
+    try:
+        win_text = f"{float(row.get('win_probability_pct') or 0):.2f}%"
+    except (TypeError, ValueError):
+        win_text = "-"
+    prefix = "Win trước" if dropped else "Win"
+    parts = [
+        f"{index}. {row.get('symbol', '-')}",
+        side,
+        f"{prefix} {win_text}",
+        _rc_row_source_label(config, row),
+        f"sống {_rc_row_age_label(row, now)}",
+    ]
+    if row.get("revived_at"):
+        parts.append(_revived_target_label(row))
+        revived_time = _revived_time_label(row)
+        if revived_time:
+            parts.append(f"Hồi sinh {revived_time}")
+        parts.append("HS")
+    return " | ".join(parts)
+
+
+def _rc_recheck_row_line_v3(
+    config: dict[str, Any],
+    index: int,
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    dropped: bool = False,
+) -> str:
+    side = str(row.get("side") or "-").upper()
+    try:
+        win_text = f"{float(row.get('win_probability_pct') or 0):.2f}%"
+    except (TypeError, ValueError):
+        win_text = "-"
+    try:
+        current_win_text = f"{float(row.get('current_win_probability_pct', row.get('win_probability_pct')) or 0):.2f}%"
+    except (TypeError, ValueError):
+        current_win_text = win_text
+    try:
+        previous_win_raw = row.get("previous_scan_win_probability_pct")
+        previous_win_text = f"{float(previous_win_raw):.2f}%" if previous_win_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        previous_win_text = None
+    if dropped:
+        win_label = f"Win {previous_win_text} -> {current_win_text}" if previous_win_text else f"Win recheck {current_win_text}"
+    else:
+        win_label = f"Win {current_win_text}"
+    parts = [
+        f"{index}. {row.get('symbol', '-')}",
+        side,
+        win_label,
+        _rc_row_source_label(config, row),
+        f"sá»‘ng {_rc_row_age_label(row, now)}",
+    ]
+    if row.get("revived_at"):
+        parts.append(_revived_target_label(row))
+        revived_time = _revived_time_label(row)
+        if revived_time:
+            parts.append(f"Há»“i sinh {revived_time}")
+        parts.append("HS")
+    return " | ".join(parts)
+
+
+def _undecided_recheck_notification_text_v2(
+    config: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    kept_rows: list[dict[str, Any]],
+    promoted_rows: list[dict[str, Any]],
+) -> str:
+    created_at = _parse_time(meta.get("recheck_time")) or datetime.now(timezone.utc)
+    local_now = _local_time(config, created_at)
+    recheck_index = meta.get("daily_index", "-")
+    dropped_rows = [row for row in meta.get("dropped_rows") or [] if isinstance(row, dict)]
+    lines = [
+        f"📋 RC #{recheck_index} Chưa Duyệt",
+        local_now.strftime("%d/%m/%y %H:%M:%S"),
+        f"Lần recheck: #{recheck_index} ({local_now.strftime('%H:%M:%S')})",
+        f"Kept {len(kept_rows)} | Dropped {len(dropped_rows)} | Promoted {len(promoted_rows)}",
+    ]
+    if kept_rows:
+        lines.append("🟢 Giữ lại:")
+        lines.extend(_rc_recheck_row_line_v3(config, index, row, now=created_at) for index, row in enumerate(kept_rows[:3], 1))
+    else:
+        lines.append("🟢 Giữ lại: không còn cặp nào.")
+    if dropped_rows:
+        lines.append("🔴 Bị loại:")
+        lines.extend(
+            _rc_recheck_row_line_v3(config, index, row, now=created_at, dropped=True)
+            for index, row in enumerate(dropped_rows[:3], 1)
+        )
+    else:
+        lines.append("🔴 Bị loại: 0")
+    if promoted_rows:
+        lines.append("♻️ Đẩy lên LC nội bộ:")
+        lines.extend(
+            _rc_recheck_row_line_v3(config, index, row, now=created_at)
+            for index, row in enumerate(promoted_rows[:3], 1)
+        )
+        top = promoted_rows[0]
+        revived_time = _revived_time_label(top)
+        lines.append(
+            f"Thông báo hồi sinh: {top.get('symbol', '-')} -> {_revived_target_label(top)} | "
+            f"từ {_base_source_label(top)} | lúc {revived_time or '-'}"
+        )
+    else:
+        lines.append("♻️ Đẩy lên LC nội bộ: 0")
+    return "\n".join(lines)
+
+
+def internal_notification_timeline_messages(config: dict[str, Any], *, limit_per_frame: int = 5) -> list[str]:
+    now = datetime.now(timezone.utc)
+    state = _load_state(config, now, reset_for_new_day=False)
+    current_day = str(state.get("day_key") or _day_key(config, now))
+    items = state.get("internal_notifications") if isinstance(state.get("internal_notifications"), list) else []
+    entries: list[tuple[str, str]] = []
+    for event in state.get("one_hour_history") or []:
+        if isinstance(event, dict) and _is_same_local_day(config, event.get("created_at") or event.get("slot"), current_day):
+            entries.append((str(event.get("created_at") or ""), _one_hour_notification_text(config, event)))
+    for event in state.get("two_hour_history") or []:
+        if isinstance(event, dict) and _is_same_local_day(config, event.get("created_at") or event.get("slot"), current_day):
+            entries.append((str(event.get("created_at") or ""), _two_hour_notification_text(config, event)))
+    for event in state.get("four_hour_history") or []:
+        if isinstance(event, dict) and _is_same_local_day(config, event.get("created_at") or event.get("slot"), current_day):
+            entries.append((str(event.get("created_at") or ""), _four_hour_notification_text(config, event)))
+    latest_scan = latest_lc_pipeline_mini_scan(config)
+    latest_four_hour = state.get("four_hour_history")[-1] if state.get("four_hour_history") else None
+    mini_created_at_keys: set[str] = set()
+    if (
+        isinstance(latest_scan, dict)
+        and latest_scan.get("created_at")
+        and _is_same_local_day(config, latest_scan.get("created_at"), current_day)
+    ):
+        created_at_key = str(latest_scan.get("created_at") or "")
+        entries.append((created_at_key, _mini_notification_text(config, latest_scan, latest_four_hour)))
+        mini_created_at_keys.add(created_at_key)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        frame = str(item.get("frame") or "")
+        if frame in {"rc", "1h", "2h", "4h"}:
+            continue
+        created_at_key = str(item.get("created_at") or "")
+        if not created_at_key or not _is_same_local_day(config, created_at_key, current_day):
+            continue
+        if frame == "mini" and created_at_key in mini_created_at_keys:
+            continue
+        entries.append((created_at_key, _internal_notification_text(item, config)))
+    if not entries:
+        return []
+    timeline_limit = max(4, int(limit_per_frame) * 4)
+    timeline = sorted(entries, key=lambda item: item[0])[-timeline_limit:]
+    return [text for _, text in timeline]
+
+
+def undecided_notification_timeline_messages(config: dict[str, Any], *, limit_per_frame: int = 5) -> list[str]:
+    now = datetime.now(timezone.utc)
+    state = _load_state(config, now, reset_for_new_day=False)
+    current_day = str(state.get("day_key") or _day_key(config, now))
+    items = state.get("internal_notifications") if isinstance(state.get("internal_notifications"), list) else []
+    entries: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("frame") or "") != "rc":
+            continue
+        created_at_key = str(item.get("created_at") or "")
+        if not created_at_key or not _is_same_local_day(config, created_at_key, current_day):
+            continue
+        entries.append((created_at_key, _internal_notification_text(item, config)))
+    if not entries:
+        return []
+    timeline_limit = max(3, int(limit_per_frame) * 3)
+    timeline = sorted(entries, key=lambda item: item[0])[-timeline_limit:]
+    return [text for _, text in timeline]
+
+
+def format_internal_notifications_view(config: dict[str, Any], *, limit_per_frame: int = 5) -> str:
+    timeline_messages = internal_notification_timeline_messages(config, limit_per_frame=limit_per_frame)
+    if not timeline_messages:
+        return "🔔 Thông báo nội bộ: chưa có dữ liệu 1h/2h/4h/Mini."
+    blocks = [
+        "🔔 Thông báo nội bộ",
+        "Timeline 1h/2h/4h/Mini, mỗi khối là 1 thông báo đầy đủ, mới nhất nằm dưới cùng.",
+    ]
+    blocks.extend(timeline_messages)
+    return "\n\n".join(blocks)
+
+
+def _notify_two_hour_summary(config: dict[str, Any], event: dict[str, Any]) -> None:
+    sanitized_event, _ = _sanitize_event_sample_rows(config, event)
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    send_telegram_message(
+        config,
+        _two_hour_notification_text(config, sanitized_event),
+        with_buttons=False,
+        replace_previous=False,
+        allow_during_startup_quiet=True,
+    )
+
+
+def _notify_one_hour_summary(config: dict[str, Any], event: dict[str, Any]) -> None:
+    sanitized_event, _ = _sanitize_event_sample_rows(config, event)
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    send_telegram_message(
+        config,
+        _one_hour_notification_text(config, sanitized_event),
+        with_buttons=False,
+        replace_previous=False,
+        allow_during_startup_quiet=True,
+    )
+
+
+def _notify_four_hour_summary(config: dict[str, Any], event: dict[str, Any]) -> None:
+    sanitized_event, _ = _sanitize_event_sample_rows(config, event)
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    send_telegram_message(
+        config,
+        _four_hour_notification_text(config, sanitized_event),
+        with_buttons=False,
+        replace_previous=False,
+        allow_during_startup_quiet=True,
+    )
+
+
+def _should_push_one_hour_summary(config: dict[str, Any], now: datetime) -> bool:
+    local_now = _local_time(config, now)
+    return local_now.minute == 0
+
+
+def _notify_undecided_recheck_summary(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    kept_rows: list[dict[str, Any]],
+    promoted_rows: list[dict[str, Any]],
+    now: datetime,
+) -> None:
+    filtered_kept_rows = _filter_sample_rows(config, kept_rows)
+    filtered_promoted_rows = _filter_sample_rows(config, promoted_rows)
+    displayed_setup_keys = {
+        _setup_key(row)
+        for row in [*filtered_kept_rows, *filtered_promoted_rows]
+        if isinstance(row, dict)
+    }
+    filtered_dropped_rows = [
+        row
+        for row in _filter_sample_rows(config, list(meta.get("dropped_rows") or []))
+        if isinstance(row, dict) and _setup_key(row) not in displayed_setup_keys
+    ]
+    filtered_input_count = len(filtered_kept_rows) + len(filtered_dropped_rows)
+    if filtered_input_count <= 0:
+        return
+    text = _undecided_recheck_notification_text_v2(
+        config,
+        {**meta, "recheck_time": now.isoformat(), "input_count": filtered_input_count, "dropped_rows": filtered_dropped_rows},
+        kept_rows=filtered_kept_rows,
+        promoted_rows=filtered_promoted_rows,
+    )
+    lines = text.splitlines()[2:]
+    _append_internal_notification(
+        state,
+        frame="rc",
+        icon="📋",
+        title=f"RC #{meta.get('daily_index', '-')}",
+        lines=lines,
+        created_at=now,
+    )
+    if not _pipeline_config(config)["notify_undecided_recheck_summary"]:
+        return
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    send_telegram_message(config, text, with_buttons=False, replace_previous=False)
+
+
+def _age_label(hours: float) -> str:
+    total_minutes = max(0, int(hours * 60))
+    whole_hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if whole_hours:
+        return f"{whole_hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _row_age_payload(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+    first_seen = _parse_time(row.get("first_seen_at"))
+    last_seen = _parse_time(row.get("last_seen_at"))
+    age_hours = (now - first_seen).total_seconds() / 3600 if first_seen else None
+    return {
+        **row,
+        "first_seen_at": first_seen.isoformat() if first_seen else row.get("first_seen_at"),
+        "last_seen_at": last_seen.isoformat() if last_seen else row.get("last_seen_at"),
+        "age_hours": round(age_hours, 3) if age_hours is not None else None,
+        "age_label": _age_label(age_hours or 0) if age_hours is not None else "-",
+    }
+
+
+def _ai_watch_result_from_text(*values: Any) -> str | None:
+    text = " | ".join(str(value or "") for value in values).lower()
+    if "no_trade" in text or "no trade" in text:
+        return "no_trade"
+    if "review" in text or "candidate_reviewed" in text:
+        return "review"
+    if "reject" in text:
+        return None
+    return None
+
+def _ai_watch_rows(config: dict[str, Any], *, now: datetime) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        report = latest_decision_payload(config) or {}
+    except Exception:
+        report = {}
+    decision = report.get("decision") if isinstance(report.get("decision"), dict) else report
+    if isinstance(decision, dict):
+        selected = decision.get("selected") if isinstance(decision.get("selected"), dict) else {}
+        stages = decision.get("decision_stages") if isinstance(decision.get("decision_stages"), dict) else {}
+        ai_review = stages.get("ai_review") if isinstance(stages.get("ai_review"), dict) else {}
+        risk_gate = stages.get("risk_gate") if isinstance(stages.get("risk_gate"), dict) else {}
+        execution = stages.get("execution") if isinstance(stages.get("execution"), dict) else {}
+        reasons = risk_gate.get("reasons") if isinstance(risk_gate.get("reasons"), list) else []
+        result = _ai_watch_result_from_text(
+            ai_review.get("status"),
+            ai_review.get("decision"),
+            selected.get("setup_quality"),
+            " | ".join(str(item) for item in reasons),
+            execution.get("message"),
+        )
+        if result and selected.get("symbol"):
+            rows.append(
+                {
+                    "symbol": selected.get("symbol"),
+                    "side": selected.get("side"),
+                    "flow": "automation",
+                    "result": result,
+                    "created_at": decision.get("created_at"),
+                    "confidence": selected.get("confidence") or ai_review.get("confidence"),
+                    "win_probability_pct": selected.get("win_probability_pct") or ai_review.get("win_probability_pct"),
+                    "reason": next((str(item) for item in reasons if item), execution.get("message") or ai_review.get("status")),
+                }
+            )
+
+    scan = latest_lc_pipeline_mini_scan(config) or {}
+    ai_review = scan.get("ai_review") if isinstance(scan.get("ai_review"), dict) else {}
+    result = _ai_watch_result_from_text(scan.get("status"), scan.get("skip_reason"), ai_review.get("decision"))
+    if result:
+        symbols = _symbol_list(scan.get("pool_symbols"), limit=10) or _symbol_list(scan.get("current_pool_symbols"), limit=10)
+        if not symbols:
+            symbols = _symbol_list(scan.get("selected_original_symbols"), limit=10)
+        for symbol in symbols:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "side": None,
+                    "flow": "mini",
+                    "result": result,
+                    "created_at": scan.get("created_at") or scan.get("slot_id"),
+                    "confidence": None,
+                    "win_probability_pct": None,
+                    "reason": scan.get("skip_reason") or ai_review.get("reason") or ai_review.get("decision"),
+                }
+            )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (str(row.get("symbol") or ""), str(row.get("flow") or ""), str(row.get("result") or ""))
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        created_at = _parse_time(row.get("created_at"))
+        row["created_at"] = created_at.isoformat() if created_at else row.get("created_at") or now.isoformat()
+        deduped.append(row)
+    return deduped[:10]
+
+def lc_pipeline_dashboard_payload(config: dict[str, Any]) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    state = _load_state(config, now, reset_for_new_day=False)
+    settings = _pipeline_settings_with_recovery_mode(config)
+    undecided = _sort_saved_rows(
+        [
+            _row_age_payload(row, now)
+            for row in state.get("undecided") or []
+            if isinstance(row, dict) and _undecided_row_is_visible(row, settings)
+        ],
+        settings,
+        reverse=True,
+    )
+    internal_lc = _sort_saved_rows([_row_age_payload(row, now) for row in state.get("internal_lc") or []], settings, reverse=True)
+    two_hour_windows = state.get("two_hour_windows") or []
+    latest_two_hour = two_hour_windows[-1] if two_hour_windows else None
+    one_hour_history = state.get("one_hour_history") or []
+    two_hour_history = state.get("two_hour_history") or []
+    four_hour_history = state.get("four_hour_history") or []
+    latest_four_hour = four_hour_history[-1] if four_hour_history else None
+    return {
+        "enabled": settings["enabled"],
+        "created_at": now.isoformat(),
+        "day_key": state.get("day_key"),
+        "daily_one_hour_counter": state.get("daily_one_hour_counter", 0),
+        "daily_two_hour_counter": state.get("daily_two_hour_counter", 0),
+        "four_hour_counter": state.get("four_hour_counter", 0),
+        "last_hourly_slot": state.get("last_hourly_slot"),
+        "last_two_hour_slot": state.get("last_two_hour_slot"),
+        "last_four_hour_slot": state.get("last_four_hour_slot"),
+        "last_recheck_at": state.get("last_recheck_at"),
+        "settings": settings,
+        "counts": {
+            "undecided": len(undecided),
+            "internal_lc": len(internal_lc),
+            "two_hour_windows": len(two_hour_windows),
+            "one_hour_history": len(one_hour_history),
+            "two_hour_history": len(two_hour_history),
+            "four_hour_history": len(four_hour_history),
+        },
+        "undecided": undecided,
+        "internal_lc": internal_lc,
+        "ai_watch": _ai_watch_rows(config, now=now),
+        "latest_two_hour": latest_two_hour,
+        "latest_four_hour": latest_four_hour,
+    }
+
+
+def format_internal_lc_view(config: dict[str, Any], *, limit: int = 10) -> str:
+    now = datetime.now(timezone.utc)
+    state = _load_state(config, now, reset_for_new_day=False)
+    settings = _pipeline_settings_with_recovery_mode(config)
+    rows = _sort_saved_rows([_row_age_payload(row, now) for row in state.get("internal_lc") or []], settings, reverse=True)[
+        : max(1, int(limit))
+    ]
+    lines = [f"🟡 LC nội bộ { _local_time(config, now).strftime('%d/%m/%Y %H:%M') }", f"📊 Tổng LC: {len(rows)}"]
+    if not rows:
+        lines.append("⚪ Chưa có LC nội bộ")
+        return "\n".join(lines)
+    for index, row in enumerate(rows, 1):
+        side = str(row.get("side") or "-").upper()
+        source_label = _source_label_v2(row)
+        try:
+            win_label = f"{float(row.get('win_probability_pct') or 0):.2f}%"
+        except (TypeError, ValueError):
+            win_label = "-"
+        lines.append(
+            f"{index}. {row.get('symbol', '-')} | {side} | Win {win_label} | {source_label}"
+        )
+    return "\n".join(lines)
+
+
+def _notify_promoted_lc(config: dict[str, Any], record: dict[str, Any], *, age_hours: float, remaining_count: int) -> None:
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    side = str(record.get("side") or "-").upper()
+    lines = [
+        "♻️ Chưa Duyệt hồi sinh thành LC nội bộ",
+        f"{record.get('symbol', '-')} | {side} | sống {_age_label(age_hours)}",
+        f"Chưa Duyệt còn: {remaining_count}",
+    ]
+    send_telegram_message(config, "\n".join(lines), with_buttons=False, replace_previous=False)
+
+
+def _source_label(row: dict[str, Any]) -> str:
+    if row.get("revived_at"):
+        return f"HS {row.get('revived_label') or row.get('revived_at')}"
+    source_slot = row.get("source_slot") or row.get("state") or "-"
+    source_index = row.get("source_index")
+    raw_label = str(row.get("source_label") or "").strip()
+    source_clock = None
+    if raw_label:
+        parts = raw_label.split()
+        source_clock = parts[-1] if parts else None
+    if not source_clock:
+        source_time = _parse_time(row.get("source_time"))
+        source_clock = source_time.strftime("%H:%M:%S") if source_time else None
+    if source_index:
+        return f"{source_slot} #{source_index} ({source_clock})" if source_clock else f"{source_slot} #{source_index}"
+    return str(source_slot)
+
+
+def _source_label_v2(row: dict[str, Any]) -> str:
+    if row.get("revived_at"):
+        return f"{_revived_target_label(row)} | HS {row.get('revived_label') or row.get('revived_at')}"
+    return _source_label(row)
+
+
+def _notify_promoted_lc_v2(config: dict[str, Any], record: dict[str, Any], *, age_hours: float, remaining_count: int) -> None:
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    side = str(record.get("side") or "-").upper()
+    revived_time = _revived_time_label(record) or "-"
+    lines = [
+        "♻️ Chưa Duyệt hồi sinh thành LC nội bộ",
+        f"{record.get('symbol', '-')} | {side} | sống {_age_label(age_hours)}",
+        f"Vào: {_revived_target_label(record)} | từ {_base_source_label(record)}",
+        f"Hồi sinh lúc: {revived_time}",
+        f"Chưa Duyệt còn: {remaining_count}",
+    ]
+    send_telegram_message(config, "\n".join(lines), with_buttons=False, replace_previous=False)
+
+
+def notify_mini_pool_summary(
+    config: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    scan: dict[str, Any] | None = None,
+    slot_id: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    now = now or datetime.now(timezone.utc)
+    settings = _pipeline_settings_with_recovery_mode(config)
+    state = _load_state(config, now)
+    latest_four_hour = state.get("four_hour_history")[-1] if state.get("four_hour_history") else None
+    scan = scan or latest_lc_pipeline_mini_scan(config) or {}
+    rows = _filter_sample_rows(config, rows)
+    latest_four_hour, _ = _sanitize_event_sample_rows(config, latest_four_hour or {})
+    scan, _ = _sanitize_mini_scan_sample_symbols(config, scan)
+    mini_index = scan.get("mini_index") or int(state.get("daily_mini_counter") or 0) or "-"
+    if slot_id and not scan.get("slot_id"):
+        scan = {**scan, "slot_id": slot_id}
+    local_now = _local_time(config, now)
+    selected_symbols = _symbol_list(scan.get("selected_symbols"), limit=3)
+    selected_count = len(selected_symbols)
+    lines = [
+        f"Lần gọi Mini: #{mini_index} ({local_now.strftime('%H:%M')})" if mini_index != "-" else f"Lần gọi Mini: {local_now.strftime('%H:%M')}",
+        f"Mini chọn: {selected_count}/3 cặp",
+    ]
+    if isinstance(latest_four_hour, dict):
+        lines.extend(_event_source_lines(latest_four_hour, config=config))
+    if rows:
+        for index, row in enumerate(rows[:3], 1):
+            side = str(row.get("side") or "-").upper()
+            lines.append(f"{index}. {row.get('symbol', '-')} | {side} | {_source_label(row)}")
+    else:
+        lines.append("Mini chưa chọn được cặp nào.")
+    lines.extend(_mini_reason_notification_lines(scan))
+    if scan.get("slot_id"):
+        lines.append(f"Slot: {scan.get('slot_id')}")
+    _append_internal_notification(
+        state,
+        frame="mini",
+        icon=MINI_ICON,
+        title=f"Mini #{mini_index}" if mini_index != "-" else f"Mini {local_now.strftime('%d/%m/%y %H:%M:%S')}",
+        lines=lines,
+        created_at=now,
+    )
+    _save_state(config, state)
+    if (
+        not rows
+        and not _symbol_list(scan.get("selected_symbols"), limit=3)
+        and not _symbol_list(scan.get("pool_symbols"), limit=3)
+    ):
+        return
+    if not settings["notify_mini_pool_summary"]:
+        return
+    try:
+        from .notifier import send_telegram_message
+    except Exception:
+        return
+    send_telegram_message(
+        config,
+        _mini_notification_text(config, scan, latest_four_hour, rows=rows),
+        with_buttons=False,
+        replace_previous=False,
+        allow_during_startup_quiet=True,
+    )
+
+
+def _candidate_is_relaxed_valid(candidate: TradeCandidate, settings: dict[str, Any]) -> bool:
+    win_probability = float(candidate.win_probability_pct or 0)
+    confidence = float(candidate.confidence or 0)
+    return (
+        win_probability >= float(settings["relaxed_min_win_probability_pct"])
+        and confidence >= float(settings["relaxed_min_confidence"])
+        and float(candidate.risk_reward or 0) >= float(settings["relaxed_min_risk_reward"])
+    )
+
+
+def _row_meets_optional_floor(value: Any, threshold: float) -> bool:
+    if value in (None, ""):
+        return True
+    try:
+        return float(value) >= threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def _row_is_relaxed_valid(row: dict[str, Any], settings: dict[str, Any]) -> bool:
+    try:
+        win_probability = float(row.get("win_probability_pct") or 0)
+    except (TypeError, ValueError):
+        win_probability = 0.0
+    return (
+        win_probability >= float(settings["relaxed_min_win_probability_pct"])
+        and _row_meets_optional_floor(row.get("confidence"), float(settings["relaxed_min_confidence"]))
+        and _row_meets_optional_floor(row.get("risk_reward"), float(settings["relaxed_min_risk_reward"]))
+    )
+
+
+def _mark_undecided_row(
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    settings: dict[str, Any],
+    status: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    record = {
+        **row,
+        "state": "CHUA_DUYET",
+        "last_seen_at": now.isoformat(),
+        "last_recheck_at": now.isoformat(),
+        "undecided_status": status,
+    }
+    record.setdefault("current_win_probability_pct", row.get("win_probability_pct"))
+    record["peak_win_probability_pct"] = _peak_win_probability(
+        row.get("peak_win_probability_pct"),
+        row.get("current_win_probability_pct"),
+        row.get("win_probability_pct"),
+    )
+    if reason:
+        record["undecided_reason"] = reason
+    elif "undecided_reason" in record:
+        record.pop("undecided_reason", None)
+    return record
+
+
+def _mark_missing_undecided_row(
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    reason: str,
+) -> dict[str, Any]:
+    record = {**row}
+    record["previous_scan_win_probability_pct"] = _latest_known_win_probability(record)
+    record["win_probability_pct"] = 0.0
+    record["current_win_probability_pct"] = 0.0
+    record["peak_win_probability_pct"] = _peak_win_probability(
+        row.get("peak_win_probability_pct"),
+        row.get("current_win_probability_pct"),
+        row.get("win_probability_pct"),
+    )
+    record["win_rate_trend"] = "down"
+    record["recheck_state"] = "invalid"
+    return _mark_undecided_row(record, now=now, settings={}, status="missing_setup", reason=reason)
+
+
+def _row_with_recheck_metadata(
+    row: dict[str, Any],
+    *,
+    recheck_daily_index: int,
+    recheck_slot: str,
+    now: datetime,
+    local_now: datetime,
+) -> dict[str, Any]:
+    return {
+        **row,
+        "recheck_daily_index": recheck_daily_index,
+        "recheck_slot": recheck_slot,
+        "recheck_time": now.isoformat(),
+        "recheck_label": local_now.strftime("%d/%m/%y %H:%M:%S"),
+    }
+
+
+def _recheck_undecided_pool(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime,
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    undecided_rows = [row for row in rows if isinstance(row, dict) and str(row.get("symbol") or "")]
+    undecided_rows = _filter_sample_rows(config, undecided_rows)
+    if not undecided_rows:
+        return [], {"input_count": 0, "refreshed_count": 0, "dropped_count": 0, "kept_count": 0, "warnings": []}
+    local_now = _local_time(config, now)
+    recheck_daily_index = int(state.get("daily_undecided_recheck_counter") or 0) + 1
+    state["daily_undecided_recheck_counter"] = recheck_daily_index
+    recheck_slot = _fixed_interval_slot_key(config, now, minutes=int(settings["recheck_interval_minutes"]))
+    refreshed_rows, recheck_meta = _recheck_rows_with_latest_market_data(config, undecided_rows, now=now)
+    refreshed_rows = _filter_sample_rows(config, refreshed_rows)
+    filtered_dropped_items = [
+        item
+        for item in list(recheck_meta.get("dropped") or [])
+        if isinstance(item, dict) and not _is_sample_symbol(config, item.get("symbol"))
+    ]
+    refreshed_by_key = {_setup_key(row): row for row in refreshed_rows if isinstance(row, dict)}
+    dropped_by_key = {
+        (str(item.get("symbol") or ""), str(item.get("old_side") or "").lower()): item
+        for item in filtered_dropped_items
+    }
+    dropped_rows_summary: list[dict[str, Any]] = []
+    output: list[dict[str, Any]] = []
+    for row in undecided_rows:
+        key = _setup_key(row)
+        if key in refreshed_by_key:
+            merged = _merge_rechecked_row(row, refreshed_by_key[key])
+            merged = _row_with_recheck_metadata(
+                merged,
+                recheck_daily_index=recheck_daily_index,
+                recheck_slot=recheck_slot,
+                now=now,
+                local_now=local_now,
+            )
+            if _undecided_row_is_active(merged, settings, now):
+                output.append(_mark_undecided_row(merged, now=now, settings=settings, status="soft_valid"))
+            else:
+                reason = _undecided_drop_reason(merged, settings, now)
+                invalid_row = _mark_undecided_row(merged, now=now, settings=settings, status="soft_invalid", reason=reason)
+                dropped_rows_summary.append({**invalid_row, "reason": reason})
+                output.append(invalid_row)
+            continue
+        dropped_item = dropped_by_key.get(key)
+        if dropped_item:
+            marked_row = _row_with_recheck_metadata(
+                _mark_missing_undecided_row(
+                    row,
+                    now=now,
+                    reason=str(dropped_item.get("reason") or "khong con setup hop le trong du lieu moi nhat"),
+                ),
+                recheck_daily_index=recheck_daily_index,
+                recheck_slot=recheck_slot,
+                now=now,
+                local_now=local_now,
+            )
+            output.append(marked_row)
+            dropped_rows_summary.append(
+                {**marked_row, "reason": str(dropped_item.get("reason") or "khong con setup hop le trong du lieu moi nhat")}
+            )
+            continue
+        marked_row = _row_with_recheck_metadata(
+            _mark_missing_undecided_row(
+                row,
+                now=now,
+                reason="khong tim thay setup hop le trong du lieu recheck moi nhat",
+            ),
+            recheck_daily_index=recheck_daily_index,
+            recheck_slot=recheck_slot,
+            now=now,
+            local_now=local_now,
+        )
+        dropped_rows_summary.append({**marked_row, "reason": "khong tim thay setup hop le trong du lieu recheck moi nhat"})
+        output.append(marked_row)
+    kept_rows = list(output)
+    trimmed = False
+    if len(kept_rows) > int(settings["undecided_max"]):
+        kept_rows = _trim_undecided(kept_rows, settings)
+        trimmed = len(kept_rows) < len(output)
+    return kept_rows, {
+        "input_count": len(undecided_rows),
+        "refreshed_count": len(refreshed_rows),
+        "dropped_count": len(dropped_rows_summary),
+        "kept_count": len(kept_rows),
+        "trimmed": trimmed,
+        "warnings": list(recheck_meta.get("warnings") or []),
+        "dropped": filtered_dropped_items,
+        "dropped_rows": dropped_rows_summary,
+        "daily_index": recheck_daily_index,
+        "recheck_label": local_now.strftime("%d/%m/%y %H:%M:%S"),
+        "slot": recheck_slot,
+    }
+
+
+def _promote_survivors(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    candidates_by_symbol: dict[str, TradeCandidate],
+    settings: dict[str, Any],
+    now: datetime,
+    blocked_symbols: set[str],
+) -> list[dict[str, Any]]:
+    if not settings["promote_survivors"]:
+        return []
+    promoted: list[dict[str, Any]] = []
+    active_symbols = open_pending_symbols(config) | set(blocked_symbols)
+    internal_lc = list(state.get("internal_lc") or [])
+    undecided: list[dict[str, Any]] = []
+    local_now = _local_time(config, now)
+    revive_candidates: list[tuple[dict[str, Any], dict[str, Any], TradeCandidate, float]] = []
+    for row in state.get("undecided") or []:
+        symbol = str(row.get("symbol") or "")
+        undecided_status = str(row.get("undecided_status") or "").strip().lower()
+        if undecided_status in {"soft_invalid", "missing_setup"}:
+            undecided.append(row)
+            continue
+        first_seen = _parse_time(row.get("first_seen_at"))
+        candidate = candidates_by_symbol.get(symbol)
+        if not first_seen or not candidate:
+            undecided.append(row)
+            continue
+        age_hours = (now - first_seen).total_seconds() / 3600
+        guard_side, guard_reasons = _exhaustion_guard_reasons(candidate, settings, phase="mini")
+        if (
+            age_hours >= float(settings["promote_after_hours"])
+            and symbol not in active_symbols
+            and symbol not in blocked_symbols
+            and guard_reasons
+        ):
+            undecided.append(
+                _annotate_exhaustion_guard_row(
+                    row,
+                    guard_reasons,
+                    phase="promote",
+                    settings=settings,
+                    side=guard_side,
+                    now=now,
+                )
+            )
+            continue
+        if (
+            age_hours >= float(settings["promote_after_hours"])
+            and symbol not in active_symbols
+            and symbol not in blocked_symbols
+            and _candidate_is_relaxed_valid(candidate, settings)
+        ):
+            base_record = {
+                **_candidate_record(candidate, state="LC_NOI_BO", first_seen_at=row.get("first_seen_at"), now=now),
+                "origin_source_slot": row.get("origin_source_slot"),
+                "origin_source_index": row.get("origin_source_index"),
+                "origin_source_time": row.get("origin_source_time"),
+                "origin_source_label": row.get("origin_source_label"),
+                "source_slot": row.get("source_slot"),
+                "source_index": row.get("source_index"),
+                "source_time": row.get("source_time"),
+                "source_label": row.get("source_label"),
+            }
+            record = {
+                **_row_with_source_metadata(
+                    base_record,
+                    state_label="LC_NOI_BO",
+                    source_slot="HS",
+                    source_index=row.get("source_index"),
+                    now=now,
+                    local_now=local_now,
+                ),
+                "revived_at": now.isoformat(),
+                "revived_label": local_now.strftime("%d/%m/%y %H:%M:%S"),
+                "revived_age_hours": round(age_hours, 3),
+                "revived_age_label": _age_label(age_hours),
+            }
+            internal_lc = _upsert_by_symbol(internal_lc, record)
+            revive_candidates.append((row, record, candidate, age_hours))
+            continue
+        undecided.append(row)
+    state["internal_lc"] = _sort_saved_rows(internal_lc, settings, reverse=True)[: int(settings["internal_lc_max"])]
+    for position, lc_row in enumerate(state["internal_lc"], 1):
+        if isinstance(lc_row, dict) and lc_row.get("revived_at"):
+            lc_row["revived_target_rank"] = position
+    survivor_keys = {_setup_key(row) for row in state["internal_lc"] if isinstance(row, dict)}
+    promoted_to_notify: list[tuple[dict[str, Any], TradeCandidate, float]] = []
+    for original_row, record, candidate, age_hours in revive_candidates:
+        key = _setup_key(record)
+        if key not in survivor_keys:
+            kept_row = _mark_undecided_row(
+                original_row,
+                now=now,
+                settings=settings,
+                status="soft_valid",
+                reason="LC nội bộ đang đầy top 3, tiếp tục recheck",
+            )
+            undecided = _upsert_by_setup(undecided, kept_row)
+            continue
+        for lc_row in state["internal_lc"]:
+            if isinstance(lc_row, dict) and _setup_key(lc_row) == key:
+                record["revived_target_rank"] = lc_row.get("revived_target_rank")
+                break
+        promoted.append(record)
+        active_symbols.add(str(record.get("symbol") or ""))
+        promoted_to_notify.append((record, candidate, age_hours))
+    state["undecided"] = _trim_undecided(undecided, settings)
+    for record, _candidate, age_hours in promoted_to_notify:
+        _notify_promoted_lc_v2(config, record, age_hours=age_hours, remaining_count=len(state["undecided"]))
+    return promoted
+
+
+def update_lc_internal_pipeline(
+    config: dict[str, Any],
+    candidates: list[TradeCandidate],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    with _LC_PIPELINE_UPDATE_LOCK:
+        return _update_lc_internal_pipeline_impl(config, candidates, now=now)
+
+
+def _update_lc_internal_pipeline_impl(
+    config: dict[str, Any],
+    candidates: list[TradeCandidate],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    settings = _pipeline_settings_with_recovery_mode(config)
+    if not settings["enabled"]:
+        return {"enabled": False}
+    state = _load_state(config, now)
+    blocked_symbols = _active_symbol_blocklist(config)
+    _prune_blocked_state(state, blocked_symbols)
+    _prune_low_win_state(state, settings, now)
+    living_hs_internal_lc_rows = _living_hs_internal_lc_rows(
+        state,
+        settings=settings,
+        now=now,
+        blocked_symbols=blocked_symbols,
+    )
+    top_limit = int(settings["top_limit"])
+    candidates_by_symbol = {candidate.symbol: candidate for candidate in candidates}
+    hourly_slot = _slot_key(config, now, 1)
+    two_hour_slot = _slot_key(config, now, 2)
+    # Keep 4h on fixed local boundaries: 00/04/08/12/16/20.
+    four_hour_slot = _slot_key(config, now, 4)
+    undecided_recheck_slot = _fixed_interval_slot_key(
+        config,
+        now,
+        minutes=int(settings["recheck_interval_minutes"]),
+    )
+    slot_tolerance_minutes = int(settings["slot_tolerance_minutes"])
+    hourly_slot_open = _slot_is_open(config, now, hours=1, tolerance_minutes=slot_tolerance_minutes)
+    two_hour_slot_open = _slot_is_open(config, now, hours=2, tolerance_minutes=slot_tolerance_minutes)
+    four_hour_slot_open = _slot_is_open(config, now, hours=4, tolerance_minutes=slot_tolerance_minutes)
+    undecided_recheck_due = _fixed_interval_slot_is_exact(
+        config,
+        now,
+        minutes=int(settings["recheck_interval_minutes"]),
+    ) and state.get("last_undecided_recheck_slot") != undecided_recheck_slot
+    result: dict[str, Any] = {
+        "enabled": True,
+        "hourly_slot": hourly_slot,
+        "two_hour_slot": two_hour_slot,
+        "four_hour_slot": four_hour_slot,
+        "undecided_recheck_slot": undecided_recheck_slot,
+        "slot_tolerance_minutes": slot_tolerance_minutes,
+        "hourly_slot_open": hourly_slot_open,
+        "two_hour_slot_open": two_hour_slot_open,
+        "four_hour_slot_open": four_hour_slot_open,
+        "undecided_recheck_due": undecided_recheck_due,
+        "created_hourly": False,
+        "created_two_hour": False,
+        "created_four_hour": False,
+        "promoted": [],
+        "blocked_symbols": sorted(blocked_symbols),
+        "skip_reasons": {
+            "hourly": [],
+            "two_hour": [],
+            "four_hour": [],
+            "undecided_recheck": [],
+        },
+    }
+
+    if not candidates:
+        result["skip_reasons"]["hourly"].append("no_candidates")
+    if not hourly_slot_open:
+        result["skip_reasons"]["hourly"].append("slot_closed")
+    if state.get("last_hourly_slot") == hourly_slot:
+        result["skip_reasons"]["hourly"].append("slot_already_created")
+    if candidates and hourly_slot_open and state.get("last_hourly_slot") != hourly_slot:
+        local_now = _local_time(config, now)
+        next_hourly_index = int(state.get("daily_one_hour_counter") or 0) + 1
+        top: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        ranked_candidates = _rank_candidates(
+            candidates,
+            len(candidates),
+            blocked_symbols=blocked_symbols,
+            settings=settings,
+            phase="1h",
+        )
+        for candidate in ranked_candidates:
+            base_row = _row_with_source_metadata(
+                _candidate_record(candidate, state="HOUR_1", now=now),
+                state_label="HOUR_1",
+                source_slot="1h",
+                source_index=next_hourly_index,
+                now=now,
+                local_now=local_now,
+            )
+            guard_side, guard_reasons = _exhaustion_guard_reasons(candidate, settings, phase="1h")
+            if guard_reasons:
+                rejected.append(
+                    _annotate_exhaustion_guard_row(
+                        base_row,
+                        guard_reasons,
+                        phase="1h",
+                        settings=settings,
+                        side=guard_side,
+                        now=now,
+                    )
+                )
+                continue
+            if len(top) < top_limit:
+                top.append(base_row)
+        one_hour_event = {
+            "frame": "1h",
+            "slot": hourly_slot,
+            "created_at": now.isoformat(),
+            "index": next_hourly_index,
+            "daily_index": next_hourly_index,
+            "date": local_now.strftime("%d/%m/%y"),
+            "time": local_now.strftime("%H:%M:%S"),
+            "approved": top[:top_limit],
+            "rejected": rejected,
+            "source_windows": [],
+        }
+        state["one_hour_history"].append(one_hour_event)
+        state["hourly_windows"].append(
+            {
+                "slot": hourly_slot,
+                "created_at": now.isoformat(),
+                "daily_index": next_hourly_index,
+                "top": top,
+            }
+        )
+        state["hourly_windows"] = state["hourly_windows"][-2:]
+        state["daily_one_hour_counter"] = next_hourly_index
+        state["last_hourly_slot"] = hourly_slot
+        if top:
+            hourly_internal_lc = _build_internal_lc_rows(
+                top[:top_limit],
+                source_slot="1h",
+                source_index=next_hourly_index,
+                now=now,
+                local_now=local_now,
+            )
+            state["internal_lc"] = _sort_saved_rows(hourly_internal_lc, settings, reverse=True)[
+                : int(settings["internal_lc_max"])
+            ]
+        result["created_hourly"] = True
+        result["one_hour_event"] = one_hour_event
+        _append_internal_notification(
+            state,
+            frame="1h",
+            icon=ONE_HOUR_ICON,
+            title=f"1h top {len(top)} setup",
+            lines=[f"Khung {ONE_HOUR_ICON} 1h: #{next_hourly_index} ({local_now.strftime('%H:%M')})"]
+            + [_format_pair_line(index, row, config=config) for index, row in enumerate(top[:3], 1)],
+            created_at=now,
+        )
+    expected_hourly_slots = _aligned_source_slots(config, two_hour_slot, parent_hours=2, child_hours=1)
+    aligned_hourly_events = _latest_events_for_slots(list(state.get("one_hour_history") or []), expected_hourly_slots)
+    # OLD_RULE_DISABLED_FOR_DEMO:
+    # has_two_hour_inputs = any(list(window.get("approved") or []) for window in aligned_hourly_events)
+    #
+    # DEMO_RULE_ACTIVE:
+    # Chỉ cần 1 pool 1h có approved data là 2h vẫn chạy để kiểm tra hệ thống.
+    aligned_hourly_input_count = sum(1 for window in aligned_hourly_events if list(window.get("approved") or []))
+    has_two_hour_inputs = aligned_hourly_input_count >= 1
+    current_two_hour_event = _latest_event_for_slot(
+        list(state.get("two_hour_history") or []),
+        two_hour_slot,
+        config=config,
+        require_aligned_sources=True,
+    )
+    result["two_hour_sources"] = {
+        "expected_slots": expected_hourly_slots,
+        "aligned_slots": [str(window.get("slot") or "") for window in aligned_hourly_events if isinstance(window, dict)],
+        "aligned_event_count": len(aligned_hourly_events),
+        "aligned_input_count": aligned_hourly_input_count,
+    }
+    if not two_hour_slot_open:
+        result["skip_reasons"]["two_hour"].append("slot_closed")
+    if not has_two_hour_inputs:
+        result["skip_reasons"]["two_hour"].append("waiting_for_aligned_1h_input")
+    if current_two_hour_event is not None:
+        result["skip_reasons"]["two_hour"].append("slot_already_created")
+    if two_hour_slot_open and has_two_hour_inputs and current_two_hour_event is None:
+        combined: list[dict[str, Any]] = []
+        for window in aligned_hourly_events:
+            combined.extend(window.get("approved") or [])
+        refreshed_combined, two_hour_recheck = _recheck_rows_with_latest_market_data(config, combined, now=now)
+        _sync_state_after_recheck(
+            state,
+            hourly_slots=expected_hourly_slots,
+            refreshed_rows=refreshed_combined,
+            dropped=list(two_hour_recheck.get("dropped") or []),
+        )
+        result["two_hour_recheck"] = two_hour_recheck
+        eligible_two_hour = [
+            row for row in refreshed_combined if _candidate_passes_lc_threshold(row, settings, phase="2h")
+        ]
+        next_daily_index = int(state.get("daily_two_hour_counter") or 0) + 1
+        local_now = _local_time(config, now)
+        eligible_two_hour, guard_rejected_two_hour = _split_exhaustion_guard_rows(
+            eligible_two_hour,
+            settings,
+            phase="2h",
+            source_slot="2h",
+            source_index=next_daily_index,
+            now=now,
+            local_now=local_now,
+        )
+        ranked = _sort_saved_rows(eligible_two_hour, settings, reverse=True)
+        approved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        approved_keys: set[tuple[str, str]] = set()
+        for row in ranked:
+            symbol = str(row.get("symbol") or "")
+            if not symbol or symbol in seen or symbol in blocked_symbols:
+                continue
+            approved_row = _build_internal_lc_rows(
+                [row],
+                source_slot="2h",
+                source_index=next_daily_index,
+                now=now,
+                local_now=local_now,
+            )[0]
+            approved.append(approved_row)
+            approved_keys.add(_setup_key(approved_row))
+            seen.add(symbol)
+            if len(approved) >= top_limit:
+                break
+        guard_rejected_keys = {_setup_key(row) for row in guard_rejected_two_hour}
+        rejected = _soft_undecided_rows(
+            refreshed_combined,
+            settings=settings,
+            approved_keys=approved_keys | guard_rejected_keys,
+            blocked_symbols=blocked_symbols,
+            source_slot="2h",
+            source_index=next_daily_index,
+            now=now,
+            local_now=local_now,
+        )
+        rejected = guard_rejected_two_hour + rejected
+        existing = list(state.get("undecided") or [])
+        existing = _merge_undecided_rows(existing, rejected, now=now)
+        state["undecided"] = _sort_saved_rows(existing, settings, reverse=True)
+        state["internal_lc"] = _sort_saved_rows(approved, settings, reverse=True)[: int(settings["internal_lc_max"])]
+        state["daily_two_hour_counter"] = next_daily_index
+        event = {
+            "frame": "2h",
+            "slot": two_hour_slot,
+            "created_at": now.isoformat(),
+            "index": state["daily_two_hour_counter"],
+            "daily_index": state["daily_two_hour_counter"],
+            "date": local_now.strftime("%d/%m/%y"),
+            "time": local_now.strftime("%H:%M:%S"),
+            "approved": approved[:top_limit],
+            "rejected": rejected,
+            "recheck": two_hour_recheck,
+            "source_windows": [
+                _source_window_payload("1h", window, config=config) for window in aligned_hourly_events if isinstance(window, dict)
+            ],
+        }
+        state["two_hour_history"] = _replace_event_for_slot(list(state.get("two_hour_history") or []), event)
+        state["two_hour_windows"] = _replace_event_for_slot(list(state.get("two_hour_windows") or []), event)
+        state["two_hour_windows"] = state["two_hour_windows"][-2:]
+        state["last_two_hour_slot"] = two_hour_slot
+        state["telegram_events"] = _replace_event_for_slot(list(state.get("telegram_events") or []), event)
+        state["telegram_events"] = state["telegram_events"][-20:]
+        _append_internal_notification(
+            state,
+            frame="2h",
+            icon=_two_hour_icon(config),
+            title=f"#{state['daily_two_hour_counter']} LC nội bộ tổng hợp 2h",
+            lines=_event_source_lines(event, config=config)
+            + [_format_pair_line(index, row, config=config, include_origin=True) for index, row in enumerate(approved[:top_limit], 1)],
+            created_at=now,
+        )
+        result["created_two_hour"] = True
+        result["two_hour_event"] = event
+        result["two_hour_recheck"] = two_hour_recheck
+    expected_two_hour_slots = _aligned_source_slots(config, four_hour_slot, parent_hours=4, child_hours=2)
+    aligned_two_hour_events = _latest_events_for_slots_aligned(
+        config,
+        list(state.get("two_hour_history") or []),
+        expected_two_hour_slots,
+    )
+    # OLD_RULE_DISABLED_FOR_DEMO:
+    # has_four_hour_inputs = sum(1 for window in aligned_two_hour_events if list(window.get("approved") or [])) >= 2
+    #
+    # DEMO_RULE_ACTIVE:
+    # Chỉ cần 1 pool 2h có approved data là 4h vẫn chạy để kiểm tra hệ thống.
+    aligned_two_hour_input_count = sum(1 for window in aligned_two_hour_events if list(window.get("approved") or []))
+    has_four_hour_inputs = aligned_two_hour_input_count >= 1
+    has_all_four_hour_source_events = bool(expected_two_hour_slots) and len(aligned_two_hour_events) >= len(
+        expected_two_hour_slots
+    )
+    current_four_hour_event = _latest_event_for_slot(
+        list(state.get("four_hour_history") or []),
+        four_hour_slot,
+        config=config,
+        require_aligned_sources=True,
+    )
+    result["four_hour_sources"] = {
+        "expected_slots": expected_two_hour_slots,
+        "aligned_slots": [str(window.get("slot") or "") for window in aligned_two_hour_events if isinstance(window, dict)],
+        "aligned_event_count": len(aligned_two_hour_events),
+        "aligned_input_count": aligned_two_hour_input_count,
+        "has_all_expected_events": has_all_four_hour_source_events,
+    }
+    if not four_hour_slot_open:
+        result["skip_reasons"]["four_hour"].append("slot_closed")
+    if not has_four_hour_inputs and not has_all_four_hour_source_events:
+        result["skip_reasons"]["four_hour"].append("waiting_for_aligned_2h_input")
+    if current_four_hour_event is not None:
+        result["skip_reasons"]["four_hour"].append("slot_already_created")
+    if four_hour_slot_open and (has_four_hour_inputs or has_all_four_hour_source_events) and current_four_hour_event is None:
+        if has_four_hour_inputs:
+            combined_two_hour: list[dict[str, Any]] = []
+            for window in aligned_two_hour_events:
+                combined_two_hour.extend(window.get("approved") or [])
+            combined_two_hour = _union_rows_by_setup(combined_two_hour, living_hs_internal_lc_rows)
+            refreshed_two_hour, four_hour_recheck = _recheck_rows_with_latest_market_data(config, combined_two_hour, now=now)
+            _sync_state_after_recheck(
+                state,
+                two_hour_slots=[str(window.get("slot") or "") for window in aligned_two_hour_events],
+                refreshed_rows=refreshed_two_hour,
+                dropped=list(four_hour_recheck.get("dropped") or []),
+            )
+        else:
+            refreshed_two_hour = []
+            four_hour_recheck = {
+                "input_count": 0,
+                "refreshed_count": 0,
+                "dropped": [],
+                "warnings": [],
+                "sync_complete": True,
+                "synchronized_count": 0,
+                "skip_reason": "empty_aligned_2h_sources",
+            }
+        result["four_hour_recheck"] = four_hour_recheck
+        eligible_four_hour = [
+            row for row in refreshed_two_hour if _candidate_passes_lc_threshold(row, settings, phase="4h")
+        ]
+        next_four_hour_index = int(state.get("four_hour_counter") or 0) + 1
+        local_now = _local_time(config, now)
+        eligible_four_hour, guard_rejected_four_hour = _split_exhaustion_guard_rows(
+            eligible_four_hour,
+            settings,
+            phase="4h",
+            source_slot="4h",
+            source_index=next_four_hour_index,
+            now=now,
+            local_now=local_now,
+        )
+        ranked_two_hour = _sort_saved_rows(eligible_four_hour, settings, reverse=True)
+        approved_four_hour: list[dict[str, Any]] = []
+        approved_four_hour_keys: set[tuple[str, str]] = set()
+        seen_four_hour: set[str] = set()
+        for row in ranked_two_hour:
+            symbol = str(row.get("symbol") or "")
+            if not symbol or symbol in seen_four_hour or symbol in blocked_symbols:
+                continue
+            approved_row = _build_internal_lc_rows(
+                [row],
+                source_slot="4h",
+                source_index=next_four_hour_index,
+                now=now,
+                local_now=local_now,
+            )[0]
+            approved_four_hour.append(approved_row)
+            approved_four_hour_keys.add(_setup_key(approved_row))
+            seen_four_hour.add(symbol)
+            if len(approved_four_hour) >= top_limit:
+                break
+        guard_rejected_four_hour_keys = {_setup_key(row) for row in guard_rejected_four_hour}
+        rejected_four_hour = _soft_undecided_rows(
+            refreshed_two_hour,
+            settings=settings,
+            approved_keys=approved_four_hour_keys | guard_rejected_four_hour_keys,
+            blocked_symbols=blocked_symbols,
+            source_slot="4h",
+            source_index=next_four_hour_index,
+            now=now,
+            local_now=local_now,
+        )
+        rejected_four_hour = guard_rejected_four_hour + rejected_four_hour
+        existing = list(state.get("undecided") or [])
+        existing = _merge_undecided_rows(existing, rejected_four_hour, now=now)
+        state["undecided"] = _sort_saved_rows(existing, settings, reverse=True)
+        four_hour_event = {
+            "frame": "4h",
+            "slot": four_hour_slot,
+            "created_at": now.isoformat(),
+            "index": next_four_hour_index,
+            "sequence_index": next_four_hour_index,
+            "date": local_now.strftime("%d/%m/%y"),
+            "time": local_now.strftime("%H:%M:%S"),
+            "approved": approved_four_hour[:top_limit],
+            "rejected": rejected_four_hour,
+            "recheck": four_hour_recheck,
+            "source_windows": [
+                _source_window_payload("2h", window, config=config) for window in aligned_two_hour_events if isinstance(window, dict)
+            ],
+        }
+        state["four_hour_history"] = _replace_event_for_slot(list(state.get("four_hour_history") or []), four_hour_event)
+        state["four_hour_counter"] = next_four_hour_index
+        state["last_four_hour_slot"] = four_hour_slot
+        _append_internal_notification(
+            state,
+            frame="4h",
+            icon=FOUR_HOUR_ICON,
+            title=f"#{next_four_hour_index} LC nội bộ tổng hợp 4h",
+            lines=_event_source_lines(four_hour_event, config=config)
+            + (
+                [_format_pair_line(index, row, config=config, include_origin=True) for index, row in enumerate(approved_four_hour[:top_limit], 1)]
+                if approved_four_hour
+                else ["Không có cặp nào đủ điều kiện giữ lại ở 4h."]
+            ),
+            created_at=now,
+        )
+        result["created_four_hour"] = True
+        result["four_hour_event"] = four_hour_event
+        result["four_hour_recheck"] = four_hour_recheck
+    if not undecided_recheck_due:
+        if state.get("last_undecided_recheck_slot") == undecided_recheck_slot:
+            result["skip_reasons"]["undecided_recheck"].append("slot_already_rechecked")
+        else:
+            result["skip_reasons"]["undecided_recheck"].append("not_due")
+    if undecided_recheck_due:
+        state["last_recheck_at"] = now.isoformat()
+        state["last_undecided_recheck_slot"] = undecided_recheck_slot
+        state["undecided"], result["undecided_recheck"] = _recheck_undecided_pool(
+            config,
+            state,
+            list(state.get("undecided") or []),
+            now=now,
+            settings=settings,
+        )
+        result["promoted"] = _promote_survivors(config, state, candidates_by_symbol, settings, now, blocked_symbols)
+        notification_kept_rows = [
+            row
+            for row in _sort_saved_rows(state.get("undecided", []), settings, reverse=True)
+            if isinstance(row, dict) and str(row.get("undecided_status") or "").lower() == "soft_valid"
+        ][: int(settings["undecided_max"])]
+        _notify_undecided_recheck_summary(
+            config,
+            state,
+            result["undecided_recheck"],
+            kept_rows=notification_kept_rows,
+            promoted_rows=result["promoted"],
+            now=now,
+        )
+
+    if isinstance(result.get("two_hour_event"), dict):
+        state["internal_lc"] = _sort_saved_rows(
+            [row for row in result["two_hour_event"].get("approved") or [] if isinstance(row, dict)],
+            settings,
+            reverse=True,
+        )[: int(settings["internal_lc_max"])]
+    result["undecided"] = _sort_saved_rows(state.get("undecided", []), settings, reverse=True)[
+        : int(settings["undecided_max"])
+    ]
+    result["internal_lc"] = _sort_saved_rows(state.get("internal_lc", []), settings, reverse=True)[
+        : int(settings["internal_lc_max"])
+    ]
+    _save_state(config, state)
+    if (
+        settings["notify_one_hour_summary"]
+        and _should_push_one_hour_summary(config, now)
+        and isinstance(result.get("one_hour_event"), dict)
+    ):
+        _notify_one_hour_summary(config, result["one_hour_event"])
+    if settings["notify_two_hour_summary"] and isinstance(result.get("two_hour_event"), dict):
+        _notify_two_hour_summary(config, result["two_hour_event"])
+    if settings["notify_mini_pool_summary"] and isinstance(result.get("four_hour_event"), dict):
+        _notify_four_hour_summary(config, result["four_hour_event"])
+    return result
+
+
+def lc_pipeline_mini_pool(config: dict[str, Any], candidates: list[TradeCandidate], *, limit: int = 3) -> list[TradeCandidate]:
+    settings = _pipeline_settings_with_recovery_mode(config)
+    if not settings["enabled"]:
+        return _rank_candidates(candidates, limit, settings=_phase_settings(settings, "4h"), phase="4h")
+    state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+    blocked_symbols = _active_symbol_blocklist(config)
+    rejected_keys = _active_rejected_setup_keys(state)
+    candidates_by_symbol = {candidate.symbol: candidate for candidate in candidates}
+    desired_symbols: list[str] = []
+    for row in _latest_four_hour_rows(state):
+        symbol = str(row.get("symbol") or "")
+        row_key = _setup_key(row)
+        if symbol and symbol not in desired_symbols and symbol not in blocked_symbols and row_key not in rejected_keys:
+            desired_symbols.append(symbol)
+    pool = [
+        candidates_by_symbol[symbol]
+        for symbol in desired_symbols
+        if symbol in candidates_by_symbol
+        and (candidates_by_symbol[symbol].symbol, str(candidates_by_symbol[symbol].side or "").lower()) not in rejected_keys
+    ]
+    ranked_pool = _rank_candidates(
+        pool,
+        len(pool),
+        blocked_symbols=blocked_symbols,
+        settings=_phase_settings(settings, "4h"),
+        phase="4h",
+    )
+    clean: list[TradeCandidate] = []
+    for candidate in ranked_pool:
+        if _exhaustion_guard_reasons(candidate, settings, phase="mini")[1]:
+            continue
+        clean.append(candidate)
+        if len(clean) >= limit:
+            break
+    return clean
+
+
+def lc_pipeline_pool_rows(config: dict[str, Any], symbols: list[str]) -> list[dict[str, Any]]:
+    state = _load_state(config, datetime.now(timezone.utc), reset_for_new_day=False)
+    rows_by_symbol = {
+        str(row.get("symbol") or ""): row
+        for row in _latest_four_hour_rows(state)
+        if row.get("symbol")
+    }
+    output: list[dict[str, Any]] = []
+    for index, symbol in enumerate(symbols, 1):
+        row = rows_by_symbol.get(symbol)
+        if row:
+            output.append({**row, "mini_index": index})
+        else:
+            output.append({"symbol": symbol, "source_slot": "scan", "mini_index": index})
+    return output

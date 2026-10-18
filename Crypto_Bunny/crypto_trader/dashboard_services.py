@@ -1,0 +1,3503 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+from .ai_coordinator import latest_internal_market_scan, next_internal_market_scan_at
+from .active_position_manager import evaluate_open_positions, latest_active_position_decisions
+from .atlas_mirror import atlas_database
+from .capital import (
+    analyze_configuration_change,
+    build_capital_snapshot,
+    calculate_capital_reserve_state,
+    calculate_position_size,
+    check_capital_allocation,
+    infer_capital_mode,
+    latest_capital_reserve_state,
+    latest_capital_snapshot,
+)
+from .config import project_path
+from .codex_features import (
+    ai_call_decision_stats,
+    ai_trade_decision_stats,
+    _market_regime_aggregate_limit,
+    _market_regime_top_symbols,
+    current_market_regime,
+    current_strategy_state,
+    get_bunny_health_state,
+    get_trading_system_state,
+    market_regime_history,
+    prompt_status,
+    recent_ai_call_history,
+    recent_ai_trade_decisions,
+    refresh_trading_system_state,
+    replay_stats,
+)
+from .market_guard import market_guard_block_status
+from .models import to_jsonable
+from .sizing import STATE_KEY as SIZING_STATE_KEY
+from .trend_scan import TREND_APPROVED_HOLD_QUEUE_STATE_KEY, TREND_WATCHLIST_STATE_KEY
+from .storage import (
+    count_pending_orders,
+    dashboard_snapshot_cache_version,
+    get_journal_state,
+    is_retryable_storage_error,
+    list_journal_state_prefix,
+    list_market_guard_observations,
+    list_paper_trades,
+    list_replay_history_rows,
+    list_trade_execution_rows,
+    list_trade_memory,
+    recent_market_scan_memory,
+    safe_storage_stats,
+    set_journal_state,
+)
+from .trade_intent import build_shadow_trade_intents_from_rows
+from market_pattern_engine.infrastructure.config_loader import load_engine_config
+from market_pattern_engine.repositories.analysis_repository import AnalysisRepository
+
+LOGGER = logging.getLogger(__name__)
+SYSTEM_CHECKLIST_CURRENT_KEY = "system_checklist_current"
+SYSTEM_CHECKLIST_PREVIOUS_KEY = "system_checklist_previous"
+SYSTEM_CHECKLIST_DEFAULT_TTL_SECONDS = 300
+DASHBOARD_SNAPSHOT_PREFIX = "dashboard_snapshot"
+DASHBOARD_DEFAULT_TTL_SECONDS = 300
+TRADE_INTENT_SHADOW_LOG_PREFIX = "trade_intent_shadow_log"
+TRADE_INTENT_SHADOW_LAST_SOURCE_KEY = "trade_intent_shadow_last_source"
+
+def _trend_approved_hold_dashboard(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        queue = json.loads(get_journal_state(config, TREND_APPROVED_HOLD_QUEUE_STATE_KEY) or "{}")
+    except Exception as exc:
+        queue = {"error": str(exc), "items": {}}
+    try:
+        watchlist = json.loads(get_journal_state(config, TREND_WATCHLIST_STATE_KEY) or "{}")
+    except Exception:
+        watchlist = {"items": {}}
+    queue_items = [dict(item) for item in (queue.get("items") or {}).values() if isinstance(item, dict)]
+    priority_items = [
+        dict(item)
+        for item in (watchlist.get("items") or {}).values()
+        if isinstance(item, dict)
+        and (str(item.get("status") or "") == "priority_rewatch" or str(item.get("source") or "") == "approved_hold_returned")
+    ]
+    ready_items = [item for item in queue_items if str(item.get("status") or "") == "ready_for_order"]
+    return {
+        "ok": not queue.get("error"),
+        "error": queue.get("error"),
+        "updated_at": queue.get("updated_at"),
+        "queue_count": len(queue_items),
+        "ready_count": len(ready_items),
+        "priority_rewatch_count": len(priority_items),
+        "processed": queue.get("processed") or [],
+        "checked": queue.get("checked") or [],
+        "items": queue_items[:20],
+        "priority_rewatch_items": priority_items[:20],
+    }
+
+def _trend_approved_hold_module(config: dict[str, Any]) -> dict[str, Any]:
+    approved_hold_dashboard = _trend_approved_hold_dashboard(config)
+    return {
+        "number": 13.5,
+        "name": "Trend Approved Hold Queue",
+        "purpose": "Theo doi cac setup Trend da duoc Mini approve nhung dang bi block truoc khi vao lenh.",
+        "status": "ok" if not approved_hold_dashboard.get("error") else "warn",
+        "trend_approved_hold": approved_hold_dashboard,
+        "update_event": "Sau Mini APPROVE bi block va moi lan trend scan recheck queue",
+        "update_schedule": "Moi trend scan; recheck theo cau hinh 120 giay",
+        "update_interval": "event-driven/120 giay",
+        "stats": [
+            _module_row("queue_count", approved_hold_dashboard.get("queue_count"), "So setup dang nam trong Approved Hold Queue.", attention=bool(approved_hold_dashboard.get("queue_count"))),
+            _module_row("ready_count", approved_hold_dashboard.get("ready_count"), "So setup da clear block va san sang di tiep vao order.", attention=bool(approved_hold_dashboard.get("ready_count"))),
+            _module_row("priority_rewatch_count", approved_hold_dashboard.get("priority_rewatch_count"), "So setup tu queue quay lai watchlist uu tien 30p.", attention=bool(approved_hold_dashboard.get("priority_rewatch_count"))),
+            _module_row("last_checked", (approved_hold_dashboard.get("checked") or [{}])[-1].get("action") if approved_hold_dashboard.get("checked") else "-", "Ket qua recheck queue gan nhat."),
+            _module_row("last_processed", (approved_hold_dashboard.get("processed") or [{}])[-1].get("action") if approved_hold_dashboard.get("processed") else "-", "Huong xu ly gan nhat khi queue het TTL."),
+            _module_row("updated_at", approved_hold_dashboard.get("updated_at"), "Thoi diem queue duoc cap nhat gan nhat."),
+            _module_row("error", approved_hold_dashboard.get("error") or "-", "Loi doc queue neu co.", attention=bool(approved_hold_dashboard.get("error"))),
+        ],
+    }
+
+def _ensure_trend_approved_hold_module(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    modules = payload.get("modules")
+    if not isinstance(modules, list):
+        return payload
+    if any(isinstance(module, dict) and module.get("name") == "Trend Approved Hold Queue" for module in modules):
+        return payload
+    next_payload = dict(payload)
+    next_payload["modules"] = [*modules, _trend_approved_hold_module(config)]
+    next_payload["module_count"] = len(next_payload["modules"])
+    return next_payload
+
+def _safe_log_token(value: Any) -> str:
+    token = re.sub(r"[^0-9A-Za-z_.:-]+", "_", str(value or "").strip())
+    return token[:120] or "unknown"
+
+def _persist_trade_intent_shadow_log(config: dict[str, Any], payload: dict[str, Any]) -> None:
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    source_key = "|".join(
+        [
+            str(source.get("slot_id") or "unknown-slot"),
+            str(source.get("latest_scan_at") or payload.get("created_at") or "unknown-time"),
+            str(source.get("candidate_count") or payload.get("candidate_count") or 0),
+            str(payload.get("intent_count") or 0),
+        ]
+    )
+    try:
+        if get_journal_state(config, TRADE_INTENT_SHADOW_LAST_SOURCE_KEY) == source_key:
+            return
+    except Exception as exc:
+        LOGGER.warning("Skipping shadow intent last-source read after storage error: %s", exc)
+    log_payload = to_jsonable(
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_key": source_key,
+            "shadow_mode": bool(payload.get("shadow_mode", True)),
+            "enabled_for_execution": False,
+            "phase_completion": payload.get("phase_completion"),
+            "source": source,
+            "candidate_count": payload.get("candidate_count"),
+            "intent_count": payload.get("intent_count"),
+            "strategy_counts": payload.get("strategy_counts"),
+            "items": payload.get("items"),
+        }
+    )
+    body = json.dumps(log_payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        key = f"{TRADE_INTENT_SHADOW_LOG_PREFIX}:{_safe_log_token(source.get('latest_scan_at') or payload.get('created_at'))}:{_safe_log_token(source.get('slot_id'))}"
+        set_journal_state(config, key, body)
+        set_journal_state(config, TRADE_INTENT_SHADOW_LAST_SOURCE_KEY, source_key)
+    except Exception as exc:
+        LOGGER.warning("Skipping shadow intent journal log after storage error: %s", exc)
+    try:
+        log_path = project_path(config, "logs/trade_intent_shadow.jsonl")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(body + "\n")
+    except Exception as exc:
+        LOGGER.warning("Skipping shadow intent file log after filesystem error: %s", exc)
+
+
+def _market_pattern_engine_dashboard(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        engine_config = load_engine_config()
+        repository = AnalysisRepository(db=atlas_database(config), config=engine_config)
+        latest = repository.latest(limit=20)
+        health = repository.health()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "latest": None, "latest_items": [], "counts": {}}
+    latest_snapshot = latest[0] if latest else None
+    counts = health.get("collections", {}) if isinstance(health, dict) else {}
+    return {"ok": True, "error": None, "latest": latest_snapshot, "latest_items": latest, "counts": counts}
+
+def _trade_intent_shadow_dashboard(config: dict[str, Any], regime: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        latest_scan = latest_internal_market_scan(config) or {}
+        candidates = latest_scan.get("candidates") or latest_scan.get("pool_symbols") or []
+        if not isinstance(candidates, list):
+            candidates = []
+        payload = build_shadow_trade_intents_from_rows(
+            [item for item in candidates if isinstance(item, dict)],
+            limit=5,
+            market_regime=str((regime or {}).get("regime") or ""),
+        )
+        payload["source"] = {
+            "latest_scan_at": latest_scan.get("created_at"),
+            "slot_id": latest_scan.get("slot_id"),
+            "status": latest_scan.get("status"),
+            "candidate_count": latest_scan.get("candidate_count") or len(candidates),
+        }
+        payload["ok"] = True
+        _persist_trade_intent_shadow_log(config, payload)
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "shadow_mode": True,
+            "phase_completion": {
+                "phase_1_schema": 100,
+                "phase_2_context_builder": 0,
+                "phase_3_analysis_result": 0,
+                "phase_4_strategy_selector": 0,
+            },
+            "candidate_count": 0,
+            "intent_count": 0,
+            "strategy_counts": {},
+            "items": [],
+        }
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+def _parse_exchange_time(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    parsed = _parse_time(value)
+    if parsed is not None:
+        return parsed
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    if numeric > 1_000_000_000_000:
+        numeric /= 1000.0
+    try:
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _system_timezone(config: dict[str, Any] | None = None) -> tzinfo:
+    config = config or {}
+    timezone_name = (
+        config.get("timezone")
+        or config.get("ai", {}).get("internal", {}).get("market_scan_timezone")
+        or "Asia/Ho_Chi_Minh"
+    )
+    try:
+        return ZoneInfo(str(timezone_name))
+    except Exception:
+        return timezone(timedelta(hours=7), "Asia/Ho_Chi_Minh")
+
+
+def _system_report_date(config: dict[str, Any] | None = None, value: datetime | None = None) -> str:
+    local_value = (value or datetime.now(timezone.utc)).astimezone(_system_timezone(config))
+    if local_value.hour < 6:
+        local_value -= timedelta(days=1)
+    return local_value.date().isoformat()
+
+
+def _local_calendar_day_bounds(config: dict[str, Any], date_key: str) -> tuple[str, str]:
+    local_tz = _system_timezone(config)
+    local_start = datetime.fromisoformat(str(date_key)).replace(tzinfo=local_tz)
+    local_end = local_start + timedelta(days=1)
+    return local_start.astimezone(timezone.utc).isoformat(), local_end.astimezone(timezone.utc).isoformat()
+
+
+def _period_start(date_value: datetime, period: str) -> datetime:
+    if period == "week":
+        return date_value - timedelta(days=date_value.weekday())
+    if period == "month":
+        return date_value.replace(day=1)
+    if period == "year":
+        return date_value.replace(month=1, day=1)
+    return date_value
+
+
+def _timeframe_minutes(value: str) -> int:
+    text = str(value or "").strip().lower()
+    if not text:
+        return 10**9
+    unit = text[-1]
+    number = text[:-1]
+    if not number.isdigit():
+        return 10**9
+    amount = int(number)
+    if unit == "m":
+        return amount
+    if unit == "h":
+        return amount * 60
+    if unit == "d":
+        return amount * 1440
+    if unit == "w":
+        return amount * 10080
+    return 10**9
+
+
+def _configured_timeframes(config: dict[str, Any]) -> list[str]:
+    strategy = config.get("strategy", {})
+    primary = str(strategy.get("timeframe") or "1m")
+    frames = [primary]
+    confirmation = strategy.get("confirmation_timeframes", {})
+    if bool(confirmation.get("enabled", True)):
+        frames.extend(str(item) for item in confirmation.get("frames", []) if str(item))
+    unique = []
+    seen: set[str] = set()
+    for frame in sorted(frames, key=_timeframe_minutes):
+        if frame not in seen:
+            unique.append(frame)
+            seen.add(frame)
+    return unique
+
+
+def _flatten_scan_memory(memory: dict[str, dict[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for symbol, frame_map in memory.items():
+        for timeframe, entries in frame_map.items():
+            for entry in entries or []:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        **entry,
+                    }
+                )
+    return rows
+
+
+def _latest_scan_timeframe_context(scan_payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for candidate in scan_payload.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        for item in candidate.get("code_timeframe_analysis") or []:
+            if not isinstance(item, dict):
+                continue
+            frame = str(item.get("timeframe") or "")
+            if frame:
+                grouped[frame].append(
+                    {
+                        "symbol": candidate.get("symbol"),
+                        "side": candidate.get("side"),
+                        "signal_summary": item.get("signal_summary"),
+                        "trend": item.get("trend") or item.get("trend_context"),
+                        "rsi": item.get("rsi"),
+                    }
+                )
+        mini_context = candidate.get("mini_context_4h")
+        if isinstance(mini_context, dict):
+            grouped["4h"].append(
+                {
+                    "symbol": candidate.get("symbol"),
+                    "side": candidate.get("side"),
+                    "signal_summary": mini_context.get("signal_summary"),
+                    "trend": mini_context.get("trend") or mini_context.get("trend_context"),
+                    "rsi": mini_context.get("rsi"),
+                }
+            )
+    return grouped
+
+
+def _paper_trade_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts = Counter(str(row.get("status") or "-") for row in rows)
+    latest = rows[0] if rows else {}
+    return {
+        "count": len(rows),
+        "status_counts": dict(status_counts),
+        "latest_created_at": latest.get("created_at"),
+        "latest_status": latest.get("status"),
+    }
+
+
+def _trade_memory_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    outcomes = Counter(str(row.get("outcome") or "-") for row in rows)
+    pnl_values = [_safe_float(row.get("pnl_usdt")) for row in rows]
+    return {
+        "count": len(rows),
+        "outcome_counts": dict(outcomes),
+        "total_pnl_usdt": round(sum(pnl_values), 6),
+        "average_pnl_usdt": round(_avg(pnl_values), 6) if pnl_values else 0.0,
+        "latest_closed_at": next((row.get("closed_at") for row in rows if row.get("closed_at")), None),
+    }
+
+
+def system_checklist_history(config: dict[str, Any], *, limit: int = 30) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    try:
+        rows = list_journal_state_prefix(config, "system_checklist:", limit=max(1, min(limit, 366)))
+    except Exception as exc:
+        LOGGER.warning("Skipping system checklist history after storage timeout/error: %s", exc)
+        return items
+    for row in rows:
+        try:
+            payload = json.loads(str(row.get("value")))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload.setdefault("date", str(row.get("key") or "").split(":", 1)[-1])
+        payload.setdefault("updated_at", row.get("updated_at"))
+        items.append(payload)
+    return items
+
+
+def system_checklist_snapshot(config: dict[str, Any], date_key: str) -> dict[str, Any] | None:
+    try:
+        raw = get_journal_state(config, f"system_checklist:{date_key}")
+    except Exception as exc:
+        LOGGER.warning("Skipping dated system checklist snapshot after storage timeout/error: %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _current_system_checklist_snapshot(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        raw = get_journal_state(config, SYSTEM_CHECKLIST_CURRENT_KEY)
+    except Exception as exc:
+        LOGGER.warning("Skipping current system checklist snapshot after storage timeout/error: %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _latest_system_checklist_snapshot(config: dict[str, Any]) -> dict[str, Any] | None:
+    current = _current_system_checklist_snapshot(config)
+    if current is not None:
+        return current
+    history = system_checklist_history(config, limit=1)
+    latest = history[0] if history else None
+    return latest if isinstance(latest, dict) else None
+
+
+def _preferred_system_checklist_snapshot(config: dict[str, Any], date_key: str) -> dict[str, Any] | None:
+    current = _current_system_checklist_snapshot(config)
+    if isinstance(current, dict) and str(current.get("date") or "") == date_key:
+        return current
+    dated = system_checklist_snapshot(config, date_key)
+    if isinstance(dated, dict):
+        return dated
+    return None
+
+
+def _snapshot_age_seconds(payload: dict[str, Any]) -> float | None:
+    created_at = _parse_time(payload.get("created_at"))
+    if created_at is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds())
+
+
+def _cache_token(value: Any) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)
+
+
+def _dashboard_snapshot_key(config: dict[str, Any], name: str, **params: Any) -> str:
+    params = {"v": dashboard_snapshot_cache_version(config), **params}
+    if not params:
+        return f"{DASHBOARD_SNAPSHOT_PREFIX}:{name}"
+    suffix = ";".join(f"{_cache_token(key)}={_cache_token(value)}" for key, value in sorted(params.items()))
+    return f"{DASHBOARD_SNAPSHOT_PREFIX}:{name}:{suffix}"
+
+
+def _cached_payload(config: dict[str, Any], key: str) -> dict[str, Any] | None:
+    raw = get_journal_state(config, key)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _persist_cached_payload(config: dict[str, Any], key: str, payload: dict[str, Any]) -> None:
+    set_journal_state(config, key, json.dumps(to_jsonable(payload), ensure_ascii=False))
+
+
+def _dashboard_degraded_payload(name: str, error: Exception, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(snapshot or {})
+    payload.update(
+        {
+            "ok": False,
+            "degraded": True,
+            "stale": snapshot is not None,
+            "error": str(error),
+            "error_group": "MongoDB Atlas timeout" if is_retryable_storage_error(error) else "Dashboard error",
+            "generated_at": payload.get("generated_at") or datetime.now(timezone.utc).isoformat(),
+            "degraded_at": datetime.now(timezone.utc).isoformat(),
+            "dashboard": name,
+        }
+    )
+    return payload
+
+
+def _get_or_build_cached_payload(
+    config: dict[str, Any],
+    *,
+    key: str,
+    builder: Callable[[], dict[str, Any]],
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] | None = None
+    snapshot_error: Exception | None = None
+    dashboard_name = key.split(":", 2)[1] if ":" in key else key
+    try:
+        snapshot = _cached_payload(config, key)
+    except Exception as exc:
+        snapshot_error = exc
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Dashboard snapshot read degraded for %s: %s", dashboard_name, exc)
+    if not force_refresh:
+        if snapshot is not None:
+            age_seconds = _snapshot_age_seconds(snapshot)
+            if max_age_seconds is None or age_seconds is None or age_seconds <= max(0, int(max_age_seconds)):
+                return snapshot
+    try:
+        payload = builder()
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Dashboard builder degraded for %s: %s", dashboard_name, exc)
+        return _dashboard_degraded_payload(dashboard_name, exc, snapshot=snapshot)
+    try:
+        _persist_cached_payload(config, key, payload)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        LOGGER.warning("Dashboard snapshot persist skipped for %s: %s", dashboard_name, exc)
+        payload = dict(payload)
+        payload["cache_warning"] = str(exc)
+    if snapshot_error is not None:
+        payload = dict(payload)
+        payload["cache_read_warning"] = str(snapshot_error)
+    return payload
+
+
+def _persist_system_checklist_snapshot(config: dict[str, Any], payload: dict[str, Any]) -> None:
+    clean_payload = to_jsonable(_strip_system_checklist_comparison_snapshot(payload))
+    current = _current_system_checklist_snapshot(config)
+    current_clean = (
+        to_jsonable(_strip_system_checklist_comparison_snapshot(current))
+        if isinstance(current, dict)
+        else None
+    )
+    current_created_at = str((current_clean or {}).get("created_at") or "")
+    next_created_at = str(clean_payload.get("created_at") or "")
+    if current_clean and (current_created_at != next_created_at or current_clean != clean_payload):
+        previous_body = json.dumps(_compact_system_checklist_comparison_snapshot(current_clean), ensure_ascii=False)
+        set_journal_state(config, SYSTEM_CHECKLIST_PREVIOUS_KEY, previous_body)
+    body = json.dumps(clean_payload, ensure_ascii=False)
+    set_journal_state(config, SYSTEM_CHECKLIST_CURRENT_KEY, body)
+    set_journal_state(config, f"system_checklist:{clean_payload['date']}", body)
+
+
+def _strip_system_checklist_comparison_snapshot(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    clean_payload = dict(payload)
+    clean_payload.pop("previous_snapshot", None)
+    return clean_payload
+
+def _compact_system_checklist_comparison_snapshot(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact: dict[str, Any] = {
+        "date": payload.get("date"),
+        "created_at": payload.get("created_at"),
+        "ok_count": payload.get("ok_count"),
+        "total": payload.get("total"),
+        "status_counts": payload.get("status_counts"),
+    }
+    modules: list[dict[str, Any]] = []
+    for module in payload.get("modules") or []:
+        if not isinstance(module, dict):
+            continue
+        module_compact = {
+                "number": module.get("number"),
+                "name": module.get("name"),
+                "status": module.get("status"),
+                "summary": module.get("summary"),
+                "stats": module.get("stats") if isinstance(module.get("stats"), list) else [],
+        }
+        modules.append({key: value for key, value in module_compact.items() if value not in (None, [], {})})
+    if modules:
+        compact["modules"] = modules
+    criteria = payload.get("criteria") or payload.get("items")
+    if isinstance(criteria, list):
+        compact["criteria"] = [
+            {
+                "label": item.get("label"),
+                "status": item.get("status"),
+                "detail": item.get("detail"),
+            }
+            for item in criteria
+            if isinstance(item, dict)
+        ]
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _raw_previous_system_checklist_snapshot(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        raw = get_journal_state(config, SYSTEM_CHECKLIST_PREVIOUS_KEY)
+    except Exception as exc:
+        LOGGER.warning("Skipping previous system checklist snapshot after storage timeout/error: %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _fallback_previous_system_checklist_snapshot(
+    config: dict[str, Any],
+    current_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    current_date = str(current_payload.get("date") or "")
+    current_created_at = str(current_payload.get("created_at") or "")
+    history = system_checklist_history(config, limit=366)
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        item_date = str(item.get("date") or "")
+        item_created_at = str(item.get("created_at") or "")
+        if current_created_at and item_created_at == current_created_at:
+            continue
+        if current_date and item_date == current_date:
+            continue
+        return _compact_system_checklist_comparison_snapshot(item)
+    return None
+
+
+def attach_previous_system_checklist_snapshot(
+    config: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    clean_payload = _strip_system_checklist_comparison_snapshot(payload)
+    if not clean_payload:
+        return {}
+    previous = _raw_previous_system_checklist_snapshot(config)
+    previous_clean = _compact_system_checklist_comparison_snapshot(previous) if isinstance(previous, dict) else None
+    current_created_at = str(clean_payload.get("created_at") or "")
+    if previous_clean and str(previous_clean.get("created_at") or "") == current_created_at:
+        previous_clean = None
+    if previous_clean is None:
+        previous_clean = _fallback_previous_system_checklist_snapshot(config, clean_payload)
+    enriched = dict(clean_payload)
+    enriched["previous_snapshot"] = previous_clean
+    return _compact_system_checklist_response(enriched)
+
+
+def system_checklist_summary(config: dict[str, Any], period: str) -> dict[str, Any]:
+    period = period if period in {"week", "month", "year"} else "week"
+    today = datetime.fromisoformat(_system_report_date(config))
+    start = _period_start(today, period).date().isoformat()
+    end = today.date().isoformat()
+    snapshots = [
+        item for item in system_checklist_history(config, limit=366)
+        if start <= str(item.get("date") or "") <= end
+    ]
+    status_counts = {"ok": 0, "warn": 0, "fail": 0}
+    module_status_counts = {"ok": 0, "warn": 0, "fail": 0}
+    for snapshot in snapshots:
+        for item in snapshot.get("criteria") or snapshot.get("items") or []:
+            status = str((item or {}).get("status") or "fail")
+            status_counts[status if status in status_counts else "fail"] += 1
+        for item in snapshot.get("modules") or []:
+            status = str((item or {}).get("status") or "fail")
+            module_status_counts[status if status in module_status_counts else "fail"] += 1
+    return {
+        "period": period,
+        "start": start,
+        "end": end,
+        "snapshot_count": len(snapshots),
+        "status_counts": status_counts,
+        "module_status_counts": module_status_counts,
+        "dates": [item.get("date") for item in snapshots],
+    }
+
+
+def _evidence_line(label: str, value: Any) -> dict[str, str]:
+    return {"label": label, "value": "-" if value is None else str(value)}
+
+
+def _check_item(
+    name: str,
+    ok: bool,
+    detail: str,
+    *,
+    required: bool = False,
+    warning: bool = False,
+    evidence: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    status = "ok" if ok else "warn" if warning and not required else "fail"
+    return {
+        "name": name,
+        "target": "✅ Bắt buộc" if required else "✅",
+        "status": status,
+        "ok": ok,
+        "required": required,
+        "detail": detail,
+        "evidence": evidence or [],
+    }
+
+
+def _module_file_index(config: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    module_dir = project_path(config, "module")
+    files: dict[int, dict[str, Any]] = {}
+    if not module_dir.exists():
+        return files
+    for path in sorted(module_dir.rglob("*.txt")):
+        match = re.match(r"\s*(\d+)", path.name)
+        if not match:
+            continue
+        number = int(match.group(1))
+        try:
+            stat = path.stat()
+            preview = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[:3]
+        except OSError:
+            stat = None
+            preview = []
+        relative_path = str(path.relative_to(module_dir))
+        files[number] = {
+            "file_name": path.name,
+            "folder": path.parent.name,
+            "relative_path": relative_path,
+            "path": str(path),
+            "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat() if stat else None,
+            "size_bytes": stat.st_size if stat else None,
+            "preview": [line.strip() for line in preview if line.strip()],
+        }
+    return files
+
+
+def _module_row(label: str, value: Any, meaning: str, *, attention: bool = False) -> dict[str, Any]:
+    return {
+        "label": label,
+        "value": "-" if value is None else value,
+        "meaning": meaning,
+        "attention": attention,
+    }
+
+
+def _module_bool_percent(value: Any) -> float:
+    return 100.0 if bool(value) else 0.0
+
+
+def _recovery_need_amounts(
+    config: dict[str, Any],
+    risk_state: dict[str, Any],
+    sizing_state: dict[str, Any] | None = None,
+) -> dict[str, float | None]:
+    sizing_state = sizing_state if isinstance(sizing_state, dict) else {}
+    cycle_source = risk_state.get("recoveryCyclePnlUsdt")
+    if cycle_source is None:
+        cycle_source = sizing_state.get("cycle_pnl_usdt")
+    if cycle_source is None:
+        return {"soft": None, "normal": None}
+    cycle_pnl = _safe_float(cycle_source)
+    target_profit = _safe_float(config.get("position_sizing", {}).get("target_profit_usdt"), 0.30)
+    normal_needed = max(0.0, target_profit - cycle_pnl)
+    sizing_band = str(sizing_state.get("recovery_band") or "").lower()
+    mode = str(risk_state.get("recoveryMode") or "").upper()
+    soft_threshold = _safe_float(risk_state.get("hardRecoverySoftExitThresholdUsdt"), 0.0)
+    is_hard = sizing_band == "hard" or mode == "HARD_RECOVERY"
+    soft_needed_raw = risk_state.get("needToSoftUsdt")
+    soft_needed = None if soft_needed_raw is None else _safe_float(soft_needed_raw)
+    if soft_needed is None:
+        soft_needed = max(0.0, soft_threshold - cycle_pnl) if is_hard else 0.0
+    normal_needed_raw = risk_state.get("needToNormalUsdt")
+    if normal_needed_raw is not None:
+        normal_needed = _safe_float(normal_needed_raw)
+    return {"soft": round(soft_needed, 6), "normal": round(normal_needed, 6)}
+
+
+def _module_percent(part: Any, total: Any) -> float | None:
+    whole = _safe_float(total)
+    if whole <= 0:
+        return None
+    return round(_safe_float(part) / whole * 100.0, 2)
+
+
+def _module_minutes_until(value: Any) -> float | None:
+    target = _parse_time(value)
+    if target is None:
+        return None
+    return round(max(0.0, (target - datetime.now(timezone.utc)).total_seconds() / 60.0), 2)
+
+
+def _module_file_payload(file_info: dict[str, Any] | None) -> dict[str, Any] | None:
+    return file_info or None
+
+
+def _load_sizing_runtime_state(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        raw = get_journal_state(config, SIZING_STATE_KEY)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _trade_execution_price(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None and key == "entry_price":
+        value = row.get("entry")
+    number = _safe_float(value, float("nan"))
+    return None if number != number else number
+
+def _trade_execution_position_payload(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _trade_execution_payload(row)
+    position = payload.get("position") if isinstance(payload.get("position"), dict) else {}
+    info = position.get("info") if isinstance(position.get("info"), dict) else {}
+    return position, info
+
+
+def _trade_execution_live_entry_price(row: dict[str, Any]) -> float | None:
+    position, info = _trade_execution_position_payload(row)
+    for value in (
+        position.get("entryPrice"),
+        position.get("entry_price"),
+        info.get("avgPx"),
+        row.get("entry_price"),
+        row.get("initial_entry_price"),
+        row.get("entry"),
+    ):
+        number = _safe_float(value, float("nan"))
+        if number == number and number > 0:
+            return number
+    return None
+
+def _trade_execution_target_from_payload(row: dict[str, Any], target: str) -> float | None:
+    _, info = _trade_execution_position_payload(row)
+    orders = info.get("closeOrderAlgo")
+    if isinstance(orders, str):
+        try:
+            orders = json.loads(orders)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            orders = []
+    key = "tpTriggerPx" if target == "take_profit" else "slTriggerPx"
+    fallback_key = "tpOrdPx" if target == "take_profit" else "slOrdPx"
+    if isinstance(orders, list):
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            number = _safe_float(order.get(key) or order.get(fallback_key), float("nan"))
+            if number == number:
+                return number
+    return None
+
+def _trade_execution_effective_stop_loss(row: dict[str, Any]) -> float | None:
+    return _trade_execution_target_from_payload(row, "stop_loss") or _trade_execution_price(row, "stop_loss")
+
+def _trade_execution_stop_loss_is_valid(side: str, entry: float | None, stop_loss: float | None) -> bool:
+    if entry is None or stop_loss is None:
+        return False
+    side = str(side or "").lower()
+    if side == "long":
+        return stop_loss < entry
+    if side == "short":
+        return stop_loss > entry
+    return False
+
+def _trade_execution_effective_take_profit(row: dict[str, Any]) -> float | None:
+    return _trade_execution_target_from_payload(row, "take_profit") or _trade_execution_price(row, "take_profit")
+
+
+def _trade_execution_mark_price(row: dict[str, Any]) -> float | None:
+    direct = _trade_execution_price(row, "last_price") or _trade_execution_price(row, "mark_price")
+    if direct is not None:
+        return direct
+    for key in ("snapshot_json", "payload_json"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        position = payload.get("position") if isinstance(payload, dict) else None
+        if not isinstance(position, dict):
+            continue
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        for price_key in ("markPrice", "lastPrice", "last"):
+            number = _safe_float(position.get(price_key), float("nan"))
+            if number == number:
+                return number
+        for price_key in ("markPx", "last"):
+            number = _safe_float(info.get(price_key), float("nan"))
+            if number == number:
+                return number
+    return None
+
+
+def _trade_execution_live_pnl(row: dict[str, Any]) -> float | None:
+    position, info = _trade_execution_position_payload(row)
+    for value in (
+        position.get("unrealized_pnl"),
+        position.get("unrealizedPnl"),
+        position.get("upl"),
+        info.get("upl"),
+        info.get("uplLastPx"),
+        row.get("pnl"),
+    ):
+        number = _safe_float(value, float("nan"))
+        if number == number:
+            return round(number, 6)
+    mark = _trade_execution_mark_price(row)
+    return _trade_execution_pnl_at(row, mark)
+
+
+def _trade_execution_progress(row: dict[str, Any]) -> float | None:
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    take_profit = _trade_execution_effective_take_profit(row)
+    mark = _trade_execution_mark_price(row)
+    if entry is None or take_profit is None or mark != mark:
+        return None
+    reward = take_profit - entry if side == "long" else entry - take_profit
+    if reward <= 0:
+        return None
+    gained = mark - entry if side == "long" else entry - mark
+    return round(gained / reward * 100, 2)
+
+
+def _trade_execution_r_multiple(row: dict[str, Any]) -> float | None:
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    initial_sl = _trade_execution_price(row, "initial_stop_loss") or _trade_execution_effective_stop_loss(row)
+    mark = _trade_execution_mark_price(row)
+    if entry is None or initial_sl is None or mark != mark:
+        return None
+    risk = entry - initial_sl if side == "long" else initial_sl - entry
+    if risk <= 0:
+        return None
+    gained = mark - entry if side == "long" else entry - mark
+    return round(gained / risk, 4)
+
+
+def _trade_execution_payload(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("snapshot_json", "payload_json"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _trade_execution_quantity(row: dict[str, Any]) -> float | None:
+    payload = _trade_execution_payload(row)
+    position, info = _trade_execution_position_payload(row)
+    for value in (
+        position.get("contracts"),
+        info.get("pos"),
+        payload.get("quantity"),
+        payload.get("contracts"),
+        row.get("quantity"),
+        row.get("contracts"),
+    ):
+        number = _safe_float(value, float("nan"))
+        if number == number and number > 0:
+            return abs(number)
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    mark = _trade_execution_mark_price(row)
+    pnl = _safe_float(row.get("pnl"), float("nan"))
+    contract_size = _trade_execution_contract_size(row)
+    if entry is not None and mark is not None and pnl == pnl and contract_size > 0:
+        price_delta = mark - entry if side == "long" else entry - mark
+        denominator = price_delta * contract_size
+        if abs(denominator) > 1e-12:
+            inferred = pnl / denominator
+            if inferred > 0:
+                return inferred
+    return None
+
+def _trade_execution_initial_quantity(row: dict[str, Any]) -> float | None:
+    payload = _trade_execution_payload(row)
+    position, info = _trade_execution_position_payload(row)
+    for value in (
+        row.get("initial_quantity"),
+        row.get("max_contracts_seen"),
+        row.get("original_quantity"),
+        payload.get("initial_quantity"),
+        payload.get("max_contracts_seen"),
+        payload.get("original_quantity"),
+        position.get("initial_quantity"),
+        info.get("initialQty"),
+    ):
+        number = _safe_float(value, float("nan"))
+        if number == number and number > 0:
+            return abs(number)
+    return _trade_execution_quantity(row)
+
+
+def _trade_execution_contract_size(row: dict[str, Any]) -> float:
+    payload = _trade_execution_payload(row)
+    position = payload.get("position") if isinstance(payload.get("position"), dict) else {}
+    info = position.get("info") if isinstance(position.get("info"), dict) else {}
+    for value in (
+        row.get("contract_size"),
+        row.get("contractSize"),
+        payload.get("contract_size"),
+        payload.get("contractSize"),
+        position.get("contractSize"),
+        info.get("ctVal"),
+    ):
+        number = _safe_float(value, float("nan"))
+        if number == number and number > 0:
+            return number
+    return 1.0
+
+
+def _trade_execution_pnl_at(row: dict[str, Any], price: Any, amount: Any | None = None) -> float | None:
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    target = _safe_float(price, float("nan"))
+    qty = _safe_float(amount, float("nan")) if amount is not None else (_trade_execution_quantity(row) or float("nan"))
+    if entry is None or target != target or qty != qty or qty <= 0:
+        return None
+    gross = target - entry if side == "long" else entry - target
+    return round(gross * qty * _trade_execution_contract_size(row), 6)
+
+
+def _trade_execution_trigger_price(side: str, entry: float | None, target: float | None, progress: float) -> float | None:
+    if entry is None or target is None:
+        return None
+    reward = target - entry if side == "long" else entry - target
+    if reward <= 0:
+        return None
+    return entry + reward * progress if side == "long" else entry - reward * progress
+
+
+def _trade_execution_is_profitable_close(side: str, entry: float | None, price: Any, pnl: Any = None) -> bool:
+    pnl_number = _safe_float(pnl, float("nan"))
+    if pnl_number == pnl_number:
+        return pnl_number > 0
+    close_price = _safe_float(price, float("nan"))
+    if entry is None or close_price != close_price:
+        return False
+    if side == "long":
+        return close_price > entry
+    if side == "short":
+        return close_price < entry
+    return False
+
+
+def _loss_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("loss_guard", {}) if isinstance(config.get("loss_guard"), dict) else {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "effective_from": str(raw.get("effective_from") or ""),
+        "apply_to_existing_positions": bool(raw.get("apply_to_existing_positions", False)),
+        "auto_close_enabled": bool(raw.get("auto_close_enabled", False)),
+        "warning_r": _safe_float(raw.get("warning_r"), -0.5),
+        "strong_warning_r": _safe_float(raw.get("strong_warning_r"), -0.7),
+        "partial_close_r": _safe_float(raw.get("partial_close_r"), -0.8),
+        "partial_close_fraction": max(0.01, min(0.9, _safe_float(raw.get("partial_close_fraction"), 0.25))),
+        "require_broken_setup_for_partial_close": bool(raw.get("require_broken_setup_for_partial_close", True)),
+    }
+
+def _loss_guard_applies_to_row(row: dict[str, Any], settings: dict[str, Any]) -> bool:
+    if settings.get("apply_to_existing_positions"):
+        return True
+    effective_raw = str(settings.get("effective_from") or "").strip()
+    if not effective_raw:
+        return False
+    created_raw = row.get("created_at")
+    if not created_raw:
+        return False
+    try:
+        effective_at = datetime.fromisoformat(effective_raw.replace("Z", "+00:00"))
+        created_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if effective_at.tzinfo is None:
+        effective_at = effective_at.replace(tzinfo=timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at >= effective_at
+
+def _trade_execution_partial_close_event(row: dict[str, Any]) -> dict[str, Any] | None:
+    events = _trade_execution_event_history(row)
+    partial_events = [
+        item for item in events
+        if isinstance(item, dict) and str(item.get("type") or "").lower() in {"partial_close", "loss_guard_partial_close"}
+    ]
+    if not partial_events:
+        return None
+    partial_events.sort(key=lambda item: str(item.get("created_at") or item.get("closed_at") or ""), reverse=True)
+    return partial_events[0]
+
+def _trade_execution_loss_guard(row: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
+    settings = _loss_guard_settings(config)
+    if not settings["enabled"]:
+        return None
+    applies_to_row = _loss_guard_applies_to_row(row, settings)
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    stored_initial_sl = _trade_execution_price(row, "initial_stop_loss")
+    live_sl = _trade_execution_effective_stop_loss(row)
+    initial_sl = live_sl if _trade_execution_stop_loss_is_valid(side, entry, live_sl) else stored_initial_sl
+    take_profit = _trade_execution_effective_take_profit(row)
+    qty = _trade_execution_quantity(row)
+    if side not in {"long", "short"} or entry is None or initial_sl is None or qty is None:
+        return None
+    risk = entry - initial_sl if side == "long" else initial_sl - entry
+    if risk <= 0:
+        return None
+    risk_reward = None
+    if take_profit is not None:
+        reward = take_profit - entry if side == "long" else entry - take_profit
+        if reward > 0:
+            risk_reward = round(reward / risk, 4)
+    partial_r = float(settings["partial_close_r"])
+    partial_price = entry + risk * partial_r if side == "long" else entry - risk * partial_r
+    partial_fraction = float(settings["partial_close_fraction"])
+    partial_amount = qty * partial_fraction
+    executed = bool(row.get("loss_guard_partial_done"))
+    actual_price = _safe_float(row.get("loss_guard_partial_price"), float("nan"))
+    actual_amount = _safe_float(row.get("loss_guard_partial_amount"), float("nan"))
+    actual_pnl = _safe_float(row.get("loss_guard_partial_pnl"), float("nan"))
+    try:
+        partial_order = json.loads(str(row.get("partial_take_profit_order_json") or "{}"))
+    except json.JSONDecodeError:
+        partial_order = {}
+    partial_history = partial_order.get("history") if isinstance(partial_order, dict) and isinstance(partial_order.get("history"), dict) else {}
+    if executed and partial_history:
+        history_price = _safe_float(partial_history.get("price"), float("nan"))
+        history_amount = _safe_float(partial_history.get("amount"), float("nan"))
+        history_pnl = _safe_float(partial_history.get("pnl"), float("nan"))
+        if history_price == history_price:
+            actual_price = history_price
+        if history_amount == history_amount:
+            actual_amount = history_amount
+        if history_pnl == history_pnl:
+            actual_pnl = history_pnl
+    if actual_pnl != actual_pnl and actual_price == actual_price and actual_amount == actual_amount:
+        actual_pnl = _trade_execution_pnl_at(row, actual_price, actual_amount)
+    return {
+        "enabled": True,
+        "applies": applies_to_row,
+        "auto_close_enabled": settings["auto_close_enabled"],
+        "require_broken_setup_for_partial_close": settings["require_broken_setup_for_partial_close"],
+        "warning_r": settings["warning_r"],
+        "strong_warning_r": settings["strong_warning_r"],
+        "partial_close_r": partial_r,
+        "partial_close_fraction": partial_fraction,
+        "partial_close_price": partial_price,
+        "partial_close_amount": partial_amount,
+        "partial_close_pnl": _trade_execution_pnl_at(row, partial_price, partial_amount),
+        "executed": executed,
+        "executed_at": row.get("loss_guard_partial_at"),
+        "actual_partial_price": actual_price if actual_price == actual_price else None,
+        "actual_partial_amount": actual_amount if actual_amount == actual_amount else None,
+        "actual_partial_pnl": actual_pnl if actual_pnl == actual_pnl else None,
+        "actual_partial_trigger_price": row.get("loss_guard_partial_trigger_price"),
+        "risk_reward": risk_reward,
+    }
+
+def _trade_execution_profit_protection_levels(
+    row: dict[str, Any],
+    partial_config: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    partial_config = partial_config if isinstance(partial_config, dict) else {}
+    side = str(row.get("side") or "").lower()
+    entry = _trade_execution_live_entry_price(row)
+    partial_done = bool(row.get("partial_take_profit_done"))
+    stored_initial_sl = _trade_execution_price(row, "initial_stop_loss")
+    live_sl = _trade_execution_effective_stop_loss(row)
+    initial_sl = live_sl if _trade_execution_stop_loss_is_valid(side, entry, live_sl) else stored_initial_sl
+    manual_targets_are_initial = bool(
+        partial_done
+        and live_sl is not None
+        and stored_initial_sl is not None
+        and _trade_execution_stop_loss_is_valid(side, entry, live_sl)
+        and abs(float(live_sl) - float(stored_initial_sl)) > max(1e-8, abs(float(stored_initial_sl)) * 1e-4)
+    )
+    take_profit = _trade_execution_effective_take_profit(row)
+    qty = _trade_execution_quantity(row)
+    base_qty = _trade_execution_initial_quantity(row) or qty
+    partial_fraction = _safe_float(row.get("partial_take_profit_fraction"), float("nan"))
+    if partial_fraction != partial_fraction:
+        partial_fraction = _safe_float(partial_config.get("close_fraction"), float("nan"))
+    if partial_fraction != partial_fraction:
+        partial_fraction = 0.3
+    partial_amount = _safe_float(row.get("partial_take_profit_amount"), float("nan"))
+    loss_guard = _trade_execution_loss_guard(row, config or {})
+    partial_base_qty = qty
+    if partial_amount != partial_amount and partial_base_qty:
+        partial_amount = partial_base_qty * partial_fraction
+    current_amount = qty
+    remaining_amount = current_amount
+    if not row.get("partial_take_profit_done") and partial_base_qty is not None:
+        remaining_amount = max(0.0, current_amount * (1.0 - partial_fraction)) if current_amount is not None else 0.0
+    current_sl = _trade_execution_effective_stop_loss(row)
+    current_tp = _trade_execution_effective_take_profit(row)
+    partial_price = row.get("partial_take_profit_price")
+    partial_pnl_value = _safe_float(row.get("partial_take_profit_pnl"), float("nan"))
+    partial_reference_entry = _trade_execution_price(row, "initial_entry_price") or entry
+    partial_event = _trade_execution_partial_close_event(row)
+    if isinstance(partial_event, dict):
+        event_pnl = _safe_float(partial_event.get("pnl"), float("nan"))
+        event_price = _safe_float(partial_event.get("mark_price") or partial_event.get("price"), float("nan"))
+        event_amount = _safe_float(partial_event.get("partial_amount") or partial_event.get("amount"), float("nan"))
+        if partial_pnl_value != partial_pnl_value and event_pnl == event_pnl:
+            partial_pnl_value = event_pnl
+        if partial_price is None and event_price == event_price:
+            partial_price = event_price
+        if partial_amount != partial_amount and event_amount == event_amount:
+            partial_amount = event_amount
+    partial_is_profitable = partial_done and _trade_execution_is_profitable_close(
+        side,
+        partial_reference_entry,
+        partial_price,
+        partial_pnl_value if partial_pnl_value == partial_pnl_value else None,
+    )
+    if not partial_is_profitable and partial_amount != partial_amount and partial_base_qty is not None:
+        partial_amount = partial_base_qty * partial_fraction
+    if not partial_is_profitable and partial_base_qty is not None:
+        remaining_amount = max(0.0, current_amount * (1.0 - partial_fraction)) if current_amount is not None else 0.0
+    partial_is_loss_close = bool(partial_done and not partial_is_profitable)
+    if partial_is_loss_close:
+        if (
+            partial_pnl_value != partial_pnl_value
+            and partial_reference_entry is not None
+            and partial_price is not None
+            and partial_amount == partial_amount
+        ):
+            close_price = _safe_float(partial_price, float("nan"))
+            if close_price == close_price:
+                gross = close_price - partial_reference_entry if side == "long" else partial_reference_entry - close_price
+                partial_pnl_value = round(gross * partial_amount * _trade_execution_contract_size(row), 6)
+        loss_fraction = _safe_float((loss_guard or {}).get("partial_close_fraction"), float("nan"))
+        if loss_fraction != loss_fraction and partial_amount == partial_amount and base_qty:
+            loss_fraction = partial_amount / base_qty
+        if loss_fraction != loss_fraction:
+            loss_fraction = 0.25
+        loss_guard = dict(loss_guard or {})
+        loss_guard.update(
+            {
+                "enabled": True,
+                "executed": True,
+                "executed_at": row.get("partial_take_profit_at") or (partial_event or {}).get("created_at"),
+                "actual_partial_price": partial_price,
+                "actual_partial_amount": partial_amount if partial_amount == partial_amount else None,
+                "actual_partial_pnl": partial_pnl_value if partial_pnl_value == partial_pnl_value else None,
+                "actual_partial_trigger_price": partial_price,
+                "partial_close_price": partial_price,
+                "partial_close_amount": partial_amount if partial_amount == partial_amount else None,
+                "partial_close_pnl": partial_pnl_value if partial_pnl_value == partial_pnl_value else None,
+                "partial_close_fraction": loss_fraction,
+                "source": "partial_close_loss_reclassified",
+            }
+        )
+    current_step = _safe_float(row.get("profit_extension_step"), float("nan"))
+    extension_fraction_for_base = _safe_float(partial_config.get("tp_extension_fraction"), float("nan"))
+    if extension_fraction_for_base != extension_fraction_for_base:
+        extension_fraction_for_base = partial_fraction
+    original_tp = row.get("partial_take_profit_original_tp")
+    if (
+        not manual_targets_are_initial
+        and entry is not None
+        and current_tp is not None
+        and current_step == current_step
+        and current_step > 0
+        and extension_fraction_for_base > 0
+    ):
+        multiplier = extension_fraction_for_base * current_step
+        reconstructed_tp = (current_tp + multiplier * entry) / (1.0 + multiplier)
+        original_tp_number = _safe_float(original_tp, float("nan"))
+        expected_current_tp = None
+        if original_tp_number == original_tp_number:
+            reward = original_tp_number - entry if side == "long" else entry - original_tp_number
+            if reward > 0:
+                expected_current_tp = (
+                    original_tp_number + reward * multiplier
+                    if side == "long"
+                    else original_tp_number - reward * multiplier
+                )
+        if (
+            original_tp is None
+            or expected_current_tp is None
+            or abs(float(expected_current_tp) - float(current_tp)) > max(1e-8, abs(float(current_tp)) * 1e-4)
+        ):
+            original_tp = reconstructed_tp
+    if original_tp is None:
+        original_tp = current_tp
+    if manual_targets_are_initial:
+        original_tp = current_tp
+    extended_tp = row.get("partial_take_profit_extended_tp")
+    if partial_price is None and entry is not None and take_profit is not None:
+        progress = _safe_float(partial_config.get("trigger_tp_progress"), float("nan"))
+        if progress != progress:
+            progress = 0.7
+        partial_price = _trade_execution_trigger_price(side, entry, take_profit, progress)
+    if extended_tp is None and entry is not None and take_profit is not None:
+        extension_fraction = _safe_float(partial_config.get("tp_extension_fraction"), float("nan"))
+        if extension_fraction != extension_fraction:
+            extension_fraction = partial_fraction
+        reward = take_profit - entry if side == "long" else entry - take_profit
+        if reward > 0:
+            extended_tp = take_profit + reward * max(0.0, extension_fraction) if side == "long" else take_profit - reward * max(0.0, extension_fraction)
+    tp_steps: list[dict[str, Any]] = []
+    sl_steps: list[dict[str, Any]] = []
+    base_tp = original_tp or take_profit
+    if entry is not None and base_tp is not None:
+        extension_fraction = _safe_float(partial_config.get("tp_extension_fraction"), float("nan"))
+        if extension_fraction != extension_fraction:
+            extension_fraction = partial_fraction
+        trigger_progress = _safe_float(partial_config.get("trigger_tp_progress"), float("nan"))
+        if trigger_progress != trigger_progress:
+            trigger_progress = 0.7
+        reward = base_tp - entry if side == "long" else entry - base_tp
+        if reward > 0:
+            previous_tp = None
+            for step_index in range(4):
+                price = base_tp if step_index == 0 else (base_tp + reward * extension_fraction * step_index if side == "long" else base_tp - reward * extension_fraction * step_index)
+                amount = qty if step_index == 0 else remaining_amount
+                trigger_price = None if step_index == 0 else _trade_execution_trigger_price(side, entry, previous_tp, trigger_progress)
+                tp_steps.append({"step": step_index + 1, "price": price, "pnl": _trade_execution_pnl_at(row, price, amount), "trigger_price": trigger_price})
+                previous_tp = price
+    if entry is not None and initial_sl is not None:
+        initial_r = entry - initial_sl if side == "long" else initial_sl - entry
+        buffers = partial_config.get("sl_buffer_r_by_step") if isinstance(partial_config.get("sl_buffer_r_by_step"), list) else [0.1, 0.5, 1.0]
+        sl_steps.append({
+            "step": 1,
+            "price": initial_sl,
+            "pnl": _trade_execution_pnl_at(row, initial_sl, qty),
+            "trigger_price": None,
+            "initial_amount": base_qty,
+        })
+        if initial_r > 0:
+            trigger_progress = _safe_float(partial_config.get("trigger_tp_progress"), float("nan"))
+            if trigger_progress != trigger_progress:
+                trigger_progress = 0.7
+            step_base_tp = original_tp or take_profit
+            extension_fraction = _safe_float(partial_config.get("tp_extension_fraction"), float("nan"))
+            if extension_fraction != extension_fraction:
+                extension_fraction = partial_fraction
+            base_reward = (step_base_tp - entry if side == "long" else entry - step_base_tp) if step_base_tp is not None else 0.0
+            for index, buffer in enumerate(buffers[:3], start=2):
+                buffer_value = _safe_float(buffer, 0.0)
+                price = entry + initial_r * max(0.0, buffer_value) if side == "long" else entry - initial_r * max(0.0, buffer_value)
+                previous_tp = None
+                if step_base_tp is not None and base_reward > 0:
+                    previous_tp = step_base_tp if index == 2 else (step_base_tp + base_reward * extension_fraction * (index - 2) if side == "long" else step_base_tp - base_reward * extension_fraction * (index - 2))
+                trigger_price = _trade_execution_trigger_price(side, entry, previous_tp, trigger_progress)
+                sl_steps.append({"step": index, "price": price, "pnl": _trade_execution_pnl_at(row, price, remaining_amount), "trigger_price": trigger_price})
+    projected_sl2 = current_sl
+    if entry is not None and initial_sl is not None:
+        initial_r = entry - initial_sl if side == "long" else initial_sl - entry
+        if initial_r > 0:
+            buffer_r = _safe_float(partial_config.get("remaining_sl_buffer_r"), float("nan"))
+            if buffer_r != buffer_r:
+                buffer_r = 0.1
+            protected_sl = entry + initial_r * max(0.0, buffer_r) if side == "long" else entry - initial_r * max(0.0, buffer_r)
+            current_sl_number = _safe_float(current_sl, float("nan"))
+            projected_sl2 = max(current_sl_number, protected_sl) if side == "long" and current_sl_number == current_sl_number else protected_sl
+            if side == "short" and current_sl_number == current_sl_number:
+                projected_sl2 = min(current_sl_number, protected_sl)
+    planned_partial_price = partial_price
+    if not partial_is_profitable and entry is not None and take_profit is not None:
+        progress = _safe_float(partial_config.get("trigger_tp_progress"), float("nan"))
+        if progress != progress:
+            progress = 0.7
+        planned_partial_price = _trade_execution_trigger_price(side, entry, take_profit, progress)
+    displayed_partial_price = partial_price if partial_is_profitable else planned_partial_price
+    return {
+        "live_entry_price": entry,
+        "initial_entry_price": _trade_execution_price(row, "initial_entry_price"),
+        "manual_targets_are_initial": manual_targets_are_initial,
+        "current_stop_loss": current_sl,
+        "current_take_profit": current_tp,
+        "quantity": qty,
+        "contract_size": _trade_execution_contract_size(row),
+        "current_amount": current_amount,
+        "remaining_amount": remaining_amount,
+        "current_sl": {
+            "price": current_sl,
+            "pnl": _trade_execution_pnl_at(row, current_sl, current_amount),
+            "initial_amount": base_qty,
+        },
+        "current_tp": {"price": current_tp, "pnl": _trade_execution_pnl_at(row, current_tp, current_amount)},
+        "partial_30": {
+            "price": displayed_partial_price,
+            "pnl": _trade_execution_pnl_at(row, displayed_partial_price, partial_amount),
+            "trigger_price": displayed_partial_price,
+            "executed": partial_is_profitable,
+            "executed_at": row.get("partial_take_profit_at") if partial_is_profitable else None,
+            "misclassified_loss_close": partial_is_loss_close,
+        },
+        "tp2": {"price": extended_tp, "pnl": _trade_execution_pnl_at(row, extended_tp, remaining_amount), "trigger_price": displayed_partial_price},
+        "sl2": {"price": projected_sl2, "pnl": _trade_execution_pnl_at(row, projected_sl2, remaining_amount), "trigger_price": displayed_partial_price},
+        "sl3": {"price": None, "pnl": None},
+        "tp_steps": tp_steps,
+        "sl_steps": sl_steps,
+        "original_tp": {"price": original_tp, "pnl": _trade_execution_pnl_at(row, original_tp, qty)},
+        "loss_guard": loss_guard,
+    }
+
+
+def _trade_execution_closed_pnl(row: dict[str, Any]) -> float | None:
+    history = _json_payload(row.get("exchange_close_history_json"))
+    info = history.get("info") if isinstance(history.get("info"), dict) else {}
+    for key in ("realizedPnl", "realisedPnl", "netPnl", "netProfit"):
+        value = _safe_float(history.get(key), float("nan"))
+        if value == value:
+            return round(value, 6)
+    for key in ("realizedPnl", "realisedPnl", "netPnl", "netProfit"):
+        value = _safe_float(info.get(key), float("nan"))
+        if value == value:
+            return round(value, 6)
+    pnl = _safe_float(history.get("pnl"), float("nan"))
+    if pnl != pnl:
+        pnl = _safe_float(info.get("pnl"), float("nan"))
+    if pnl != pnl:
+        value = _safe_float(row.get("pnl"), float("nan"))
+        return None if value != value else value
+    adjustments = 0.0
+    adjusted = False
+    for payload in (history, info):
+        for key in ("fee", "fundingFee", "funding", "settledPnl"):
+            value = _safe_float(payload.get(key), float("nan"))
+            if value != value:
+                continue
+            adjustments += value
+            adjusted = True
+    return round(pnl + adjustments, 6) if adjusted else pnl
+
+def _trade_execution_exchange_closed_at(row: dict[str, Any]) -> str | None:
+    history = _json_payload(row.get("exchange_close_history_json"))
+    info = history.get("info") if isinstance(history.get("info"), dict) else {}
+    timestamps: list[datetime] = []
+    for payload in (history, info):
+        for key in ("timestamp", "lastUpdateTimestamp", "updatedAt", "closed_at", "closedAt", "uTime", "cTime", "closeTime"):
+            parsed = _parse_exchange_time(payload.get(key))
+            if parsed is not None:
+                timestamps.append(parsed)
+    return max(timestamps).isoformat() if timestamps else None
+
+def _trade_execution_close_dedupe_key(item: dict[str, Any]) -> tuple[Any, ...] | None:
+    history = _json_payload(item.get("exchange_close_history_json"))
+    info = history.get("info") if isinstance(history.get("info"), dict) else {}
+    pos_id = str(history.get("posId") or info.get("posId") or "").strip()
+    exchange_closed_at = item.get("exchange_closed_at")
+    pnl = _safe_float(item.get("pnl"), float("nan"))
+    if not pos_id or not exchange_closed_at or pnl != pnl:
+        return None
+    close_size = str(history.get("closeTotalPos") or info.get("closeTotalPos") or "").strip()
+    close_price = str(history.get("closeAvgPx") or info.get("closeAvgPx") or "").strip()
+    return (
+        str(item.get("symbol") or "").strip(),
+        str(item.get("side") or "").strip().upper(),
+        pos_id,
+        exchange_closed_at,
+        round(pnl, 6),
+        close_size,
+        close_price,
+    )
+
+def _dedupe_trade_execution_closed_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        key = _trade_execution_close_dedupe_key(item)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(item)
+    return deduped
+
+def _trade_execution_event_history(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = row.get("trade_event_history_json")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
+def _trade_execution_summary(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        open_rows = list_trade_execution_rows(config, statuses=["OPEN"], limit=20, order="created_asc")
+        closed_rows = list_trade_execution_rows(config, statuses=["WIN", "LOSS", "BREAKEVEN", "CLOSED", "RECONCILED"], limit=20, order="closed_desc")
+        error = None
+    except Exception as exc:
+        open_rows = []
+        closed_rows = []
+        error = str(exc)
+    trailing = config.get("trailing_stop", {}) if isinstance(config.get("trailing_stop"), dict) else {}
+    partial = trailing.get("partial_take_profit", {}) if isinstance(trailing.get("partial_take_profit"), dict) else {}
+    try:
+        pending_total = count_pending_orders(config)
+    except Exception:
+        pending_total = None
+    open_items: list[dict[str, Any]] = []
+    for row in open_rows:
+        event_history = _trade_execution_event_history(row)
+        row_with_events = {**row, "trade_event_history": event_history}
+        open_items.append(
+            {
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "entry_price": row.get("entry_price"),
+                "live_entry_price": _trade_execution_live_entry_price(row_with_events),
+                "initial_entry_price": row.get("initial_entry_price"),
+                "initial_stop_loss": row.get("initial_stop_loss"),
+                "stop_loss": _trade_execution_effective_stop_loss(row_with_events),
+                "take_profit": _trade_execution_effective_take_profit(row_with_events),
+                "quantity": _trade_execution_quantity(row_with_events),
+                "contract_size": _trade_execution_contract_size(row_with_events),
+                "mark_price": _trade_execution_mark_price(row_with_events),
+                "pnl": _trade_execution_live_pnl(row_with_events),
+                "pnl_pct": row.get("pnl_pct"),
+                "partial_take_profit_done": bool(row.get("partial_take_profit_done")),
+                "partial_take_profit_at": row.get("partial_take_profit_at"),
+                "partial_take_profit_price": row.get("partial_take_profit_price"),
+                "partial_take_profit_fraction": row.get("partial_take_profit_fraction"),
+                "partial_take_profit_amount": row.get("partial_take_profit_amount"),
+                "partial_take_profit_original_tp": row.get("partial_take_profit_original_tp"),
+                "partial_take_profit_extended_tp": row.get("partial_take_profit_extended_tp"),
+                "partial_take_profit_protection_error": row.get("partial_take_profit_protection_error"),
+                "profit_extension_step": row.get("profit_extension_step"),
+                "trailing_stop_updated_at": row.get("trailing_stop_updated_at"),
+                "trailing_stop_r_multiple": row.get("trailing_stop_r_multiple"),
+                "trailing_stop_atr": row.get("trailing_stop_atr"),
+                "tp_progress_pct": _trade_execution_progress(row_with_events),
+                "r_multiple": _trade_execution_r_multiple(row_with_events),
+                "profit_protection_levels": _trade_execution_profit_protection_levels(row_with_events, partial, config),
+                "trade_event_count": len(event_history),
+                "trade_event_history": event_history[-10:],
+            }
+        )
+    closed_items = [
+        {
+            "id": row.get("id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "status": row.get("status"),
+            "close_reason": row.get("close_reason"),
+            "closed_at": row.get("closed_at"),
+            "exchange_closed_at": _trade_execution_exchange_closed_at(row),
+            "exchange_close_history_json": row.get("exchange_close_history_json"),
+            "entry_price": row.get("entry_price"),
+            "stop_loss": row.get("stop_loss"),
+            "take_profit": row.get("take_profit"),
+            "pnl": _trade_execution_closed_pnl(row),
+            "pnl_pct": row.get("pnl_pct"),
+            "exchange_close_source": row.get("exchange_close_source"),
+            "partial_take_profit_done": bool(row.get("partial_take_profit_done")),
+            "trade_event_count": len(_trade_execution_event_history(row)),
+            "trade_event_history": _trade_execution_event_history(row)[-10:],
+        }
+        for row in closed_rows
+    ]
+    closed_items.sort(
+        key=lambda item: (
+            _parse_time(item.get("exchange_closed_at")) or _parse_time(item.get("closed_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            _safe_int(item.get("id"), 0),
+        ),
+        reverse=True,
+    )
+    closed_items = _dedupe_trade_execution_closed_items(closed_items)
+    for item in closed_items:
+        item.pop("exchange_close_history_json", None)
+    return {
+        "ok": error is None,
+        "error": error,
+        "open_count": len(open_items),
+        "closed_count": len(closed_items),
+        "pending_total": pending_total,
+        "partial_done_count": sum(1 for row in open_items if row.get("partial_take_profit_done")),
+        "waiting_partial_count": sum(1 for row in open_items if not row.get("partial_take_profit_done")),
+        "open_items": open_items,
+        "recent_closed": closed_items,
+        "trailing_config": {
+            "enabled": bool(trailing.get("enabled")),
+            "atr_timeframe": trailing.get("atr_timeframe"),
+            "atr_period": trailing.get("atr_period"),
+            "atr_multiplier": trailing.get("atr_multiplier"),
+            "activation_r_multiple": trailing.get("activation_r_multiple"),
+            "partial_enabled": bool(partial.get("enabled")),
+            "partial_trigger_tp_progress": partial.get("trigger_tp_progress"),
+            "partial_close_fraction": partial.get("close_fraction"),
+            "remaining_sl_buffer_r": partial.get("remaining_sl_buffer_r"),
+            "tp_extension_fraction": partial.get("tp_extension_fraction"),
+        },
+    }
+
+
+def _default_automation_status(config: dict[str, Any]) -> dict[str, Any]:
+    automation = config.get("automation", {})
+    fallback = config.get("paper_trading", {}).get("scan_interval_seconds", 60)
+    interval = max(60, int(automation.get("scan_interval_seconds", fallback) or 60))
+    return {
+        "enabled": bool(automation.get("enabled", True)),
+        "interval_seconds": interval,
+        "mode": config.get("mode", "dry_run"),
+    }
+
+
+def _normalize_ai_decision_range(value: Any) -> str:
+    return "all" if str(value or "").strip().lower() == "all" else "current"
+
+
+def _market_regime_snapshot_symbol(snapshot: dict[str, Any] | None) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    indicators = snapshot.get("indicators") if isinstance(snapshot.get("indicators"), dict) else {}
+    return str(snapshot.get("symbol") or indicators.get("symbol") or "").strip()
+
+
+def _market_regime_snapshot_scope(snapshot: dict[str, Any] | None) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    indicators = snapshot.get("indicators") if isinstance(snapshot.get("indicators"), dict) else {}
+    return str(snapshot.get("scope") or indicators.get("scope") or "").strip().lower()
+
+
+def _market_regime_history_items(
+    config: dict[str, Any],
+    *,
+    limit: int = 30,
+    symbol: str = "",
+) -> list[dict[str, Any]]:
+    try:
+        rows = market_regime_history(config, limit=max(limit, 100) if symbol else limit)
+    except Exception:
+        return []
+    if symbol:
+        rows = [item for item in rows if _market_regime_snapshot_symbol(item) == symbol]
+    return rows[:limit]
+
+def _slim_market_regime_snapshot(item: dict[str, Any]) -> dict[str, Any]:
+    indicators = item.get("indicators") if isinstance(item.get("indicators"), dict) else {}
+    keep_indicator_keys = {
+        "symbol",
+        "scope",
+        "trend_score",
+        "price_above_ema20_pct",
+        "ema20_above_ema50_pct",
+        "price_above_ema200_pct",
+        "price_above_vwap_pct",
+        "ema_fast",
+        "ema_slow",
+        "ema200",
+        "vwap",
+        "atr",
+        "atr_pct",
+        "volatility",
+        "rsi",
+        "average_rsi",
+        "adx",
+        "macd",
+        "median_rsi",
+        "fear_greed",
+        "news_score",
+        "median_atr_pct",
+        "funding_rate",
+        "funding",
+        "fundingRate",
+        "median_volume_ratio",
+        "volume_ratio",
+        "volume",
+        "open_interest",
+        "open_interest_change",
+        "openInterest",
+        "openInterestChange",
+        "bull_percent",
+        "bear_percent",
+        "sideway_percent",
+        "high_volatility_percent",
+        "low_volatility_percent",
+        "coverage_count",
+        "target_count",
+        "coverage_pct",
+        "market_symbols",
+        "top_symbols",
+        "covered_symbols",
+        "missing_symbols",
+    }
+    slim = {
+        "created_at": item.get("created_at"),
+        "regime": item.get("regime"),
+        "confidence": item.get("confidence"),
+        "symbol": item.get("symbol"),
+        "scope": item.get("scope"),
+        "reason": item.get("reason"),
+        "indicators": {key: indicators.get(key) for key in keep_indicator_keys if key in indicators},
+    }
+    return {key: value for key, value in slim.items() if value not in (None, {}, [])}
+
+def _slim_market_regime_history_payload(payload: Any, *, limit: int = 12) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    chart_limit = max(1, min(int(limit or 12), 12))
+
+    def slim_items(items: Any) -> list[dict[str, Any]]:
+        return [
+            _slim_market_regime_snapshot(item)
+            for item in (items or [])[:chart_limit]
+            if isinstance(item, dict)
+        ]
+
+    compact = dict(payload)
+    compact["items"] = slim_items(payload.get("items"))
+    aggregate = payload.get("aggregate") if isinstance(payload.get("aggregate"), dict) else {}
+    compact["aggregate"] = {
+        **aggregate,
+        "items": slim_items(aggregate.get("items")),
+        "count": len(slim_items(aggregate.get("items"))),
+    }
+    by_symbol: dict[str, Any] = {}
+    for symbol, bucket in (payload.get("by_symbol") or {}).items():
+        if isinstance(bucket, dict):
+            items = slim_items(bucket.get("items"))
+            by_symbol[str(symbol)] = {**bucket, "items": items, "count": len(items)}
+        elif isinstance(bucket, list):
+            by_symbol[str(symbol)] = slim_items(bucket)
+    compact["by_symbol"] = by_symbol
+    return compact
+
+def _compact_system_checklist_response(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact = dict(payload)
+    history_payload = _slim_market_regime_history_payload(compact.get("market_regime_history"))
+    compact["market_regime_history"] = history_payload
+    modules: list[Any] = []
+    for module in compact.get("modules") or []:
+        if not isinstance(module, dict):
+            modules.append(module)
+            continue
+        next_module = dict(module)
+        if next_module.get("market_regime_history") is not None:
+            next_module["market_regime_history"] = history_payload
+        modules.append(next_module)
+    compact["modules"] = modules
+    if isinstance(compact.get("previous_snapshot"), dict):
+        compact["previous_snapshot"] = _compact_system_checklist_comparison_snapshot(compact.get("previous_snapshot"))
+    return compact
+
+
+def _market_regime_history_payload(
+    config: dict[str, Any],
+    *,
+    limit: int = 30,
+    current_regime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    chart_limit = max(1, min(int(limit or 30), 12))
+    detail_symbols = _market_regime_top_symbols(config)
+    aggregate_limit = _market_regime_aggregate_limit(config)
+    read_limit = max(limit, min(60, limit * 2))
+    try:
+        rows = market_regime_history(config, limit=read_limit)
+    except Exception as exc:
+        LOGGER.warning("Skipping market regime history after storage timeout/error: %s", exc)
+        rows = []
+    aggregate_items: list[dict[str, Any]] = []
+    by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in detail_symbols}
+    for item in rows:
+        scope = _market_regime_snapshot_scope(item)
+        symbol = _market_regime_snapshot_symbol(item)
+        if scope == "aggregate" or symbol == "MARKET":
+            aggregate_items.append(item)
+            continue
+        if symbol in by_symbol:
+            by_symbol[symbol].append(item)
+    if (
+        not aggregate_items
+        and isinstance(current_regime, dict)
+        and (_market_regime_snapshot_scope(current_regime) == "aggregate" or _market_regime_snapshot_symbol(current_regime) == "MARKET")
+        and current_regime.get("created_at")
+    ):
+        aggregate_items.append(current_regime)
+    symbol_payload = {
+        symbol: {
+            "label": symbol.split("/", 1)[0],
+            "items": [_slim_market_regime_snapshot(item) for item in items[:chart_limit]],
+            "count": len(items[:chart_limit]),
+            "latest_created_at": items[0].get("created_at") if items else None,
+        }
+        for symbol, items in by_symbol.items()
+    }
+    fallback_symbol = _market_regime_snapshot_symbol(current_regime) if isinstance(current_regime, dict) else ""
+    fallback_items = by_symbol.get(fallback_symbol, [])[:chart_limit] if fallback_symbol in by_symbol else []
+    active_items = aggregate_items[:chart_limit] if aggregate_items else fallback_items
+    latest_aggregate = aggregate_items[0] if aggregate_items else None
+    aggregate_indicators = latest_aggregate.get("indicators") if isinstance(latest_aggregate, dict) and isinstance(latest_aggregate.get("indicators"), dict) else {}
+    coverage_count = aggregate_indicators.get("coverage_count")
+    target_count = aggregate_indicators.get("target_count") or aggregate_limit
+    return {
+        "items": [_slim_market_regime_snapshot(item) for item in active_items],
+        "aggregate": {
+            "label": "Thị trường",
+            "items": [_slim_market_regime_snapshot(item) for item in aggregate_items[:chart_limit]],
+            "count": len(aggregate_items[:chart_limit]),
+            "latest_created_at": latest_aggregate.get("created_at") if latest_aggregate else None,
+        },
+        "top_symbols": detail_symbols,
+        "detail_symbols": detail_symbols,
+        "aggregate_limit": target_count,
+        "market_symbols": aggregate_indicators.get("market_symbols") or aggregate_indicators.get("top_symbols") or [],
+        "by_symbol": symbol_payload,
+        "coverage": {
+            "coverage_count": coverage_count,
+            "target_count": target_count,
+            "covered_symbols": aggregate_indicators.get("covered_symbols") or [],
+            "missing_symbols": aggregate_indicators.get("missing_symbols") or [
+                symbol for symbol in detail_symbols if not by_symbol.get(symbol)
+            ],
+            "coverage_pct": aggregate_indicators.get("coverage_pct"),
+        },
+    }
+
+
+def system_modules_payload(
+    config: dict[str, Any],
+    *,
+    checked_date: str,
+    checked_at_iso: str,
+    ai_history: list[dict[str, Any]],
+    replay: dict[str, Any],
+    strategy: dict[str, Any],
+    regime: dict[str, Any],
+    health: dict[str, Any],
+    risk_state: dict[str, Any],
+    row_counts: dict[str, Any] | None = None,
+    ai_range: str = "current",
+    regime_history_items: list[dict[str, Any]] | None = None,
+    regime_history_payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    files = _module_file_index(config)
+    ai_range_key = _normalize_ai_decision_range(ai_range)
+    ai_range_label = "Toàn bộ dữ liệu đang lưu" if ai_range_key == "all" else "Hôm nay"
+    active_strategies = strategy.get("active") or []
+    latest_ai = ai_history[-1] if ai_history else {}
+    latest_ai_status = latest_ai.get("status") or latest_ai.get("result")
+    latest_ai_time = latest_ai.get("created_at") or latest_ai.get("updated_at")
+
+    try:
+        if ai_range_key == "all":
+            decision_created_from = None
+            decision_created_to = checked_at_iso
+            trade_decision_stats = ai_trade_decision_stats(config)
+            ai_call_stats = ai_call_decision_stats(config)
+        else:
+            decision_created_from, decision_created_to = _local_calendar_day_bounds(config, checked_date)
+            trade_decision_stats = ai_trade_decision_stats(
+                config,
+                created_from=decision_created_from,
+                created_to=decision_created_to,
+            )
+            ai_call_stats = ai_call_decision_stats(
+                config,
+                created_from=decision_created_from,
+                created_to=decision_created_to,
+            )
+        decision_stats = {
+            **trade_decision_stats,
+            **ai_call_stats,
+            "tradeSignalRecords": trade_decision_stats.get("totalRecords"),
+        }
+        decision_stats["aiOtherCount"] = max(
+            0,
+            _safe_int(decision_stats.get("totalDecisions"))
+            - _safe_int(decision_stats.get("miniNoTradeCount"))
+            - _safe_int(decision_stats.get("longCount"))
+            - _safe_int(decision_stats.get("shortCount"))
+            - _safe_int(decision_stats.get("noTradeCount")),
+        )
+        decision_stats["periodStart"] = decision_created_from
+        decision_stats["periodEnd"] = decision_created_to
+        decision_stats["range"] = ai_range_key
+        decision_stats["rangeLabel"] = ai_range_label
+    except Exception as exc:
+        decision_stats = {"error": str(exc)}
+
+    try:
+        prompt_runtime = prompt_status(config)
+    except Exception as exc:
+        prompt_runtime = {"error": str(exc)}
+    prompt_metrics = prompt_runtime.get("metrics") if isinstance(prompt_runtime.get("metrics"), dict) else {}
+
+    if regime_history_items is None:
+        regime_history_payload = regime_history_payload or _market_regime_history_payload(
+            config,
+            limit=30,
+            current_regime=regime,
+        )
+        regime_history_items = list(regime_history_payload.get("items") or [])
+    if regime_history_payload is None:
+        detail_symbols = _market_regime_top_symbols(config)
+        aggregate_limit = _market_regime_aggregate_limit(config)
+        regime_history_payload = {
+            "items": regime_history_items,
+            "aggregate": {"label": "Thị trường", "items": [], "count": 0, "latest_created_at": None},
+            "top_symbols": detail_symbols,
+            "detail_symbols": detail_symbols,
+            "aggregate_limit": aggregate_limit,
+            "market_symbols": [],
+            "by_symbol": {},
+            "coverage": {"coverage_count": None, "target_count": aggregate_limit},
+        }
+    regime_counts: dict[str, int] = {}
+    for item in regime_history_items:
+        name = str(item.get("regime") or "UNKNOWN").upper()
+        regime_counts[name] = regime_counts.get(name, 0) + 1
+    regime_history_total = len(regime_history_items)
+
+    strategy_performance = [
+        item.get("performance")
+        for item in active_strategies
+        if isinstance(item.get("performance"), dict)
+    ]
+    strategy_total_trades = sum(_safe_int(item.get("totalTrades")) for item in strategy_performance)
+    strategy_total_pnl = round(sum(_safe_float(item.get("totalPnl")) for item in strategy_performance), 6)
+    strategy_avg_win_rate = round(
+        sum(_safe_float(item.get("winRate")) for item in strategy_performance) / len(strategy_performance),
+        2,
+    ) if strategy_performance else None
+    strategy_avg_profit_factor = round(
+        sum(_safe_float(item.get("profitFactor")) for item in strategy_performance) / len(strategy_performance),
+        2,
+    ) if strategy_performance else None
+    strategy_avg_drawdown = round(
+        sum(_safe_float(item.get("drawdown")) for item in strategy_performance) / len(strategy_performance),
+        2,
+    ) if strategy_performance else None
+    strategy_avg_confidence = round(
+        sum(_safe_float(item.get("averageConfidence")) for item in strategy_performance) / len(strategy_performance),
+        2,
+    ) if strategy_performance else None
+    strategy_avg_hold_minutes = round(
+        sum(_safe_float(item.get("averageHoldMinutes")) for item in strategy_performance) / len(strategy_performance),
+        2,
+    ) if strategy_performance else None
+
+    sizing_state = _load_sizing_runtime_state(config)
+    open_count = _safe_int(risk_state.get("openPositionsCount"))
+    max_positions = _safe_int(risk_state.get("maxConcurrentPositions"))
+    slot_utilization = _module_percent(open_count, max_positions)
+    paused_minutes = _module_minutes_until(risk_state.get("pausedUntil"))
+    recovery_need = _recovery_need_amounts(config, risk_state, sizing_state)
+    prompt_updated_at = prompt_metrics.get("updated_at") if prompt_metrics else None
+    processed_keys = sizing_state.get("processed_keys") if isinstance(sizing_state, dict) else []
+    row_counts = row_counts or {}
+    recovery_blocked = bool(sizing_state and sizing_state.get("blocked"))
+    recovery_runtime_records = sum(
+        _safe_int(row_counts.get(key))
+        for key in ("trade_executions", "pending_orders", "internal_pending_orders", "paper_trades", "trade_memory")
+    )
+    recovery_orphaned_block = recovery_blocked and open_count <= 0 and recovery_runtime_records <= 0
+    recovery_status = "warn" if recovery_blocked else "ok" if sizing_state else "warn"
+    try:
+        capital_snapshot = latest_capital_snapshot(config) or build_capital_snapshot(config, use_cache=True)
+    except Exception as exc:
+        capital_snapshot = {"ok": False, "error": str(exc)}
+    capital_mode = infer_capital_mode(health=health, risk_state=risk_state, sizing_state=sizing_state or {})
+    try:
+        capital_reserve_state = latest_capital_reserve_state(config) or calculate_capital_reserve_state(
+            config,
+            mode=capital_mode,
+            snapshot=capital_snapshot if isinstance(capital_snapshot, dict) else None,
+        )
+    except Exception as exc:
+        capital_reserve_state = {"ok": False, "mode": capital_mode, "reason": str(exc)}
+    try:
+        capital_allocation_check = check_capital_allocation(
+            config,
+            config.get("position_sizing", {}).get("base_margin_usdt", 0),
+            mode=capital_mode,
+        )
+    except Exception as exc:
+        capital_allocation_check = {"allowed": False, "reason": str(exc)}
+    try:
+        capital_position_size = calculate_position_size(
+            config,
+            {
+                "symbol": "CHECK/USDT:USDT",
+                "side": "LONG",
+                "mode": capital_mode,
+                "leverage": config.get("exchange", {}).get("leverage", 1),
+                "setup_grade": "S",
+            },
+        )
+    except Exception as exc:
+        capital_position_size = {"allowed": False, "reason": str(exc)}
+    try:
+        config_impact = analyze_configuration_change(config, {})
+    except Exception as exc:
+        config_impact = {"risk_level": "UNKNOWN", "is_safe": False, "summary": str(exc), "warnings": [str(exc)]}
+    approved_hold_dashboard = _trend_approved_hold_dashboard(config)
+    capital_snapshot_ok = bool(capital_snapshot.get("ok", True)) and capital_snapshot.get("realized_capital") is not None
+    capital_reserve_ok = bool(capital_reserve_state.get("ok", True)) and capital_reserve_state.get("realized_capital") is not None
+    capital_position_ok = bool(capital_position_size.get("allowed"))
+    config_impact_safe = bool(config_impact.get("is_safe")) and str(config_impact.get("risk_level") or "").upper() not in {"HIGH", "CRITICAL"}
+    market_pattern = _market_pattern_engine_dashboard(config)
+    market_pattern_latest = market_pattern.get("latest") or {}
+    market_pattern_counts = market_pattern.get("counts") or {}
+    market_pattern_structure = market_pattern_latest.get("market_structure") if isinstance(market_pattern_latest, dict) else {}
+    market_pattern_confluence = market_pattern_latest.get("confluence") if isinstance(market_pattern_latest, dict) else {}
+    market_pattern_feature = market_pattern_latest.get("feature_vector") if isinstance(market_pattern_latest, dict) else {}
+    trade_execution = _trade_execution_summary(config)
+    trade_config = trade_execution.get("trailing_config") or {}
+    try:
+        active_position = evaluate_open_positions(
+            config,
+            rows=list_trade_execution_rows(config, statuses=["OPEN"], limit=100, order="created_asc"),
+            notify=False,
+            persist=False,
+        )
+    except Exception as exc:
+        active_position = {"enabled": False, "error": str(exc), "items": []}
+    try:
+        active_position["recent_decisions"] = latest_active_position_decisions(config, limit=20)
+    except Exception:
+        active_position["recent_decisions"] = []
+    _trade_intent_shadow_dashboard(config, regime)
+
+    definitions = [
+        {
+            "number": 1,
+            "name": "Bộ nhớ quyết định AI",
+            "purpose": "Thống kê quyết định AI giao dịch đã được hệ thống ghi nhận thực tế.",
+            "status": "fail" if "error" in str(latest_ai_status or "").lower() else "ok" if _safe_int(decision_stats.get("totalDecisions")) > 0 else "warn",
+            "ai_range": ai_range_key,
+            "ai_range_label": ai_range_label,
+            "stats": [
+                _module_row("Ngày kiểm tra", checked_date, "Ngày local của lần tổng hợp dữ liệu module."),
+                _module_row("Cập nhật lúc", checked_at_iso, "Dấu thời gian UTC của payload hiện tại."),
+                _module_row("Số lần gọi AI gần nhất", len(ai_history), "Số lần gọi AI đã được nhật ký lưu gần nhất."),
+                _module_row("Phạm vi dữ liệu AI", ai_range_label, "Phạm vi đang được dùng để tính các biến AI trong module."),
+                _module_row("total_decisions", decision_stats.get("totalDecisions"), "Tổng lần gọi AI thật theo phạm vi đang chọn: Mini + 5.5; không tính các record scan nội bộ.", attention=True),
+                _module_row("Tổng log gọi AI trong phạm vi", decision_stats.get("totalRecords"), "Tổng số log gọi AI thật theo phạm vi đang kiểm tra."),
+                _module_row("mini_no_trade_count", decision_stats.get("miniNoTradeCount"), "Số lần Mini được gọi nhưng trả NO_TRADE hoặc không chọn cặp nào."),
+                _module_row("long_count", decision_stats.get("longCount"), "Số quyết định vào lệnh LONG đã được ghi nhận."),
+                _module_row("short_count", decision_stats.get("shortCount"), "Số quyết định vào lệnh SHORT đã được ghi nhận."),
+                _module_row("no_trade_count", decision_stats.get("noTradeCount"), "Số lần GPT-5.5 từ chối vào lệnh hoặc xóa setup; không tính các lần giữ setup."),
+                _module_row("ai_other_count", decision_stats.get("aiOtherCount"), "Số lần AI đã gọi nhưng không thuộc Mini không chọn, Mini chọn LONG/SHORT hoặc 5.5 từ chối/xóa setup."),
+                _module_row("long_percent", decision_stats.get("longPercent"), "Tỷ trọng LONG trên tổng quyết định AI thực.", attention=True),
+                _module_row("short_percent", decision_stats.get("shortPercent"), "Tỷ trọng SHORT trên tổng quyết định AI thực.", attention=True),
+                _module_row("winrate_long", decision_stats.get("winrateLong"), "Tỷ lệ thắng của nhóm quyết định LONG đã đóng lệnh.", attention=True),
+                _module_row("winrate_short", decision_stats.get("winrateShort"), "Tỷ lệ thắng của nhóm quyết định SHORT đã đóng lệnh.", attention=True),
+                _module_row("avg_confidence_long", decision_stats.get("avgConfidenceLong"), "Độ tự tin trung bình của các quyết định LONG."),
+                _module_row("avg_confidence_short", decision_stats.get("avgConfidenceShort"), "Độ tự tin trung bình của các quyết định SHORT."),
+                _module_row("profit_factor_long", decision_stats.get("profitFactorLong"), "Hệ số lợi nhuận của các quyết định LONG đã chốt."),
+                _module_row("profit_factor_short", decision_stats.get("profitFactorShort"), "Hệ số lợi nhuận của các quyết định SHORT đã chốt."),
+                _module_row("Trạng thái AI gần nhất", latest_ai_status, "Trạng thái của lần gọi AI gần nhất được nhật ký lưu.", attention=True),
+                _module_row("Ghi nhận AI lúc", latest_ai_time, "Thời điểm lần gọi AI gần nhất được ghi nhận."),
+                _module_row("bias_warning", decision_stats.get("biasWarning"), "Cảnh báo lệch hướng LONG/SHORT nếu có."),
+            ],
+        },
+        {
+            "number": 2,
+            "name": "Bunny Minimize Losses",
+            "purpose": "Theo dõi chuỗi thua, recovery mode, pause và trạng thái slot thực tế của hệ thống.",
+            "status": "warn" if risk_state.get("isPaused") or risk_state.get("isRecoveryMode") else "ok",
+            "recovery_mode": risk_state.get("recoveryMode") or ("HARD_RECOVERY" if risk_state.get("isRecoveryMode") else "NORMAL"),
+            "stats": [
+                _module_row("recoveryMode", risk_state.get("recoveryMode") or ("HARD_RECOVERY" if risk_state.get("isRecoveryMode") else "NORMAL"), "Mode hiện tại của Bunny Minimize Losses.", attention=True),
+                _module_row("recoveryBand", risk_state.get("recoveryBand"), "Dải recovery nội bộ: normal, soft hoặc hard.", attention=True),
+                _module_row("isRecoveryMode", _module_bool_percent(risk_state.get("isRecoveryMode")), "100 nghĩa là hệ thống đang ở recovery mode.", attention=True),
+                _module_row("isPaused", _module_bool_percent(risk_state.get("isPaused")), "100 nghĩa là hệ thống đang pause, không nên mở lệnh mới.", attention=True),
+                _module_row("globalLossStreak", risk_state.get("globalLossStreak"), "Chuỗi thua hiện tại của toàn hệ thống.", attention=True),
+                _module_row("globalLossStreakThreshold", risk_state.get("globalLossStreakThreshold"), "Ngưỡng chuỗi thua để bật recovery mode."),
+                _module_row("pauseTradingLossStreak", risk_state.get("pauseTradingLossStreak"), "Ngưỡng chuỗi thua để pause toàn hệ thống."),
+                _module_row("openPositionsCount", risk_state.get("openPositionsCount"), "Số vị thế đang mở tại thời điểm kiểm tra.", attention=True),
+                _module_row("maxConcurrentPositions", risk_state.get("maxConcurrentPositions"), "Số slot vị thế tối đa được phép chạy song song."),
+                _module_row("slotUtilizationPercent", slot_utilization, "Mức sử dụng slot vị thế hiện tại theo phần trăm."),
+                _module_row("pausedMinutesRemaining", paused_minutes, "Số phút còn lại trước khi trạng thái pause tự hết."),
+                _module_row("normalRiskPercent", risk_state.get("normalRiskPercent"), "Phần trăm rủi ro áp dụng trong normal mode."),
+                _module_row("softRecoveryRiskPercent", risk_state.get("softRecoveryRiskPercent"), "Phần trăm rủi ro áp dụng trong soft recovery."),
+                _module_row("recoveryModeRiskPercent", risk_state.get("recoveryModeRiskPercent"), "Phần trăm rủi ro áp dụng trong recovery mode."),
+                _module_row("currentNormalMinRuleScore", risk_state.get("currentNormalMinRuleScore"), "Ngưỡng rule score động hiện hành sau khi hệ thống tự điều chỉnh."),
+                _module_row("currentNormalMinGptConfidence", risk_state.get("currentNormalMinGptConfidence"), "Ngưỡng GPT confidence động hiện hành sau khi hệ thống tự điều chỉnh."),
+                _module_row("normalMinRiskReward", risk_state.get("normalMinRiskReward"), "Ngưỡng risk reward tối thiểu trong normal mode."),
+                _module_row("softRecoveryMinRuleScore", risk_state.get("softRecoveryMinRuleScore"), "Ngưỡng rule score tối thiểu trong soft recovery."),
+                _module_row("softRecoveryMinGptConfidence", risk_state.get("softRecoveryMinGptConfidence"), "Ngưỡng GPT confidence tối thiểu trong soft recovery."),
+                _module_row("softRecoveryMinRiskReward", risk_state.get("softRecoveryMinRiskReward"), "Ngưỡng risk reward tối thiểu trong soft recovery."),
+                _module_row("recoveryMinRuleScore", risk_state.get("recoveryMinRuleScore"), "Ngưỡng rule score tối thiểu trong recovery mode."),
+                _module_row("recoveryMinGptConfidence", risk_state.get("recoveryMinGptConfidence"), "Ngưỡng GPT confidence tối thiểu trong recovery mode."),
+                _module_row("recoveryMinRiskReward", risk_state.get("recoveryMinRiskReward"), "Ngưỡng risk reward tối thiểu trong recovery mode."),
+                _module_row("strongSetupRuleScore", risk_state.get("strongSetupRuleScore"), "Ngưỡng rule score để gắn nhãn strong setup."),
+                _module_row("strongSetupGptConfidence", risk_state.get("strongSetupGptConfidence"), "Ngưỡng GPT confidence để gắn nhãn strong setup."),
+                _module_row("strongSetupMinRiskReward", risk_state.get("strongSetupMinRiskReward"), "Ngưỡng risk reward để gắn nhãn strong setup."),
+                _module_row("enableAdaptiveThreshold", _module_bool_percent(risk_state.get("enableAdaptiveThreshold")), "100 nghĩa là adaptive threshold đang bật."),
+                _module_row("weeklyTargetMinTrades", risk_state.get("weeklyTargetMinTrades"), "Số lệnh đóng tối thiểu mục tiêu trong 7 ngày."),
+                _module_row("weeklyTargetMaxTrades", risk_state.get("weeklyTargetMaxTrades"), "Số lệnh đóng tối đa mục tiêu trong 7 ngày."),
+                _module_row("adaptiveScoreStep", risk_state.get("adaptiveScoreStep"), "Mức tăng/giảm rule score khi adaptive threshold điều chỉnh."),
+                _module_row("adaptiveConfidenceStep", risk_state.get("adaptiveConfidenceStep"), "Mức tăng/giảm GPT confidence khi adaptive threshold điều chỉnh."),
+                _module_row("recoveryCyclePnlUsdt", risk_state.get("recoveryCyclePnlUsdt"), "PnL cycle dùng để phân biệt Soft Recovery và Normal.", attention=True),
+                _module_row("recoveryTargetProfitUsdt", risk_state.get("recoveryTargetProfitUsdt"), "Mốc Cycle PnL cần đạt để quay về Normal.", attention=True),
+                _module_row("hardRecoveryPeakLossUsdt", risk_state.get("hardRecoveryPeakLossUsdt"), "Đáy âm sâu nhất kể từ khi vào Hard Recovery.", attention=True),
+                _module_row("hardRecoverySoftExitThresholdUsdt", risk_state.get("hardRecoverySoftExitThresholdUsdt"), "Mốc hồi 50% của đáy Hard để quay về Soft Recovery.", attention=True),
+                _module_row("needToSoftUsdt", recovery_need.get("soft"), "Số USDT cần gỡ thêm để từ Hard Recovery quay về Soft Recovery theo mốc soft exit hiện tại.", attention=True),
+                _module_row("needToNormalUsdt", recovery_need.get("normal"), "Số USDT cần gỡ thêm để Cycle PnL đạt mục tiêu normal hiện tại.", attention=True),
+                _module_row("updatedAt", risk_state.get("updatedAt"), "Thời điểm trading system state được refresh gần nhất."),
+            ],
+        },
+        {
+            "number": 3,
+            "name": "Bunny Health Monitor",
+            "purpose": "Theo dõi win rate, profit factor, drawdown và cảnh báo sức khỏe từ dữ liệu lệnh thực tế.",
+            "status": "warn" if health.get("isCritical") or health.get("isWarning") else "ok",
+            "stats": [
+                _module_row("minimumTradesForEvaluation", health.get("minimumTradesForEvaluation"), "Số lệnh đóng tối thiểu trước khi Health Monitor được phép cảnh báo hoặc pause."),
+                _module_row("totalTrades", health.get("totalTrades"), "Số lệnh đã đóng được dùng để tính health."),
+                _module_row("winCount", health.get("winCount"), "Số lệnh thắng trong cửa sổ health hiện tại."),
+                _module_row("lossCount", health.get("lossCount"), "Số lệnh thua trong cửa sổ health hiện tại.", attention=True),
+                _module_row("breakevenCount", health.get("breakevenCount"), "Số lệnh hòa vốn trong cửa sổ health hiện tại."),
+                _module_row("winRate", health.get("winRate"), "Win rate thực tế đang được monitor.", attention=True),
+                _module_row("profitFactor", health.get("profitFactor"), "Tỷ lệ gross profit / gross loss của tập lệnh health.", attention=True),
+                _module_row("totalPnl", health.get("totalPnl"), "Tổng PnL thực tế của tập lệnh dùng để tính health.", attention=True),
+                _module_row("maxDrawdownPercent", health.get("maxDrawdownPercent"), "Drawdown lớn nhất đang ghi nhận.", attention=True),
+                _module_row("riskMultiplierPercent", round(_safe_float(health.get("riskMultiplier"), 0.0) * 100.0, 2), "Hệ số giảm rủi ro đang áp vào hệ thống, quy đổi sang %."),
+                _module_row("scoreAdjustment", health.get("scoreAdjustment"), "Phần tăng thêm vào rule score do health monitor áp đặt."),
+                _module_row("confidenceAdjustment", health.get("confidenceAdjustment"), "Phần tăng thêm vào GPT confidence do health monitor áp đặt."),
+                _module_row("isPaused", _module_bool_percent(health.get("isPaused")), "100 nghĩa là health monitor đang buộc hệ thống pause.", attention=True),
+                _module_row("updatedAt", health.get("updatedAt"), "Thời điểm health state được refresh gần nhất."),
+                _module_row("reason", health.get("reason"), "Lý do khiến health hiện ở trạng thái hiện tại."),
+            ],
+        },
+        {
+            "number": 4,
+            "name": "Replay Engine",
+            "purpose": "Thống kê replay thực tế để so sánh quyết định mới với lịch sử đã lưu.",
+            "status": "warn" if replay.get("degraded") else ("fail" if replay.get("error") else "ok"),
+            "stats": [
+                _module_row("replayCount", replay.get("replayCount"), "Số lượt replay đã được lưu trong DB."),
+                _module_row("sampleLimit", replay.get("sampleLimit"), "Số bản ghi gần nhất dùng để thống kê replay."),
+                _module_row("decisionChangedPercent", replay.get("decisionChangedPercent"), "Tỷ lệ replay làm thay đổi quyết định ban đầu.", attention=True),
+                _module_row("confidenceChangedPercent", replay.get("confidenceChangedPercent"), "Tỷ lệ replay làm thay đổi confidence ban đầu."),
+                _module_row("averageLatency", replay.get("averageLatency"), "Độ trễ trung bình của các bản ghi replay."),
+                _module_row("replayWinRate", replay.get("replayWinRate"), "Win rate của tập lệnh được replay."),
+                _module_row("replayProfitFactor", replay.get("replayProfitFactor"), "Profit factor của tập replay đã có kết quả."),
+                _module_row("replayDrawdown", replay.get("replayDrawdown"), "Drawdown của tập replay đã có kết quả.", attention=True),
+                _module_row("errorGroup", replay.get("error_group") or "-", "Nhóm lỗi nếu Replay Engine đang degrade hoặc fail.", attention=bool(replay.get("error"))),
+                _module_row("error", replay.get("error") or "-", "Chi tiết lỗi Replay Engine nếu có.", attention=bool(replay.get("error"))),
+            ],
+        },
+        {
+            "number": 5,
+            "name": "Market Regime",
+            "purpose": "Tổng hợp trạng thái thị trường từ lịch sử regime mà hệ thống đã ghi nhận.",
+            "status": "ok" if regime_history_total > 0 else "warn",
+            "market_regime": regime,
+            "market_regime_history": regime_history_payload,
+            "stats": [
+                _module_row("historySamples", regime_history_total, "Số snapshot regime gần nhất dùng để tổng hợp module này."),
+                _module_row("currentConfidence", regime.get("confidence"), "Độ tin cậy của regime hiện tại.", attention=True),
+                _module_row("bullPercent", _module_percent(regime_counts.get("BULL", 0), regime_history_total), "Tỷ trọng snapshot đang được phân loại là BULL."),
+                _module_row("bearPercent", _module_percent(regime_counts.get("BEAR", 0), regime_history_total), "Tỷ trọng snapshot đang được phân loại là BEAR."),
+                _module_row("sidewayPercent", _module_percent(regime_counts.get("SIDEWAY", 0), regime_history_total), "Tỷ trọng snapshot đang được phân loại là SIDEWAY."),
+                _module_row("highVolatilityPercent", _module_percent(regime_counts.get("HIGH_VOLATILITY", 0), regime_history_total), "Tỷ trọng snapshot ở trạng thái biến động cao.", attention=True),
+                _module_row("lowVolatilityPercent", _module_percent(regime_counts.get("LOW_VOLATILITY", 0), regime_history_total), "Tỷ trọng snapshot ở trạng thái biến động thấp."),
+                _module_row("unknownPercent", _module_percent(regime_counts.get("UNKNOWN", 0), regime_history_total), "Tỷ trọng snapshot chưa xác định rõ regime."),
+                _module_row("currentRegime", regime.get("regime"), "Regime hiện tại của thị trường."),
+                _module_row("updatedAt", regime.get("created_at"), "Thời điểm snapshot regime mới nhất được ghi nhận."),
+                _module_row("reason", regime.get("reason"), "Lý do phân loại regime gần nhất."),
+            ],
+        },
+        {
+            "number": 6,
+            "name": "Strategy Versioning",
+            "purpose": "Hiển thị hiệu suất thực tế của các strategy version đang active.",
+            "status": "ok" if active_strategies else "warn",
+            "stats": [
+                _module_row("active_count", len(active_strategies), "Số strategy version đang active trong DB.", attention=True),
+                _module_row("tracked_trades", strategy_total_trades, "Tổng số lệnh đã đóng của các strategy đang active."),
+                _module_row("avg_win_rate", strategy_avg_win_rate, "Win rate trung bình của các strategy đang active.", attention=True),
+                _module_row("avg_profit_factor", strategy_avg_profit_factor, "Profit factor trung bình của các strategy đang active."),
+                _module_row("avg_drawdown", strategy_avg_drawdown, "Drawdown trung bình của các strategy đang active.", attention=True),
+                _module_row("avg_confidence", strategy_avg_confidence, "Độ tự tin trung bình của các lệnh do strategy active tạo ra."),
+                _module_row("avg_hold_minutes", strategy_avg_hold_minutes, "Thời gian giữ lệnh trung bình của các strategy đang active."),
+                _module_row("total_pnl", strategy_total_pnl, "Tổng PnL thực tế của các strategy đang active.", attention=True),
+                _module_row("active_versions", ", ".join(str(item.get("version") or item.get("name") or "-") for item in active_strategies) or "-", "Danh sách strategy version đang active."),
+            ],
+        },
+        {
+            "number": 7,
+            "name": "Prompt Caching",
+            "purpose": "Theo dõi prompt metrics thực tế đã được hệ thống ghi xuống DB.",
+            "status": "ok" if prompt_metrics else "warn",
+            "stats": [
+                _module_row("total_requests", prompt_metrics.get("total_requests") if prompt_metrics else None, "Tổng số lần hệ thống đã ghi nhận metrics prompt."),
+                _module_row("average_prompt_tokens", prompt_metrics.get("average_prompt_tokens") if prompt_metrics else None, "Số prompt tokens trung bình đã ghi nhận."),
+                _module_row("average_completion_tokens", prompt_metrics.get("average_completion_tokens") if prompt_metrics else None, "Số completion tokens trung bình đã ghi nhận."),
+                _module_row("average_latency", prompt_metrics.get("average_latency") if prompt_metrics else None, "Độ trễ trung bình của prompt engine."),
+                _module_row("estimated_cached_tokens", prompt_metrics.get("estimated_cached_tokens") if prompt_metrics else None, "Số tokens ước tính được cache từ các lần gọi thật."),
+                _module_row("estimated_dynamic_tokens", prompt_metrics.get("estimated_dynamic_tokens") if prompt_metrics else None, "Số tokens động trung bình đã ghi nhận."),
+                _module_row("cache_hit_percent", prompt_metrics.get("cache_hit_percent") if prompt_metrics else None, "Tỷ lệ cache hit đang được prompt metrics ghi lại.", attention=True),
+                _module_row("updated_at", prompt_updated_at or prompt_runtime.get("error"), "Thời điểm prompt metrics được cập nhật gần nhất hoặc thông báo chưa có dữ liệu.", attention=not bool(prompt_metrics)),
+            ],
+        },
+        {
+            "number": 8,
+            "name": "Recovery Chain Manager",
+            "purpose": "Theo dõi state gỡ lỗ thực tế của từng chuỗi recovery đã được journal lưu.",
+            "status": recovery_status,
+            "stats": [
+                _module_row("recovery_step", sizing_state.get("recovery_step") if sizing_state else None, "Bước hiện tại của chuỗi gỡ lỗ.", attention=True),
+                _module_row("recovery_band", sizing_state.get("recovery_band") if sizing_state else None, "Band hiện tại của recovery sizing: normal, soft hoặc hard.", attention=True),
+                _module_row("cycle_pnl_usdt", sizing_state.get("cycle_pnl_usdt") if sizing_state else None, "PnL lũy kế thực tế của chu kỳ recovery hiện tại.", attention=True),
+                _module_row("hard_peak_loss_usdt", sizing_state.get("hard_peak_loss_usdt") if sizing_state else None, "Đáy âm sâu nhất kể từ khi vào hard recovery.", attention=True),
+                _module_row("soft_return_pnl_usdt", sizing_state.get("soft_return_pnl_usdt") if sizing_state else None, "Mốc Cycle PnL cần hồi về để hard recovery chuyển xuống soft.", attention=True),
+                _module_row("next_margin_usdt", sizing_state.get("next_margin_usdt") if sizing_state else None, "Margin thực tế hệ thống sẽ dùng cho bước recovery tiếp theo.", attention=True),
+                _module_row("blocked", _module_bool_percent(sizing_state.get("blocked")) if sizing_state else None, "100 nghĩa là chuỗi recovery hiện đang bị chặn.", attention=True),
+                _module_row("processed_keys_count", len(processed_keys) if isinstance(processed_keys, list) else None, "Số khóa lệnh đã được recovery chain manager xử lý."),
+                _module_row("last_realized_net_pnl", sizing_state.get("last_realized_net_pnl") if sizing_state else None, "PnL thực tế của lần chốt gần nhất mà recovery chain đã ghi nhận."),
+                _module_row("last_loss_recorded", _module_bool_percent(bool(sizing_state.get("last_loss_key"))) if sizing_state else None, "100 nghĩa là hệ thống đang có bản ghi lệnh lỗ gần nhất trong chain."),
+                _module_row("updated_at", sizing_state.get("updated_at") if sizing_state else None, "Thời điểm state recovery chain được cập nhật gần nhất."),
+                _module_row("block_reason", sizing_state.get("block_reason") if sizing_state else "Chưa có dữ liệu thu thập", "Lý do block recovery chain nếu có.", attention=True),
+                _module_row("orphaned_block_state", _module_bool_percent(recovery_orphaned_block), "100 nghĩa là recovery đang block nhưng runtime DB không còn lệnh/pending/trade record."),
+                _module_row("runtime_trade_records", recovery_runtime_records, "Số record runtime dùng để xác định recovery block còn liên quan tới lệnh thật hay chỉ là state cũ."),
+                _module_row("last_loss_symbol", sizing_state.get("last_loss_symbol") if sizing_state else None, "Cặp giao dịch của lệnh lỗ gần nhất trong chain."),
+                _module_row("last_loss_side", sizing_state.get("last_loss_side") if sizing_state else None, "Hướng LONG/SHORT của lệnh lỗ gần nhất trong chain."),
+            ],
+        },
+        {
+            "number": 10,
+            "name": "Capital Sync",
+            "purpose": "Dong bo von thuc tu OKX va tinh realized capital, khong dung PnL tha noi de tang von giao dich.",
+            "status": "ok" if capital_snapshot_ok else "warn",
+            "capital_management": {
+                "section": "capital_sync",
+                "snapshot": capital_snapshot,
+                "reserve_state": capital_reserve_state,
+                "allocation_check": capital_allocation_check,
+                "position_size": capital_position_size,
+                "configuration_impact": config_impact,
+            },
+            "update_event": "Sau nap/rut, sau lenh dong",
+            "update_schedule": "60 giay/lan hoac khi bam sync",
+            "update_interval": "60 giay",
+            "stats": [
+                _module_row("source", capital_snapshot.get("source") or config.get("capital_sync", {}).get("capital_source", "OKX"), "Nguon dong bo von."),
+                _module_row("quote_currency", capital_snapshot.get("quote_currency") or config.get("capital_sync", {}).get("quote_currency", "USDT"), "Dong tien quote dung de tinh von."),
+                _module_row("wallet_balance", capital_snapshot.get("wallet_balance"), "So du vi lay tu account snapshot."),
+                _module_row("unrealized_pnl", capital_snapshot.get("unrealized_pnl"), "PnL tha noi chi dung de tru ra khoi von thuc.", attention=True),
+                _module_row("realized_capital", capital_snapshot.get("realized_capital"), "Von thuc = wallet_balance - unrealized_pnl.", attention=True),
+                _module_row("use_realized_capital_only", _module_bool_percent(config.get("capital_sync", {}).get("use_realized_capital_only", True)), "100 nghia la chi dung realized capital."),
+                _module_row("exclude_unrealized_pnl", _module_bool_percent(config.get("capital_sync", {}).get("exclude_unrealized_pnl", True)), "100 nghia la khong dung PnL tha noi de tang von."),
+                _module_row("updated_at", capital_snapshot.get("created_at"), "Thoi diem snapshot von moi nhat."),
+                _module_row("error", capital_snapshot.get("error") or "-", "Loi dong bo von neu co.", attention=not capital_snapshot_ok),
+            ],
+        },
+        {
+            "number": 12,
+            "name": "Capital Reserve",
+            "purpose": "Tach realized capital thanh reserve capital va trading capital de khong dung toan bo von tai khoan.",
+            "status": "ok" if capital_reserve_ok and capital_allocation_check.get("allowed") else "warn",
+            "capital_management": {
+                "section": "capital_reserve",
+                "snapshot": capital_snapshot,
+                "reserve_state": capital_reserve_state,
+                "allocation_check": capital_allocation_check,
+                "position_size": capital_position_size,
+                "configuration_impact": config_impact,
+            },
+            "update_event": "Sau nap/rut, sau lenh dong, khi health/recovery doi mode",
+            "update_schedule": "5 phut/lan doi chieu",
+            "update_interval": "5 phut",
+            "stats": [
+                _module_row("mode", capital_reserve_state.get("mode") or capital_mode, "Mode von suy ra tu Health, Minimize Losses va Recovery Chain.", attention=True),
+                _module_row("realized_capital", capital_reserve_state.get("realized_capital"), "Von thuc dung lam nen tinh reserve."),
+                _module_row("reserve_percent", capital_reserve_state.get("reserve_percent"), "Phan tram von duoc giu lai lam quy du phong.", attention=True),
+                _module_row("reserve_amount", capital_reserve_state.get("reserve_amount"), "So von du phong khong dung de mo lenh moi."),
+                _module_row("trading_capital", capital_reserve_state.get("trading_capital"), "Von con lai duoc phep phan bo cho giao dich."),
+                _module_row("used_trading_capital", capital_reserve_state.get("used_trading_capital"), "Von trading da bi chiem boi pending/open noi bo."),
+                _module_row("available_trading_capital", capital_reserve_state.get("available_trading_capital"), "Von trading con co the cap margin.", attention=True),
+                _module_row("allow_reserve_usage", _module_bool_percent(capital_reserve_state.get("allow_reserve_usage")), "100 nghia la cho phep dung reserve; mac dinh phai la 0."),
+                _module_row("allocation_allowed", _module_bool_percent(capital_allocation_check.get("allowed")), "100 nghia la margin co so hien tai con duoc phep cap."),
+                _module_row("reason", capital_allocation_check.get("reason") or capital_reserve_state.get("reason") or "-", "Ly do cho phep/tu choi cap von.", attention=not bool(capital_allocation_check.get("allowed"))),
+            ],
+        },
+        {
+            "number": 13,
+            "name": "Position Sizing",
+            "purpose": "Tinh khoi luong vi the theo trading capital, reserve, risk percent, SL/TP, leverage va slot dang dung.",
+            "status": "ok" if capital_position_ok else "warn",
+            "capital_management": {
+                "section": "position_sizing",
+                "snapshot": capital_snapshot,
+                "reserve_state": capital_reserve_state,
+                "allocation_check": capital_allocation_check,
+                "position_size": capital_position_size,
+                "configuration_impact": config_impact,
+            },
+            "update_event": "Khi chuan bi mo lenh hoac khi capital reserve thay doi",
+            "update_schedule": "Theo tung setup duoc duyet",
+            "update_interval": "event-driven",
+            "stats": [
+                _module_row("mode", capital_position_size.get("mode") or capital_mode, "Mode dung de chon risk percent."),
+                _module_row("risk_percent", capital_position_size.get("risk_percent"), "Risk percent theo mode hien tai.", attention=True),
+                _module_row("risk_amount", capital_position_size.get("risk_amount"), "So USDT rui ro toi da theo trading capital."),
+                _module_row("effective_risk_amount", capital_position_size.get("effective_risk_amount"), "So USDT rui ro thuc te sau quality margin neu co."),
+                _module_row("effective_risk_source", capital_position_size.get("effective_risk_source") or "-", "Nguon quyet dinh risk: risk_percent hoac quality_margin_loss_cap."),
+                _module_row("available_trading_capital", capital_position_size.get("available_trading_capital"), "Trading capital con trong de cap margin."),
+                _module_row("max_order_size_by_risk", capital_position_size.get("max_order_size_by_risk"), "Order size toi da theo risk."),
+                _module_row("max_order_size_by_capital", capital_position_size.get("max_order_size_by_capital"), "Order size toi da theo gioi han trading capital."),
+                _module_row("quality_margin_enabled", _module_bool_percent(capital_position_size.get("quality_margin_enabled")), "100 nghia la dang bat margin target theo grade setup.", attention=bool(capital_position_size.get("quality_margin_enabled"))),
+                _module_row("quality_margin_setup_grade", capital_position_size.get("quality_margin_setup_grade") or "-", "Grade setup dung de tinh quality margin."),
+                _module_row("quality_margin_target_margin", capital_position_size.get("quality_margin_target_margin"), "Margin muc tieu theo % trading capital va grade."),
+                _module_row("quality_margin_max_loss_amount", capital_position_size.get("quality_margin_max_loss_amount"), "Tran lo toi da neu hit SL theo mode."),
+                _module_row("quality_margin_order_size", capital_position_size.get("quality_margin_order_size"), "Order size sau boost quality margin va cap lo."),
+                _module_row("suggested_order_size", capital_position_size.get("suggested_order_size"), "Khoi luong vi the de xuat."),
+                _module_row("required_margin", capital_position_size.get("required_margin"), "Margin can dung cho suggested order."),
+                _module_row("allowed", _module_bool_percent(capital_position_size.get("allowed")), "100 nghia la sizing hien tai hop le."),
+                _module_row("reason", capital_position_size.get("reason") or "-", "Ly do sizing duoc chap nhan hoac bi tu choi.", attention=not capital_position_ok),
+            ],
+        },
+        {
+            "number": 13.5,
+            "name": "Trend Approved Hold Queue",
+            "purpose": "Theo doi cac setup Trend da duoc Mini approve nhung dang bi block truoc khi vao lenh.",
+            "status": "ok" if not approved_hold_dashboard.get("error") else "warn",
+            "trend_approved_hold": approved_hold_dashboard,
+            "update_event": "Sau Mini APPROVE bi block va moi lan trend scan recheck queue",
+            "update_schedule": "Moi trend scan; recheck theo cau hinh 120 giay",
+            "update_interval": "event-driven/120 giay",
+            "stats": [
+                _module_row("queue_count", approved_hold_dashboard.get("queue_count"), "So setup dang nam trong Approved Hold Queue.", attention=bool(approved_hold_dashboard.get("queue_count"))),
+                _module_row("ready_count", approved_hold_dashboard.get("ready_count"), "So setup da clear block va san sang di tiep vao order.", attention=bool(approved_hold_dashboard.get("ready_count"))),
+                _module_row("priority_rewatch_count", approved_hold_dashboard.get("priority_rewatch_count"), "So setup tu queue quay lai watchlist uu tien 30p.", attention=bool(approved_hold_dashboard.get("priority_rewatch_count"))),
+                _module_row("last_checked", (approved_hold_dashboard.get("checked") or [{}])[-1].get("action") if approved_hold_dashboard.get("checked") else "-", "Ket qua recheck queue gan nhat."),
+                _module_row("last_processed", (approved_hold_dashboard.get("processed") or [{}])[-1].get("action") if approved_hold_dashboard.get("processed") else "-", "Huong xu ly gan nhat khi queue het TTL."),
+                _module_row("updated_at", approved_hold_dashboard.get("updated_at"), "Thoi diem queue duoc cap nhat gan nhat."),
+                _module_row("error", approved_hold_dashboard.get("error") or "-", "Loi doc queue neu co.", attention=bool(approved_hold_dashboard.get("error"))),
+            ],
+        },
+        {
+            "number": 14,
+            "name": "Market Structure & Pattern Engine",
+            "purpose": "Bộ máy nhận diện cấu trúc thị trường, vùng giá, mô hình nến, chart pattern và Smart Money để xuất feature cho AI.",
+            "status": "ok" if market_pattern.get("ok") and _safe_int(market_pattern_counts.get("market_analysis_snapshots")) > 0 else "warn",
+            "update_event": "Khi scanner hoặc final re-check gửi OHLCV vào engine",
+            "update_schedule": "Event-driven theo request analyze/recheck",
+            "update_interval": "sự kiện",
+            "market_pattern_engine": market_pattern,
+            "stats": [
+                _module_row("snapshots", market_pattern_counts.get("market_analysis_snapshots"), "Tổng snapshot market analysis đã lưu idempotent trong Mongo.", attention=True),
+                _module_row("pattern_detections", market_pattern_counts.get("pattern_detections"), "Tổng candlestick/chart/smart-money detection đã lưu."),
+                _module_row("support_resistance_zones", market_pattern_counts.get("support_resistance_zones"), "Tổng vùng support/resistance đã lưu."),
+                _module_row("market_structure_events", market_pattern_counts.get("market_structure_events"), "Tổng event cấu trúc thị trường đã lưu."),
+                _module_row("latest_symbol", market_pattern_latest.get("symbol"), "Symbol của snapshot mới nhất."),
+                _module_row("latest_timeframe", market_pattern_latest.get("timeframe"), "Timeframe của snapshot mới nhất."),
+                _module_row("trend_regime", market_pattern_structure.get("trend_regime") if isinstance(market_pattern_structure, dict) else None, "Regime cấu trúc mới nhất: bullish, bearish, range hoặc transition.", attention=True),
+                _module_row("structure_state", market_pattern_structure.get("structure_state") if isinstance(market_pattern_structure, dict) else None, "Trạng thái HH/HL, LH/LL, range hoặc mixed."),
+                _module_row("confluence_bias", market_pattern_confluence.get("bias") if isinstance(market_pattern_confluence, dict) else None, "Bias đồng thuận kỹ thuật, không phải xác suất thắng.", attention=True),
+                _module_row("confluence_score", market_pattern_confluence.get("confluence_score") if isinstance(market_pattern_confluence, dict) else None, "Điểm đồng thuận kỹ thuật 0-1."),
+                _module_row("data_quality_score", market_pattern_feature.get("data_quality_score") if isinstance(market_pattern_feature, dict) else None, "Chất lượng dữ liệu của snapshot mới nhất."),
+                _module_row("updated_at", market_pattern_latest.get("updated_at") or market_pattern_latest.get("created_at"), "Thời điểm snapshot mới nhất."),
+                _module_row("error", market_pattern.get("error") or "-", "Lỗi engine nếu chưa kết nối được Mongo/API.", attention=not market_pattern.get("ok")),
+            ],
+        },
+        {
+            "number": 15,
+            "name": "Thực thi giao dịch & Quản lý vị thế",
+            "purpose": "Thực thi giao dịch, đồng bộ OKX/Atlas, partial take-profit, trailing SL và gồng lãi cho vị thế đang mở.",
+            "status": "warn" if trade_execution.get("error") else "ok",
+            "update_event": "Sau khi mo lenh, partial close, amend SL/TP hoac runtime sync OKX",
+            "update_schedule": "Theo chu ky runtime/trailing stop",
+            "update_interval": "1 phut",
+            "trade_execution": trade_execution,
+            "stats": [
+                _module_row("open_positions", trade_execution.get("open_count"), "So vi the live dang mo trong trade_executions.", attention=True),
+                _module_row("partial_done", trade_execution.get("partial_done_count"), "So vi the da chot partial take-profit 30%.", attention=True),
+                _module_row("waiting_partial", trade_execution.get("waiting_partial_count"), "So vi the dang cho dat moc partial TP."),
+                _module_row("recent_closed", trade_execution.get("closed_count"), "So lenh dong gan nhat duoc nap vao module."),
+                _module_row("partial_enabled", _module_bool_percent(trade_config.get("partial_enabled")), "100 nghia la co che chot 30% + gong lai dang bat.", attention=True),
+                _module_row("partial_trigger_tp_progress", trade_config.get("partial_trigger_tp_progress"), "Tien do toi TP de chot partial, vi du 0.7 = 70%."),
+                _module_row("partial_close_fraction", trade_config.get("partial_close_fraction"), "Ty le dong lan dau, vi du 0.3 = 30%."),
+                _module_row("remaining_sl_buffer_r", trade_config.get("remaining_sl_buffer_r"), "Sau partial, SL phan con lai duoc keo len entry + buffer R."),
+                _module_row("tp_extension_fraction", trade_config.get("tp_extension_fraction"), "TP moi duoc nay xa them theo reward ban dau de gong lai."),
+                _module_row("atr_timeframe", trade_config.get("atr_timeframe"), "Khung ATR dung cho trailing SL sau partial."),
+                _module_row("atr_multiplier", trade_config.get("atr_multiplier"), "He so ATR de dat khoang cach trailing SL."),
+                _module_row("error", trade_execution.get("error") or "-", "Loi doc trade execution neu co.", attention=bool(trade_execution.get("error"))),
+            ],
+        },
+        {
+            "number": 16,
+            "name": "Quản lý vị thế chủ động",
+            "purpose": "Đánh giá lại các vị thế đang mở để đề xuất giữ, chốt lời ngắn, cắt lỗ sớm, DCA, scale-in hoặc bảo vệ lợi nhuận. Mặc định chạy shadow, không tự thực thi.",
+            "status": "warn" if active_position.get("error") else "ok",
+            "update_event": "Sau mỗi vòng đồng bộ OKX vị thế đang mở",
+            "update_schedule": "Theo runtime sync",
+            "update_interval": f"{max(1, int((active_position.get('review_interval_seconds') or 300) / 60))} phut",
+            "active_position_manager": active_position,
+            "stats": [
+                _module_row("enabled", _module_bool_percent(active_position.get("enabled")), "100 nghĩa là module đang bật."),
+                _module_row("shadow_mode", _module_bool_percent(active_position.get("shadow_mode")), "100 nghĩa là chỉ ghi log/khuyến nghị, không tự can thiệp thật.", attention=True),
+                _module_row("auto_execute_enabled", _module_bool_percent(active_position.get("auto_execute_enabled")), "100 nghĩa là có thể thực thi nếu Risk/Capital duyệt. Mặc định phải là 0.", attention=bool(active_position.get("auto_execute_enabled"))),
+                _module_row("open_positions", active_position.get("open_count"), "Số vị thế OPEN được review."),
+                _module_row("hold_count", (active_position.get("action_counts") or {}).get("HOLD", 0), "Số vị thế chưa cần can thiệp."),
+                _module_row("bad_cut_count", (active_position.get("action_counts") or {}).get("BAD_CUT", 0), "Số vị thế đang bị đề xuất cắt lỗ chủ động.", attention=bool((active_position.get("action_counts") or {}).get("BAD_CUT"))),
+                _module_row("dca_review_count", (active_position.get("action_counts") or {}).get("DCA_REVIEW", 0), "Số vị thế đang được xem xét DCA.", attention=bool((active_position.get("action_counts") or {}).get("DCA_REVIEW"))),
+                _module_row("scale_in_review_count", (active_position.get("action_counts") or {}).get("SCALE_IN_REVIEW", 0), "Số vị thế đang được xem xét thêm khối lượng.", attention=bool((active_position.get("action_counts") or {}).get("SCALE_IN_REVIEW"))),
+                _module_row("good_exit_review_count", (active_position.get("action_counts") or {}).get("GOOD_EXIT_REVIEW", 0), "Số vị thế đang được xem xét chốt lời ngắn.", attention=bool((active_position.get("action_counts") or {}).get("GOOD_EXIT_REVIEW"))),
+                _module_row("profit_reversal_guard_count", (active_position.get("action_counts") or {}).get("PROFIT_REVERSAL_GUARD", 0), "Số vị thế lãi quay đầu nhanh đang được chốt bảo vệ.", attention=bool((active_position.get("action_counts") or {}).get("PROFIT_REVERSAL_GUARD"))),
+                _module_row("protect_profit_count", (active_position.get("action_counts") or {}).get("PROTECT_PROFIT", 0), "Số vị thế cần ưu tiên bảo vệ lợi nhuận.", attention=bool((active_position.get("action_counts") or {}).get("PROTECT_PROFIT"))),
+                _module_row("notified", active_position.get("notified"), "Số thông báo Telegram đã gửi trong lần review này."),
+                _module_row("updated_at", active_position.get("created_at"), "Thời điểm review mới nhất."),
+                _module_row("error", active_position.get("error") or "-", "Lỗi module nếu có.", attention=bool(active_position.get("error"))),
+            ],
+        },
+        {
+            "number": 9,
+            "name": "Configuration Impact",
+            "purpose": "Phan tich tac dong truoc khi ap dung thay doi cau hinh von, slot, sizing, recovery, SL/TP va leverage.",
+            "status": "ok" if config_impact_safe else "warn",
+            "capital_management": {
+                "section": "configuration_impact",
+                "snapshot": capital_snapshot,
+                "reserve_state": capital_reserve_state,
+                "allocation_check": capital_allocation_check,
+                "position_size": capital_position_size,
+                "configuration_impact": config_impact,
+            },
+            "update_event": "Khi nguoi dung de xuat doi cau hinh",
+            "update_schedule": "Chay truoc khi apply config",
+            "update_interval": "event-driven",
+            "stats": [
+                _module_row("realized_capital", config_impact.get("realized_capital"), "Von thuc dung de mo phong tac dong."),
+                _module_row("trading_capital_before", config_impact.get("trading_capital_before"), "Trading capital truoc thay doi."),
+                _module_row("trading_capital_after", config_impact.get("trading_capital_after"), "Trading capital sau thay doi."),
+                _module_row("required_capital_before", config_impact.get("required_capital_before"), "Von can truoc thay doi."),
+                _module_row("required_capital_after", config_impact.get("required_capital_after"), "Von can sau thay doi.", attention=True),
+                _module_row("max_safe_order_size", config_impact.get("max_safe_order_size"), "Order size toi da con an toan theo mo phong."),
+                _module_row("suggested_order_size", config_impact.get("suggested_order_size"), "Order size de xuat neu cau hinh hien tai khong an toan."),
+                _module_row("safety_score", config_impact.get("safety_score"), "Diem an toan 0-100.", attention=True),
+                _module_row("risk_level", config_impact.get("risk_level"), "LOW/MEDIUM/HIGH/CRITICAL.", attention=not config_impact_safe),
+                _module_row("summary", config_impact.get("summary"), "Tom tat tac dong cau hinh."),
+            ],
+        },
+    ]
+    modules: list[dict[str, Any]] = []
+    for definition in definitions:
+        file_info = files.get(int(definition["number"]), {})
+        modules.append(
+            {
+                **definition,
+                "file": _module_file_payload(file_info),
+                "has_file": bool(file_info),
+            }
+        )
+    return modules
+
+
+def _build_system_checklist_payload(
+    config: dict[str, Any],
+    *,
+    automation: dict[str, Any] | None = None,
+    ai_range: str = "current",
+) -> dict[str, Any]:
+    checked_at = datetime.now(timezone.utc)
+    checked_at_iso = checked_at.isoformat()
+    checked_at_local = checked_at.astimezone(_system_timezone(config))
+    checked_date = _system_report_date(config, checked_at)
+    automation = automation or _default_automation_status(config)
+    ai_range_key = _normalize_ai_decision_range(ai_range)
+
+    stats = safe_storage_stats(config)
+    row_counts = stats.get("row_counts", {})
+    payload_bytes = stats.get("payload_bytes", {})
+    disk = stats.get("disk", {})
+    free_percent = float(disk.get("free_percent") or 0)
+    disk_applicable = str(stats.get("backend") or "").lower() != "atlas"
+    disk_ok = free_percent > 2 if disk_applicable else True
+    disk_label = f"{free_percent}%" if disk_applicable else "N/A (MongoDB Atlas)"
+    last_result = str(automation.get("last_result") or "")
+    runtime_error = str(automation.get("error") or "")
+    runtime_ok = disk_ok and "error" not in last_result.lower() and not runtime_error
+
+    try:
+        ai_history = recent_ai_call_history(config, limit=20)
+    except Exception:
+        ai_history = []
+    ai_errors = [
+        item for item in ai_history
+        if "error" in str(item.get("status") or item.get("result") or "").lower()
+    ]
+    ai_enabled = bool(config.get("ai", {}).get("enabled", False))
+    ai_allow = bool(config.get("ai", {}).get("allow_api_calls", False))
+    ai_ok = (not ai_enabled) or not ai_errors
+    latest_ai = ai_history[-1] if ai_history else {}
+
+    try:
+        replay = replay_stats(config)
+        replay_ok = True
+        replay_warning = False
+    except Exception as exc:
+        replay_storage_degraded = is_retryable_storage_error(exc)
+        replay = {
+            "error": str(exc),
+            "degraded": replay_storage_degraded,
+            "error_group": "MongoDB Atlas timeout" if replay_storage_degraded else "Replay Engine error",
+        }
+        replay_ok = replay_storage_degraded
+        replay_warning = replay_storage_degraded
+
+    try:
+        strategy = current_strategy_state(config)
+        active_strategies = strategy.get("active") or []
+        strategy_ok = bool(active_strategies or strategy.get("selected_strategy_version") or strategy.get("version"))
+    except Exception as exc:
+        strategy = {"error": str(exc)}
+        active_strategies = []
+        strategy_ok = False
+
+    try:
+        regime = current_market_regime(config)
+        regime_ok = bool(regime.get("regime"))
+    except Exception as exc:
+        regime = {"error": str(exc)}
+        regime_ok = False
+    regime_history_payload = _market_regime_history_payload(config, limit=30, current_regime=regime)
+    regime_history_items = list(regime_history_payload.get("items") or [])
+
+    try:
+        health = get_bunny_health_state(config)
+        health_ok = bool(health) and not bool(health.get("isCritical"))
+    except Exception as exc:
+        health = {"error": str(exc)}
+        health_ok = False
+
+    try:
+        risk_state = get_trading_system_state(config)
+        guard = market_guard_block_status(config)
+        kill_switch_ok = bool(risk_state) and "error" not in risk_state
+    except Exception as exc:
+        risk_state = {"error": str(exc)}
+        guard = {}
+        kill_switch_ok = False
+
+    try:
+        paper_trades = list_paper_trades(config, limit=10)
+    except Exception:
+        paper_trades = []
+    paper_ok = bool(paper_trades) or config.get("mode") in {"demo", "dry_run"}
+    latest_paper = paper_trades[0] if paper_trades else {}
+
+    items = [
+        _check_item(
+            "Khong con loi runtime",
+            runtime_ok,
+            f"last_result={last_result or '-'}, disk_free={disk_label}",
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Thoi gian local", checked_at_local.isoformat()),
+                _evidence_line("Thoi gian UTC", checked_at_iso),
+                _evidence_line("Nguon", "/healthz + automation_status + storage_stats"),
+                _evidence_line("Ket qua runtime gan nhat", last_result or "-"),
+                _evidence_line("Runtime error", runtime_error or "khong co"),
+                _evidence_line(
+                    "Disk con trong",
+                    f"{free_percent}% ({disk.get('free_bytes', 0)} bytes)" if disk_applicable else "N/A - MongoDB Atlas",
+                ),
+                _evidence_line("DB path", stats.get("db_path")),
+            ],
+        ),
+        _check_item(
+            "AI quyet dinh on dinh",
+            ai_ok,
+            f"enabled={ai_enabled}, allow_api={ai_allow}, recent_errors={len(ai_errors)}, calls={len(ai_history)}",
+            warning=not ai_history or not ai_enabled,
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("AI enabled", ai_enabled),
+                _evidence_line("Cho phep goi API", ai_allow),
+                _evidence_line("So lan goi AI gan nhat duoc luu", len(ai_history)),
+                _evidence_line("So loi AI gan nhat", len(ai_errors)),
+                _evidence_line("Model gan nhat", latest_ai.get("model") or "-"),
+                _evidence_line("Trang thai lan gan nhat", latest_ai.get("status") or "-"),
+                _evidence_line("Ghi chu", "AI dang tat van duoc xem la an toan van hanh; khi bat AI tieu chi dua tren loi gan nhat."),
+            ],
+        ),
+        _check_item(
+            "Replay Engine hoat dong",
+            replay_ok,
+            f"records={replay.get('replayCount', '-')}, sample_limit={replay.get('sampleLimit', '-')}",
+            warning=replay_warning,
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "/api/replay/stats"),
+                _evidence_line("So ban replay", replay.get("replayCount", "-")),
+                _evidence_line("Gioi han mau thong ke", replay.get("sampleLimit", "-")),
+                _evidence_line("Ti le doi quyet dinh", replay.get("decisionChangedPercent", "-")),
+                _evidence_line("Replay win rate", replay.get("replayWinRate", "-")),
+                _evidence_line("Trang thai degrade", replay.get("error_group") or "khong"),
+                _evidence_line("Loi", replay.get("error") or "khong co"),
+            ],
+        ),
+        _check_item(
+            "Strategy Versioning hoat dong",
+            strategy_ok,
+            f"active={len(active_strategies)}",
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "/api/strategy/current"),
+                _evidence_line("So strategy active", len(active_strategies)),
+                _evidence_line("Strategy active", ", ".join(str(item.get("version") or item.get("name") or "-") for item in active_strategies) or "-"),
+                _evidence_line("Loi", strategy.get("error") or "khong co"),
+            ],
+        ),
+        _check_item(
+            "Market Regime hoat dong",
+            regime_ok,
+            f"regime={regime.get('regime', '-')}",
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "/api/market-regime/current"),
+                _evidence_line("Regime hien tai", regime.get("regime") or "-"),
+                _evidence_line("Do tin cay", regime.get("confidence") or "-"),
+                _evidence_line("Cap nhat luc", regime.get("created_at") or "-"),
+                _evidence_line("Ly do", regime.get("reason") or regime.get("error") or "-"),
+            ],
+        ),
+        _check_item(
+            "Health Monitor hoat dong",
+            health_ok,
+            f"critical={health.get('isCritical', False)}, warning={health.get('isWarning', False)}",
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "/api/bunny-health/state"),
+                _evidence_line("Healthy", health.get("isHealthy")),
+                _evidence_line("Warning", health.get("isWarning")),
+                _evidence_line("Critical", health.get("isCritical")),
+                _evidence_line("Win rate", health.get("winRate")),
+                _evidence_line("Profit factor", health.get("profitFactor")),
+                _evidence_line("Drawdown", health.get("maxDrawdownPercent")),
+                _evidence_line("Ly do", health.get("reason") or health.get("error") or "-"),
+            ],
+        ),
+        _check_item(
+            "Kill Switch",
+            kill_switch_ok,
+            f"paused={risk_state.get('isPaused', False)}, guard_active={guard.get('active', False)}",
+            required=True,
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "trading_system_state + market_guard_block_status"),
+                _evidence_line("Trading paused", risk_state.get("isPaused")),
+                _evidence_line("Paused until", risk_state.get("pausedUntil") or "-"),
+                _evidence_line("Market Guard active", guard.get("active")),
+                _evidence_line("Guard blocked until", guard.get("blocked_until") or "-"),
+                _evidence_line("Loss streak", risk_state.get("globalLossStreak") or 0),
+                _evidence_line("Loi", risk_state.get("error") or "khong co"),
+            ],
+        ),
+        _check_item(
+            "Nhat ky day du",
+            int(row_counts.get("journal_state", 0)) > 0,
+            f"journal_state={row_counts.get('journal_state', 0)}, trades={row_counts.get('trade_executions', 0)}",
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "Atlas row_counts + payload_bytes"),
+                _evidence_line("journal_state rows", row_counts.get("journal_state", 0)),
+                _evidence_line("trade_executions rows", row_counts.get("trade_executions", 0)),
+                _evidence_line("decisions rows", row_counts.get("decisions", 0)),
+                _evidence_line("pending_orders rows", row_counts.get("pending_orders", 0)),
+                _evidence_line("market_scan_observations rows", row_counts.get("market_scan_observations", 0)),
+                _evidence_line("decision payload bytes", payload_bytes.get("decisions", 0)),
+                _evidence_line("scan payload bytes", payload_bytes.get("market_scan_observations", 0)),
+            ],
+        ),
+        _check_item(
+            "Dry Run va Paper Trading da kiem chung",
+            paper_ok,
+            f"paper_trades={len(paper_trades)}, mode={config.get('mode', '-')}",
+            warning=not paper_trades,
+            evidence=[
+                _evidence_line("Ngay kiem tra", checked_date),
+                _evidence_line("Nguon", "paper_trades + config mode"),
+                _evidence_line("Mode", config.get("mode", "-")),
+                _evidence_line("Paper trading enabled", config.get("paper_trading", {}).get("enabled")),
+                _evidence_line("So paper trades gan nhat", len(paper_trades)),
+                _evidence_line("Paper trade moi nhat", latest_paper.get("created_at") or "-"),
+                _evidence_line("Trang thai paper moi nhat", latest_paper.get("status") or "-"),
+            ],
+        ),
+    ]
+    criteria = [items[index] for index in (0, 1, 6, 7, 8) if index < len(items)]
+    modules = system_modules_payload(
+        config,
+        checked_date=checked_date,
+        checked_at_iso=checked_at_iso,
+        ai_history=ai_history,
+        replay=replay,
+        strategy=strategy,
+        regime=regime,
+        health=health,
+        risk_state=risk_state,
+        row_counts=row_counts,
+        ai_range=ai_range_key,
+        regime_history_items=regime_history_items,
+        regime_history_payload=regime_history_payload,
+    )
+    ok_count = sum(1 for item in criteria if item["ok"])
+    payload = {
+        "date": checked_date,
+        "created_at": checked_at_iso,
+        "ok": all(item["ok"] or (item["status"] == "warn" and not item["required"]) for item in criteria),
+        "ok_count": ok_count,
+        "total": len(criteria),
+        "items": criteria,
+        "criteria": criteria,
+        "modules": modules,
+        "module_count": len(modules),
+        "storage": stats,
+        "automation": automation,
+        "replay": replay,
+        "strategy": strategy,
+        "market_regime": regime,
+        "market_regime_history": regime_history_payload,
+        "health": health,
+        "risk_state": risk_state,
+        "ai_range": ai_range_key,
+    }
+    return payload
+
+
+def refresh_system_checklist_snapshot(
+    config: dict[str, Any],
+    *,
+    automation: dict[str, Any] | None = None,
+    ai_range: str = "current",
+) -> dict[str, Any]:
+    ai_range_key = _normalize_ai_decision_range(ai_range)
+    payload = _build_system_checklist_payload(config, automation=automation, ai_range=ai_range_key)
+    if ai_range_key == "current":
+        _persist_system_checklist_snapshot(config, payload)
+    return attach_previous_system_checklist_snapshot(config, payload)
+
+
+def _system_checklist_with_ai_range(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    ai_range: str,
+) -> dict[str, Any]:
+    ai_range_key = _normalize_ai_decision_range(ai_range)
+    if ai_range_key == "current":
+        return payload
+    next_payload = dict(payload)
+    modules = [dict(module) for module in next_payload.get("modules") or [] if isinstance(module, dict)]
+    checked_at_iso = str(next_payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+    checked_date = str(next_payload.get("date") or _system_report_date(config))
+    ai_range_label = "Toàn bộ dữ liệu đang lưu"
+    try:
+        trade_decision_stats = ai_trade_decision_stats(config)
+        ai_call_stats = ai_call_decision_stats(config)
+        decision_stats = {
+            **trade_decision_stats,
+            **ai_call_stats,
+            "tradeSignalRecords": trade_decision_stats.get("totalRecords"),
+            "periodStart": None,
+            "periodEnd": checked_at_iso,
+            "range": ai_range_key,
+            "rangeLabel": ai_range_label,
+        }
+        decision_stats["aiOtherCount"] = max(
+            0,
+            _safe_int(decision_stats.get("totalDecisions"))
+            - _safe_int(decision_stats.get("miniNoTradeCount"))
+            - _safe_int(decision_stats.get("longCount"))
+            - _safe_int(decision_stats.get("shortCount"))
+            - _safe_int(decision_stats.get("noTradeCount")),
+        )
+    except Exception as exc:
+        decision_stats = {"error": str(exc), "range": ai_range_key, "rangeLabel": ai_range_label}
+
+    try:
+        ai_history = recent_ai_call_history(config, limit=20)
+    except Exception:
+        ai_history = []
+    latest_ai = ai_history[-1] if ai_history else {}
+    latest_ai_status = latest_ai.get("status") or latest_ai.get("result")
+    latest_ai_time = latest_ai.get("created_at") or latest_ai.get("updated_at")
+    ai_rows = [
+        _module_row("Ngày kiểm tra", checked_date, "Ngày local của lần tổng hợp dữ liệu module."),
+        _module_row("Cập nhật lúc", checked_at_iso, "Dấu thời gian UTC của payload hiện tại."),
+        _module_row("Số lần gọi AI gần nhất", len(ai_history), "Số lần gọi AI đã được nhật ký lưu gần nhất."),
+        _module_row("Phạm vi dữ liệu AI", ai_range_label, "Phạm vi đang được dùng để tính các biến AI trong module."),
+        _module_row("total_decisions", decision_stats.get("totalDecisions"), "Tổng lần gọi AI thật theo phạm vi đang chọn: Mini + 5.5; không tính các record scan nội bộ.", attention=True),
+        _module_row("Tổng log gọi AI trong phạm vi", decision_stats.get("totalRecords"), "Tổng số log gọi AI thật theo phạm vi đang kiểm tra."),
+        _module_row("mini_no_trade_count", decision_stats.get("miniNoTradeCount"), "Số lần Mini được gọi nhưng trả NO_TRADE hoặc không chọn cặp nào."),
+        _module_row("long_count", decision_stats.get("longCount"), "Số quyết định vào lệnh LONG đã được ghi nhận."),
+        _module_row("short_count", decision_stats.get("shortCount"), "Số quyết định vào lệnh SHORT đã được ghi nhận."),
+        _module_row("no_trade_count", decision_stats.get("noTradeCount"), "Số lần GPT-5.5 từ chối vào lệnh hoặc xóa setup; không tính các lần giữ setup."),
+        _module_row("ai_other_count", decision_stats.get("aiOtherCount"), "Số lần AI đã gọi nhưng không thuộc Mini không chọn, Mini chọn LONG/SHORT hoặc 5.5 từ chối/xóa setup."),
+        _module_row("long_percent", decision_stats.get("longPercent"), "Tỷ trọng LONG trên tổng quyết định AI thực.", attention=True),
+        _module_row("short_percent", decision_stats.get("shortPercent"), "Tỷ trọng SHORT trên tổng quyết định AI thực.", attention=True),
+        _module_row("winrate_long", decision_stats.get("winrateLong"), "Tỷ lệ thắng của nhóm quyết định LONG đã đóng lệnh.", attention=True),
+        _module_row("winrate_short", decision_stats.get("winrateShort"), "Tỷ lệ thắng của nhóm quyết định SHORT đã đóng lệnh.", attention=True),
+        _module_row("avg_confidence_long", decision_stats.get("avgConfidenceLong"), "Độ tự tin trung bình của các quyết định LONG."),
+        _module_row("avg_confidence_short", decision_stats.get("avgConfidenceShort"), "Độ tự tin trung bình của các quyết định SHORT."),
+        _module_row("profit_factor_long", decision_stats.get("profitFactorLong"), "Hệ số lợi nhuận của các quyết định LONG đã chốt."),
+        _module_row("profit_factor_short", decision_stats.get("profitFactorShort"), "Hệ số lợi nhuận của các quyết định SHORT đã chốt."),
+        _module_row("Trạng thái AI gần nhất", latest_ai_status, "Trạng thái của lần gọi AI gần nhất được nhật ký lưu.", attention=True),
+        _module_row("Ghi nhận AI lúc", latest_ai_time, "Thời điểm lần gọi AI gần nhất được ghi nhận."),
+        _module_row("bias_warning", decision_stats.get("biasWarning"), "Cảnh báo lệch hướng LONG/SHORT nếu có."),
+    ]
+    for module in modules:
+        if int(module.get("number") or 0) == 1:
+            module["ai_range"] = ai_range_key
+            module["ai_range_label"] = ai_range_label
+            module["stats"] = ai_rows
+            module["status"] = "fail" if "error" in str(latest_ai_status or "").lower() else "ok" if _safe_int(decision_stats.get("totalDecisions")) > 0 else "warn"
+            break
+    next_payload["modules"] = modules
+    next_payload["ai_range"] = ai_range_key
+    return next_payload
+
+
+def _refresh_trade_execution_in_payload(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    modules = payload.get("modules")
+    if not isinstance(modules, list):
+        return payload
+    try:
+        trade_execution = _trade_execution_summary(config)
+    except Exception:
+        return payload
+    next_payload = dict(payload)
+    next_modules: list[dict[str, Any]] = []
+    for module in modules:
+        if not isinstance(module, dict):
+            next_modules.append(module)
+            continue
+        if module.get("trade_execution") is not None or int(module.get("number") or 0) == 15:
+            next_module = dict(module)
+            next_module["trade_execution"] = trade_execution
+            next_module["status"] = "warn" if trade_execution.get("error") else next_module.get("status", "ok")
+            next_modules.append(next_module)
+        else:
+            next_modules.append(module)
+    next_payload["modules"] = next_modules
+    return next_payload
+
+
+def _capital_management_runtime_payload(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        health = get_bunny_health_state(config)
+    except Exception:
+        health = {}
+    try:
+        risk_state = get_trading_system_state(config)
+    except Exception:
+        risk_state = {}
+    sizing_state = _load_sizing_runtime_state(config) or {}
+    try:
+        snapshot = latest_capital_snapshot(config) or build_capital_snapshot(config, use_cache=True)
+    except Exception as exc:
+        snapshot = {"ok": False, "error": str(exc)}
+    mode = infer_capital_mode(health=health, risk_state=risk_state, sizing_state=sizing_state)
+    try:
+        reserve_state = latest_capital_reserve_state(config) or calculate_capital_reserve_state(
+            config,
+            mode=mode,
+            snapshot=snapshot if isinstance(snapshot, dict) else None,
+        )
+    except Exception as exc:
+        reserve_state = {"ok": False, "mode": mode, "reason": str(exc)}
+    try:
+        allocation_check = check_capital_allocation(
+            config,
+            config.get("position_sizing", {}).get("base_margin_usdt", 0),
+            mode=mode,
+        )
+    except Exception as exc:
+        allocation_check = {"allowed": False, "reason": str(exc)}
+    try:
+        position_size = calculate_position_size(
+            config,
+            {
+                "symbol": "CHECK/USDT:USDT",
+                "side": "LONG",
+                "mode": mode,
+                "leverage": config.get("exchange", {}).get("leverage", 1),
+            },
+        )
+    except Exception as exc:
+        position_size = {"allowed": False, "reason": str(exc)}
+    try:
+        configuration_impact = analyze_configuration_change(config, {})
+    except Exception as exc:
+        configuration_impact = {
+            "risk_level": "UNKNOWN",
+            "is_safe": False,
+            "summary": str(exc),
+            "warnings": [str(exc)],
+        }
+    return {
+        "snapshot": snapshot,
+        "reserve_state": reserve_state,
+        "allocation_check": allocation_check,
+        "position_size": position_size,
+        "configuration_impact": configuration_impact,
+    }
+
+
+def _refresh_capital_management_in_payload(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    modules = payload.get("modules")
+    if not isinstance(modules, list):
+        return payload
+    section_by_number = {
+        10: "capital_sync",
+        12: "capital_reserve",
+        13: "position_sizing",
+        9: "configuration_impact",
+    }
+    if not any(isinstance(module, dict) and int(module.get("number") or 0) in section_by_number for module in modules):
+        return payload
+    runtime = _capital_management_runtime_payload(config)
+    next_payload = dict(payload)
+    next_modules: list[dict[str, Any]] = []
+    for module in modules:
+        if not isinstance(module, dict):
+            next_modules.append(module)
+            continue
+        number = int(module.get("number") or 0)
+        section = section_by_number.get(number)
+        if not section:
+            next_modules.append(module)
+            continue
+        next_module = dict(module)
+        next_module["capital_management"] = {"section": section, **runtime}
+        next_modules.append(next_module)
+    next_payload["modules"] = next_modules
+    return next_payload
+
+
+def _bunny_minimize_realtime_rows(risk_state: dict[str, Any], slot_utilization: Any, paused_minutes: Any) -> list[dict[str, Any]]:
+    return [
+        _module_row("recoveryMode", risk_state.get("recoveryMode"), "Current Bunny Minimize Losses mode.", attention=True),
+        _module_row("isRecoveryMode", _module_bool_percent(risk_state.get("isRecoveryMode")), "100 means recovery mode is active.", attention=True),
+        _module_row("isPaused", _module_bool_percent(risk_state.get("isPaused")), "100 means trading is paused.", attention=True),
+        _module_row("globalLossStreak", risk_state.get("globalLossStreak"), "Current system-wide loss streak.", attention=True),
+        _module_row("globalLossStreakThreshold", risk_state.get("globalLossStreakThreshold"), "Loss streak threshold for recovery mode."),
+        _module_row("pauseTradingLossStreak", risk_state.get("pauseTradingLossStreak"), "Loss streak threshold for pausing trading."),
+        _module_row("openPositionsCount", risk_state.get("openPositionsCount"), "Current open positions occupying slots.", attention=True),
+        _module_row("maxConcurrentPositions", risk_state.get("maxConcurrentPositions"), "Maximum concurrent position slots."),
+        _module_row("slotUtilizationPercent", slot_utilization, "Current slot utilization percent."),
+        _module_row("pausedMinutesRemaining", paused_minutes, "Minutes remaining before pause expires."),
+        _module_row("normalRiskPercent", risk_state.get("normalRiskPercent"), "Risk percent in normal mode."),
+        _module_row("softRecoveryRiskPercent", risk_state.get("softRecoveryRiskPercent"), "Risk percent in soft recovery mode."),
+        _module_row("recoveryModeRiskPercent", risk_state.get("recoveryModeRiskPercent"), "Risk percent in hard recovery mode."),
+        _module_row("currentNormalMinRuleScore", risk_state.get("currentNormalMinRuleScore"), "Current adaptive rule score threshold."),
+        _module_row("currentNormalMinGptConfidence", risk_state.get("currentNormalMinGptConfidence"), "Current adaptive GPT confidence threshold."),
+        _module_row("normalMinRiskReward", risk_state.get("normalMinRiskReward"), "Minimum risk reward in normal mode."),
+        _module_row("softRecoveryMinRuleScore", risk_state.get("softRecoveryMinRuleScore"), "Minimum rule score in soft recovery."),
+        _module_row("softRecoveryMinGptConfidence", risk_state.get("softRecoveryMinGptConfidence"), "Minimum GPT confidence in soft recovery."),
+        _module_row("softRecoveryMinRiskReward", risk_state.get("softRecoveryMinRiskReward"), "Minimum risk reward in soft recovery."),
+        _module_row("recoveryMinRuleScore", risk_state.get("recoveryMinRuleScore"), "Minimum rule score in hard recovery."),
+        _module_row("recoveryMinGptConfidence", risk_state.get("recoveryMinGptConfidence"), "Minimum GPT confidence in hard recovery."),
+        _module_row("recoveryMinRiskReward", risk_state.get("recoveryMinRiskReward"), "Minimum risk reward in hard recovery."),
+        _module_row("strongSetupRuleScore", risk_state.get("strongSetupRuleScore"), "Rule score threshold for strong setup."),
+        _module_row("strongSetupGptConfidence", risk_state.get("strongSetupGptConfidence"), "GPT confidence threshold for strong setup."),
+        _module_row("strongSetupMinRiskReward", risk_state.get("strongSetupMinRiskReward"), "Minimum risk reward for strong setup."),
+        _module_row("enableAdaptiveThreshold", _module_bool_percent(risk_state.get("enableAdaptiveThreshold")), "100 means adaptive threshold is enabled."),
+        _module_row("weeklyTargetMinTrades", risk_state.get("weeklyTargetMinTrades"), "Minimum target closed trades in 7 days."),
+        _module_row("weeklyTargetMaxTrades", risk_state.get("weeklyTargetMaxTrades"), "Maximum target closed trades in 7 days."),
+        _module_row("adaptiveScoreStep", risk_state.get("adaptiveScoreStep"), "Adaptive rule score adjustment step."),
+        _module_row("adaptiveConfidenceStep", risk_state.get("adaptiveConfidenceStep"), "Adaptive confidence adjustment step."),
+        _module_row("recoveryCyclePnlUsdt", risk_state.get("recoveryCyclePnlUsdt"), "Cycle PnL used to choose Soft Recovery or Normal.", attention=True),
+        _module_row("updatedAt", risk_state.get("updatedAt"), "Latest trading system state refresh time."),
+    ]
+
+
+def _refresh_bunny_minimize_losses_in_payload(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    modules = payload.get("modules")
+    if not isinstance(modules, list):
+        return payload
+    try:
+        risk_state = get_trading_system_state(config)
+    except Exception:
+        return payload
+    slot_utilization = None
+    if _safe_int(risk_state.get("maxConcurrentPositions")) > 0:
+        slot_utilization = round(
+            _safe_int(risk_state.get("openPositionsCount")) / _safe_int(risk_state.get("maxConcurrentPositions")) * 100,
+            2,
+        )
+    paused_until = _parse_time(risk_state.get("pausedUntil"))
+    paused_minutes = (
+        max(0, round((paused_until - datetime.now(timezone.utc)).total_seconds() / 60, 2))
+        if paused_until is not None
+        else "-"
+    )
+    realtime_rows = _bunny_minimize_realtime_rows(risk_state, slot_utilization, paused_minutes)
+    realtime_by_label = {str(row.get("label") or "").strip(): row for row in realtime_rows}
+    next_payload = dict(payload)
+    next_modules: list[dict[str, Any]] = []
+    for module in modules:
+        if not isinstance(module, dict):
+            next_modules.append(module)
+            continue
+        if int(module.get("number") or 0) != 2:
+            next_modules.append(module)
+            continue
+        next_module = dict(module)
+        next_module["recovery_mode"] = risk_state.get("recoveryMode")
+        next_module["status"] = "fail" if risk_state.get("isPaused") else "warn" if risk_state.get("isRecoveryMode") else "ok"
+        old_stats = [row for row in module.get("stats") or [] if isinstance(row, dict)]
+        seen: set[str] = set()
+        merged_stats: list[dict[str, Any]] = []
+        for row in old_stats:
+            label = str(row.get("label") or "").strip()
+            replacement = realtime_by_label.get(label)
+            merged_stats.append(replacement if replacement is not None else row)
+            if label:
+                seen.add(label)
+        for row in realtime_rows:
+            label = str(row.get("label") or "").strip()
+            if label and label not in seen:
+                merged_stats.append(row)
+        next_module["stats"] = merged_stats
+        next_modules.append(next_module)
+    next_payload["modules"] = next_modules
+    return next_payload
+
+
+def system_checklist_payload(
+    config: dict[str, Any],
+    *,
+    automation: dict[str, Any] | None = None,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = SYSTEM_CHECKLIST_DEFAULT_TTL_SECONDS,
+    ai_range: str = "current",
+    refresh_realtime: bool = True,
+) -> dict[str, Any]:
+    _ = max_age_seconds
+    ai_range_key = _normalize_ai_decision_range(ai_range)
+    if ai_range_key == "all":
+        snapshot = _current_system_checklist_snapshot(config) or _latest_system_checklist_snapshot(config)
+        if isinstance(snapshot, dict):
+            payload = _system_checklist_with_ai_range(config, snapshot, ai_range=ai_range_key)
+        else:
+            payload = _build_system_checklist_payload(config, automation=automation, ai_range=ai_range_key)
+        if refresh_realtime:
+            payload = _refresh_bunny_minimize_losses_in_payload(config, payload)
+            payload = _refresh_trade_execution_in_payload(config, payload)
+            payload = _refresh_capital_management_in_payload(config, payload)
+        payload = _ensure_trend_approved_hold_module(config, payload)
+        return attach_previous_system_checklist_snapshot(config, payload)
+    date_key = _system_report_date(config)
+    if not force_refresh:
+        snapshot = _preferred_system_checklist_snapshot(config, date_key)
+        if snapshot is not None:
+            if refresh_realtime:
+                snapshot = _refresh_bunny_minimize_losses_in_payload(config, snapshot)
+                snapshot = _refresh_trade_execution_in_payload(config, snapshot)
+                snapshot = _refresh_capital_management_in_payload(config, snapshot)
+            snapshot = _ensure_trend_approved_hold_module(config, snapshot)
+            return attach_previous_system_checklist_snapshot(config, snapshot)
+        snapshot = _latest_system_checklist_snapshot(config)
+        if isinstance(snapshot, dict) and str(snapshot.get("date") or "") == date_key:
+            if refresh_realtime:
+                snapshot = _refresh_bunny_minimize_losses_in_payload(config, snapshot)
+                snapshot = _refresh_trade_execution_in_payload(config, snapshot)
+                snapshot = _refresh_capital_management_in_payload(config, snapshot)
+            snapshot = _ensure_trend_approved_hold_module(config, snapshot)
+            return attach_previous_system_checklist_snapshot(config, snapshot)
+    return refresh_system_checklist_snapshot(config, automation=automation, ai_range=ai_range_key)
+
+
+def _build_timeframe_state_dashboard(config: dict[str, Any], *, lookback_hours: int = 24) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    configured_frames = _configured_timeframes(config)
+    memory = recent_market_scan_memory(
+        config,
+        timeframes=configured_frames,
+        lookback_hours=lookback_hours,
+        per_symbol_timeframe_limit=10,
+        total_limit=2000,
+        include_details=False,
+    )
+    flat_rows = _flatten_scan_memory(memory)
+    latest_scan = latest_internal_market_scan(config) or {}
+    scan_context = _latest_scan_timeframe_context(latest_scan)
+    grouped_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in flat_rows:
+        grouped_rows[str(row.get("timeframe") or "")].append(row)
+    frames_payload: list[dict[str, Any]] = []
+    for frame in configured_frames:
+        rows = grouped_rows.get(frame, [])
+        last_row = max(rows, key=lambda item: str(item.get("created_at") or ""), default={})
+        confidence_values = [_safe_float(item.get("confidence")) for item in rows if item.get("confidence") is not None]
+        win_values = [
+            _safe_float(item.get("win_probability_pct"))
+            for item in rows
+            if item.get("win_probability_pct") is not None
+        ]
+        top_symbols = Counter(str(item.get("symbol") or "") for item in rows if item.get("symbol"))
+        frames_payload.append(
+            {
+                "timeframe": frame,
+                "role": "primary" if frame == configured_frames[0] else "confirmation",
+                "configured": True,
+                "observation_count": len(rows),
+                "symbol_count": len({str(item.get("symbol") or "") for item in rows if item.get("symbol")}),
+                "last_observed_at": last_row.get("created_at"),
+                "average_confidence": round(_avg(confidence_values), 2) if confidence_values else 0.0,
+                "average_win_probability_pct": round(_avg(win_values), 2) if win_values else 0.0,
+                "side_counts": dict(Counter(str(item.get("side") or "-").upper() for item in rows)),
+                "latest_symbols": [symbol for symbol, _count in top_symbols.most_common(5)],
+                "latest_scan_context": scan_context.get(frame, [])[:5],
+            }
+        )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report_date": _system_report_date(config),
+        "timezone": str(_system_timezone(config)),
+        "lookback_hours": lookback_hours,
+        "primary_timeframe": configured_frames[0] if configured_frames else None,
+        "configured_timeframes": configured_frames,
+        "next_internal_scan_at": _iso_or_none(next_internal_market_scan_at(config)),
+        "latest_internal_scan": {
+            "created_at": latest_scan.get("created_at"),
+            "slot_id": latest_scan.get("slot_id"),
+            "approved_symbols": latest_scan.get("approved_symbols") or [],
+            "selected_symbols": latest_scan.get("selected_symbols") or [],
+            "selection_stale": bool(latest_scan.get("selection_stale")),
+            "candidate_count": latest_scan.get("candidate_count"),
+            "status": latest_scan.get("status"),
+        },
+        "frames": frames_payload,
+    }
+
+
+def timeframe_state_dashboard(
+    config: dict[str, Any],
+    *,
+    lookback_hours: int = 24,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    key = _dashboard_snapshot_key(config, "timeframes", lookback_hours=lookback_hours)
+    return _get_or_build_cached_payload(
+        config,
+        key=key,
+        builder=lambda: _build_timeframe_state_dashboard(config, lookback_hours=lookback_hours),
+        force_refresh=force_refresh,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def _build_scan_memory_dashboard(
+    config: dict[str, Any],
+    *,
+    lookback_hours: int = 24,
+    per_symbol_timeframe_limit: int = 5,
+) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    per_symbol_timeframe_limit = max(1, min(20, int(per_symbol_timeframe_limit or 5)))
+    configured_frames = _configured_timeframes(config)
+    memory = recent_market_scan_memory(
+        config,
+        timeframes=configured_frames,
+        lookback_hours=lookback_hours,
+        per_symbol_timeframe_limit=per_symbol_timeframe_limit,
+        total_limit=1200,
+        include_details=False,
+    )
+    flat_rows = _flatten_scan_memory(memory)
+    latest_scan = latest_internal_market_scan(config) or {}
+    timeframe_summary: dict[str, dict[str, Any]] = {}
+    for frame in configured_frames:
+        rows = [row for row in flat_rows if str(row.get("timeframe") or "") == frame]
+        last_seen = max((_parse_time(row.get("created_at")) for row in rows), default=None)
+        timeframe_summary[frame] = {
+            "timeframe": frame,
+            "observation_count": len(rows),
+            "symbol_count": len({str(row.get("symbol") or "") for row in rows if row.get("symbol")}),
+            "last_observed_at": _iso_or_none(last_seen),
+            "average_score": round(_avg([_safe_float(row.get("score")) for row in rows]), 2) if rows else 0.0,
+            "average_win_probability_pct": round(
+                _avg([_safe_float(row.get("win_probability_pct")) for row in rows if row.get("win_probability_pct") is not None]),
+                2,
+            ) if rows else 0.0,
+            "recent_signals": [
+                {
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "created_at": row.get("created_at"),
+                    "score": row.get("score"),
+                    "win_probability_pct": row.get("win_probability_pct"),
+                }
+                for row in rows[:8]
+            ],
+        }
+    symbol_summary = []
+    for symbol, frame_map in sorted(memory.items()):
+        latest_seen = max(
+            (_parse_time(entry.get("created_at")) for entries in frame_map.values() for entry in entries),
+            default=None,
+        )
+        symbol_summary.append(
+            {
+                "symbol": symbol,
+                "timeframes": sorted(frame_map.keys(), key=_timeframe_minutes),
+                "observation_count": sum(len(entries) for entries in frame_map.values()),
+                "last_observed_at": _iso_or_none(latest_seen),
+            }
+        )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_hours": lookback_hours,
+        "configured_timeframes": configured_frames,
+        "summary": {
+            "symbol_count": len(memory),
+            "observation_count": len(flat_rows),
+            "timeframe_count": len(configured_frames),
+            "latest_internal_scan_at": latest_scan.get("created_at"),
+            "latest_internal_scan_symbols": latest_scan.get("approved_symbols") or [],
+            "latest_internal_selected_symbols": latest_scan.get("selected_symbols") or [],
+        },
+        "by_timeframe": [timeframe_summary[frame] for frame in configured_frames],
+        "by_symbol": symbol_summary[:100],
+        "latest_internal_scan": latest_scan,
+    }
+
+
+def scan_memory_dashboard(
+    config: dict[str, Any],
+    *,
+    lookback_hours: int = 24,
+    per_symbol_timeframe_limit: int = 5,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    per_symbol_timeframe_limit = max(1, min(20, int(per_symbol_timeframe_limit or 5)))
+    key = _dashboard_snapshot_key(
+        config,
+        "scan_memory",
+        lookback_hours=lookback_hours,
+        per_symbol_timeframe_limit=per_symbol_timeframe_limit,
+    )
+    return _get_or_build_cached_payload(
+        config,
+        key=key,
+        builder=lambda: _build_scan_memory_dashboard(
+            config,
+            lookback_hours=lookback_hours,
+            per_symbol_timeframe_limit=per_symbol_timeframe_limit,
+        ),
+        force_refresh=force_refresh,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def _build_analytics_dashboard(config: dict[str, Any], *, lookback_hours: int = 24) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    decisions = recent_ai_trade_decisions(config, limit=100, include_details=False)
+    decision_stats = ai_trade_decision_stats(config)
+    ai_calls = recent_ai_call_history(config, limit=50)
+    prompt = prompt_status(config)
+    strategy = current_strategy_state(config)
+    regime = current_market_regime(config)
+    health = get_bunny_health_state(config)
+    risk_state = get_trading_system_state(config)
+    paper_trades = list_paper_trades(config, limit=200)
+    trade_memory = list_trade_memory(config, limit=200)
+    pending_total = count_pending_orders(config)
+    checklist = system_checklist_payload(config)
+    stats = checklist.get("storage") if isinstance(checklist.get("storage"), dict) else {}
+    latest_scan = latest_internal_market_scan(config) or {}
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    guard_rows = list_market_guard_observations(config, limit=200, since=since)
+    decision_days = Counter(str(row.get("created_at") or "")[:10] for row in decisions if row.get("created_at"))
+    ai_call_roles = Counter(str(item.get("role") or "ai") for item in ai_calls)
+    ai_call_status = Counter(str(item.get("status") or item.get("result") or "-") for item in ai_calls)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report_date": _system_report_date(config),
+        "lookback_hours": lookback_hours,
+        "decision_stats": decision_stats,
+        "decision_activity_by_day": dict(sorted(decision_days.items(), reverse=True)[:14]),
+        "recent_decisions": decisions[:30],
+        "ai_call_summary": {
+            "count": len(ai_calls),
+            "role_counts": dict(ai_call_roles),
+            "status_counts": dict(ai_call_status),
+            "latest_created_at": ai_calls[-1].get("created_at") if ai_calls else None,
+        },
+        "prompt": prompt,
+        "strategy": strategy,
+        "market_regime": regime,
+        "health": health,
+        "risk_state": risk_state,
+        "pending_total": pending_total,
+        "paper_trades": _paper_trade_summary(paper_trades),
+        "trade_memory": _trade_memory_summary(trade_memory),
+        "storage": stats,
+        "market_guard": {
+            "observation_count": len(guard_rows),
+            "latest_observed_at": guard_rows[0].get("observed_at") if guard_rows else None,
+            "severity_counts": dict(Counter(str(item.get("severity") or "-") for item in guard_rows)),
+        },
+        "latest_internal_scan": {
+            "created_at": latest_scan.get("created_at"),
+            "approved_symbols": latest_scan.get("approved_symbols") or [],
+            "selected_symbols": latest_scan.get("selected_symbols") or [],
+            "selection_stale": bool(latest_scan.get("selection_stale")),
+            "candidate_count": latest_scan.get("candidate_count"),
+            "status": latest_scan.get("status"),
+        },
+    }
+
+
+def analytics_dashboard(
+    config: dict[str, Any],
+    *,
+    lookback_hours: int = 24,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    lookback_hours = max(1, min(168, int(lookback_hours or 24)))
+    key = _dashboard_snapshot_key(config, "analytics", lookback_hours=lookback_hours)
+    return _get_or_build_cached_payload(
+        config,
+        key=key,
+        builder=lambda: _build_analytics_dashboard(config, lookback_hours=lookback_hours),
+        force_refresh=force_refresh,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def _build_replay_dashboard_payload(config: dict[str, Any], *, limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(limit, 500))
+    stats = replay_stats(config, limit=max(limit, 50))
+    payloads = list_replay_history_rows(config, limit=limit, include_trade_execution=True)
+    decision_counts = Counter(str(row.get("new_decision") or "-") for row in payloads)
+    strategy_counts = Counter(str(row.get("strategy_version") or "-") for row in payloads)
+    model_counts = Counter(str(row.get("model_version") or "-") for row in payloads)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": stats,
+        "normalized": {
+            "decision_counts": dict(decision_counts),
+            "strategy_counts": dict(strategy_counts),
+            "model_counts": dict(model_counts),
+            "recent": payloads,
+        },
+    }
+
+
+def replay_dashboard_payload(
+    config: dict[str, Any],
+    *,
+    limit: int = 50,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    limit = max(1, min(limit, 500))
+    key = _dashboard_snapshot_key(config, "replay", limit=limit)
+    return _get_or_build_cached_payload(
+        config,
+        key=key,
+        builder=lambda: _build_replay_dashboard_payload(config, limit=limit),
+        force_refresh=force_refresh,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def _build_system_health_dashboard(config: dict[str, Any], *, history_limit: int = 30) -> dict[str, Any]:
+    history_limit = max(1, min(history_limit, 180))
+    history = system_checklist_history(config, limit=history_limit)
+    latest = system_checklist_snapshot(config, _system_report_date(config)) or (history[0] if history else None) or {}
+    criterion_trends: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    module_trends: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for snapshot in reversed(history):
+        date_key = str(snapshot.get("date") or "")
+        for item in snapshot.get("criteria") or snapshot.get("items") or []:
+            criterion_trends[str(item.get("name") or "-")].append(
+                {"date": date_key, "status": item.get("status"), "ok": item.get("ok")}
+            )
+        for item in snapshot.get("modules") or []:
+            module_trends[str(item.get("name") or "-")].append(
+                {"date": date_key, "status": item.get("status")}
+            )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report_date": _system_report_date(config),
+        "latest": latest,
+        "history": history,
+        "summary": {
+            "week": system_checklist_summary(config, "week"),
+            "month": system_checklist_summary(config, "month"),
+            "year": system_checklist_summary(config, "year"),
+        },
+        "criterion_trends": dict(criterion_trends),
+        "module_trends": dict(module_trends),
+    }
+
+
+def system_health_dashboard(
+    config: dict[str, Any],
+    *,
+    history_limit: int = 30,
+    force_refresh: bool = False,
+    max_age_seconds: int | None = DASHBOARD_DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    history_limit = max(1, min(history_limit, 180))
+    key = _dashboard_snapshot_key(config, "system_health", history_limit=history_limit)
+    return _get_or_build_cached_payload(
+        config,
+        key=key,
+        builder=lambda: _build_system_health_dashboard(config, history_limit=history_limit),
+        force_refresh=force_refresh,
+        max_age_seconds=max_age_seconds,
+    )

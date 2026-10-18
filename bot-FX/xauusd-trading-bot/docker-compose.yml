@@ -1,0 +1,37 @@
+services:
+  api:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://xau_bot:change_this_password@postgres:5432/xau_bot
+      TRADING_CONFIG_PATH: /app/app/config/trading_config.yaml
+      BROKER_STARTUP_ENABLED: "false"
+      ENABLE_LIVE_TRADING: "false"
+      AUTO_START_BOT: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - bot_logs:/app/logs
+      - ./backtest_output:/app/backtest_output
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: xau_bot
+      POSTGRES_USER: xau_bot
+      POSTGRES_PASSWORD: change_this_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xau_bot -d xau_bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  bot_logs:

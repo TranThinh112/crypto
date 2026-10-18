@@ -1,0 +1,1782 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import tempfile
+import urllib.error
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import TestCase
+from unittest.mock import patch
+
+from crypto_trader.codex_features import (
+    _ai_call_message,
+    _compact_candidate_storage_payload,
+    _notify_recovery_mode_transition,
+    _recovery_cycle_pnl,
+    ai_call_decision_stats,
+    ai_trade_decision_stats,
+    call_openai_json,
+    detect_market_regime,
+    get_global_loss_streak,
+    get_symbol_loss_streak,
+    okx_review_explanation_vi,
+    record_ai_call_event,
+    refresh_bunny_health_state,
+    refresh_trading_system_state,
+    select_runtime_config,
+    validate_entry,
+)
+from crypto_trader.config import DEFAULT_CONFIG
+from crypto_trader.models import TradeCandidate
+from crypto_trader.storage import get_strategy_version, save_strategy_version
+
+
+class _FakeOpenAIResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "_FakeOpenAIResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class CodexFeaturesTest(TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _config(self) -> dict:
+        return {
+            "_atlas_test_mode": True,
+            "_config_path": str(Path(self._tmpdir.name) / "config.yaml"),
+            "_config_dir": self._tmpdir.name,
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "notify_ai_api_calls": True,
+                }
+            },
+            "ai": {"enabled": True, "manual_only": False, "allow_api_calls": True},
+        }
+
+    def _role_config(self) -> dict:
+        return {"api_key_env": "OPENAI_API_KEY_TEST", "timeout_seconds": 1}
+
+    def _validation_config(self) -> dict:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["_atlas_test_mode"] = True
+        config["_config_dir"] = self._tmpdir.name
+        config["mode"] = "demo"
+        config["trading_risk"].update(
+            {
+                "max_concurrent_positions": 5,
+                "normal_min_rule_score": 75,
+                "normal_min_gpt_confidence": 82,
+                "normal_min_win_probability_pct": 72,
+                "normal_min_risk_reward": 2.0,
+                "soft_recovery_min_rule_score": 87,
+                "soft_recovery_min_gpt_confidence": 87,
+                "soft_recovery_min_win_probability_pct": 75,
+                "soft_recovery_min_risk_reward": 2.2,
+                "recovery_min_rule_score": 90,
+                "recovery_min_gpt_confidence": 92,
+                "recovery_min_win_probability_pct": 80,
+                "recovery_min_risk_reward": 2.5,
+            }
+        )
+        return config
+
+    def test_validate_entry_uses_mode_win_probability_thresholds(self) -> None:
+        config = self._validation_config()
+        payload = {
+            "ruleScore": 91,
+            "gptConfidence": 92,
+            "winProbability": 76,
+            "riskReward": 2.5,
+            "entryPrice": 100,
+            "currentPrice": 100,
+            "volumeConfirmed": True,
+        }
+        with patch("crypto_trader.codex_features.get_trading_system_state") as state, patch(
+            "crypto_trader.codex_features.get_bunny_health_state",
+            return_value={"isPaused": False, "isWarning": False, "isCritical": False},
+        ), patch("crypto_trader.codex_features._open_trade_executions", return_value=[]):
+            state.return_value = {
+                "isPaused": False,
+                "isRecoveryMode": False,
+                "recoveryMode": "NORMAL",
+                "currentNormalMinRuleScore": 75,
+                "currentNormalMinGptConfidence": 82,
+            }
+            self.assertTrue(validate_entry(config, payload)["allowed"])
+            state.return_value = {
+                "isPaused": False,
+                "isRecoveryMode": True,
+                "recoveryMode": "HARD_RECOVERY",
+                "currentNormalMinRuleScore": 75,
+                "currentNormalMinGptConfidence": 82,
+            }
+            blocked = validate_entry(config, payload)
+
+        self.assertFalse(blocked["allowed"])
+        self.assertIn("Win probability 76.00% < 80.00%", blocked["reason"])
+
+    def test_validate_entry_requires_volume_only_in_hard_recovery(self) -> None:
+        config = self._validation_config()
+        payload = {
+            "ruleScore": 92,
+            "gptConfidence": 92,
+            "winProbability": 80,
+            "riskReward": 2.5,
+            "entryPrice": 100,
+            "currentPrice": 100,
+            "volumeConfirmed": False,
+        }
+        with patch("crypto_trader.codex_features.get_bunny_health_state", return_value={"isPaused": False, "isWarning": False, "isCritical": False}), patch(
+            "crypto_trader.codex_features._open_trade_executions",
+            return_value=[],
+        ):
+            with patch(
+                "crypto_trader.codex_features.get_trading_system_state",
+                return_value={
+                    "isPaused": False,
+                    "isRecoveryMode": True,
+                    "recoveryMode": "SOFT_RECOVERY",
+                    "currentNormalMinRuleScore": 75,
+                    "currentNormalMinGptConfidence": 82,
+                },
+            ):
+                self.assertTrue(validate_entry(config, payload)["allowed"])
+            with patch(
+                "crypto_trader.codex_features.get_trading_system_state",
+                return_value={
+                    "isPaused": False,
+                    "isRecoveryMode": True,
+                    "recoveryMode": "HARD_RECOVERY",
+                    "currentNormalMinRuleScore": 75,
+                    "currentNormalMinGptConfidence": 82,
+                },
+            ):
+                blocked = validate_entry(config, payload)
+
+        self.assertFalse(blocked["allowed"])
+        self.assertIn("Volume chua xac nhan", blocked["reason"])
+
+    def test_recovery_mode_notification_dedupes_repeated_hard_mode(self) -> None:
+        config = self._config()
+        payload = {
+            "recoveryMode": "HARD_RECOVERY",
+            "globalLossStreak": 1,
+            "recoveryCyclePnlUsdt": -29.7575,
+            "hardRecoveryEntryCyclePnlUsdt": -34.2967,
+            "hardRecoveryPeakLossUsdt": -34.2967,
+            "hardRecoverySoftExitThresholdUsdt": -17.1484,
+            "needToSoftUsdt": 12.6091,
+            "needToNormalUsdt": 30.0575,
+            "updatedAt": "2026-07-27T14:55:25+00:00",
+        }
+        settings = {
+            "recovery_min_rule_score": 90,
+            "recovery_min_gpt_confidence": 92,
+            "recovery_min_risk_reward": 2.5,
+            "recovery_mode_risk_percent": 0.5,
+        }
+
+        with patch("crypto_trader.notifier.send_telegram_message") as send_message:
+            _notify_recovery_mode_transition(
+                config,
+                previous_mode="SOFT_RECOVERY",
+                payload=payload,
+                settings=settings,
+            )
+            _notify_recovery_mode_transition(
+                config,
+                previous_mode="SOFT_RECOVERY",
+                payload={**payload, "updatedAt": "2026-07-27T14:56:25+00:00"},
+                settings=settings,
+            )
+
+        send_message.assert_called_once()
+
+    def test_recovery_mode_notification_suppresses_mode_flapping(self) -> None:
+        config = self._config()
+        hard_payload = {
+            "recoveryMode": "HARD_RECOVERY",
+            "globalLossStreak": 0,
+            "recoveryCyclePnlUsdt": -20.3289,
+            "hardRecoveryEntryCyclePnlUsdt": -17.4084,
+            "hardRecoveryPeakLossUsdt": -29.251,
+            "hardRecoverySoftExitThresholdUsdt": -14.6255,
+            "needToSoftUsdt": 5.7034,
+            "needToNormalUsdt": 20.6289,
+            "updatedAt": "2026-07-30T16:24:43+00:00",
+        }
+        soft_payload = {
+            **hard_payload,
+            "recoveryMode": "SOFT_RECOVERY",
+            "recoveryCyclePnlUsdt": -12.6089,
+            "needToSoftUsdt": 0.0,
+            "needToNormalUsdt": 12.9089,
+            "updatedAt": "2026-07-30T16:25:43+00:00",
+        }
+        settings = {
+            "soft_recovery_min_rule_score": 87,
+            "soft_recovery_min_gpt_confidence": 89,
+            "soft_recovery_min_risk_reward": 2.0,
+            "soft_recovery_risk_percent": 0.75,
+            "recovery_min_rule_score": 90,
+            "recovery_min_gpt_confidence": 92,
+            "recovery_min_risk_reward": 2.5,
+            "recovery_mode_risk_percent": 0.5,
+        }
+
+        with patch("crypto_trader.notifier.send_telegram_message") as send_message:
+            _notify_recovery_mode_transition(config, previous_mode="SOFT_RECOVERY", payload=hard_payload, settings=settings)
+            _notify_recovery_mode_transition(config, previous_mode="HARD_RECOVERY", payload=soft_payload, settings=settings)
+
+        send_message.assert_called_once()
+
+    def test_recovery_mode_notification_explains_hard_to_soft_recovered_amount(self) -> None:
+        config = self._config()
+        payload = {
+            "recoveryMode": "SOFT_RECOVERY",
+            "globalLossStreak": 0,
+            "recoveryCyclePnlUsdt": -12.6089,
+            "hardRecoveryPeakLossUsdt": -29.2510,
+            "hardRecoverySoftExitThresholdUsdt": -14.6255,
+            "needToSoftUsdt": 0.0,
+            "needToNormalUsdt": 12.9089,
+            "updatedAt": "2026-07-30T16:37:29+00:00",
+        }
+        settings = {
+            "soft_recovery_min_rule_score": 87,
+            "soft_recovery_min_gpt_confidence": 89,
+            "soft_recovery_min_risk_reward": 2.0,
+            "soft_recovery_risk_percent": 0.75,
+        }
+
+        with patch("crypto_trader.notifier.send_telegram_message") as send_message:
+            _notify_recovery_mode_transition(config, previous_mode="HARD_RECOVERY", payload=payload, settings=settings)
+
+        message = send_message.call_args.args[1]
+        self.assertIn("Lý do: đã gỡ được 50% số vốn thua là 16.6421 USDT.", message)
+        self.assertIn("16.6421 USDT", message)
+
+    def test_compact_candidate_storage_payload_preserves_market_pattern_context(self) -> None:
+        candidate = TradeCandidate(
+            symbol="BTC/USDT:USDT",
+            base="BTC",
+            side="long",
+            confidence=86.0,
+            win_probability_pct=82.0,
+            entry=100.0,
+            stop_loss=98.0,
+            take_profit=103.0,
+            risk_reward=1.5,
+            order_usdt=20.0,
+            quantity=1.0,
+            spread_pct=0.01,
+            news_score=0.0,
+            news_count=1,
+            indicator_summary={
+                "trend": "up",
+                "market_pattern": {
+                    "snapshot_id": "mp-storage-1",
+                    "timeframe": "4h",
+                    "trend_regime": "bullish",
+                    "confluence_bias": "bullish",
+                    "confluence_score": 0.72,
+                    "candlestick_count": 2,
+                    "candlestick_patterns": [
+                        {"pattern": "bullish_engulfing", "direction": "bullish", "confidence": 0.81},
+                    ],
+                },
+            },
+        )
+
+        payload = _compact_candidate_storage_payload(candidate)
+
+        market_pattern = payload["indicator_summary"]["market_pattern"]
+        self.assertEqual(market_pattern["snapshot_id"], "mp-storage-1")
+        self.assertEqual(market_pattern["candlestick_patterns"][0]["pattern"], "bullish_engulfing")
+
+    def test_detect_market_regime_aggregates_top_volume_scope_separately_from_detail_tabs(self) -> None:
+        config = {
+            "market_regime": {
+                "top_symbols": ["BTC/USDT:USDT", "SOL/USDT:USDT", "ETH/USDT:USDT"],
+                "aggregate_limit": 5,
+            },
+            "strategy": {"universe": {"max_symbols": 5}},
+        }
+        snapshots = [
+            SimpleNamespace(
+                symbol=f"COIN{index}/USDT:USDT",
+                last=100 + index,
+                ema_fast=99 + index,
+                ema_slow=98 + index,
+                ema200=97 + index,
+                vwap=99.5 + index,
+                rsi=50 + index,
+                adx=25 + index,
+                atr_pct=2.0,
+                volume_ratio=1.2,
+                funding_rate=0.0001 * (index + 1),
+                open_interest=1000 + index,
+                fear_greed=60,
+                news_score=1.5,
+            )
+            for index in range(5)
+        ]
+        snapshots[0].symbol = "BTC/USDT:USDT"
+        snapshots[1].symbol = "SOL/USDT:USDT"
+        snapshots[2].symbol = "ETH/USDT:USDT"
+
+        with patch("crypto_trader.codex_features.insert_market_regime_history") as insert_history:
+            result = detect_market_regime(config, snapshots)
+
+        rows = [call.args[1] for call in insert_history.call_args_list]
+        aggregate_rows = [
+            row for row in rows if json.loads(row["indicators_json"]).get("scope") == "aggregate"
+        ]
+        symbol_rows = [
+            row for row in rows if json.loads(row["indicators_json"]).get("scope") == "symbol"
+        ]
+        aggregate = json.loads(aggregate_rows[0]["indicators_json"])
+        self.assertEqual(len(aggregate_rows), 1)
+        self.assertEqual(len(symbol_rows), 3)
+        self.assertEqual(result["indicators"]["scope"], "aggregate")
+        self.assertEqual(aggregate["coverage_count"], 5)
+        self.assertEqual(aggregate["target_count"], 5)
+        self.assertEqual(aggregate["market_symbols"], [snapshot.symbol for snapshot in snapshots])
+        self.assertEqual(aggregate["detail_symbols"], ["BTC/USDT:USDT", "SOL/USDT:USDT", "ETH/USDT:USDT"])
+        self.assertIsNotNone(aggregate["adx"])
+        self.assertIsNotNone(aggregate["funding_rate"])
+        self.assertIsNotNone(aggregate["open_interest"])
+        self.assertEqual(aggregate["fear_greed"], 60.0)
+        self.assertEqual(aggregate["news_score"], 1.5)
+
+    def _prompt_package(self) -> dict:
+        return {
+            "messages": [{"role": "system", "content": "Return JSON."}, {"role": "user", "content": "{}"}],
+            "prompt_version": "prompt-v-test",
+            "prompt_hash": "abcdef1234567890",
+            "estimated_static_tokens": 12,
+            "estimated_dynamic_tokens": 3,
+            "estimated_cache_hit": 80,
+        }
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.codex_features.register_model_version")
+    @patch("crypto_trader.codex_features.register_prompt_metric")
+    @patch("crypto_trader.notifier.send_telegram_message")
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_success_sends_telegram_notice(
+        self,
+        urlopen,
+        send_telegram_message,
+        _register_prompt_metric,
+        _register_model_version,
+    ) -> None:
+        urlopen.return_value = _FakeOpenAIResponse(
+            {
+                "choices": [{"message": {"content": "{\"approved\": true}"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            }
+        )
+
+        result = call_openai_json(
+            self._config(),
+            self._role_config(),
+            self._prompt_package(),
+            model_name="gpt-test",
+            purpose="mini_market_scan",
+        )
+
+        self.assertEqual(result["parsed"], {"approved": True})
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("AI được gọi", message)
+        self.assertIn("gpt-test", message)
+        self.assertIn("Trạng thái: OK", message)
+        self.assertFalse(send_telegram_message.call_args.kwargs["with_buttons"])
+        self.assertFalse(send_telegram_message.call_args.kwargs["replace_previous"])
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.notifier.send_telegram_message")
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_http_error_sends_telegram_notice(self, urlopen, send_telegram_message) -> None:
+        urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.openai.com/v1/chat/completions",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"rate limit"}'),
+        )
+
+        with self.assertRaises(RuntimeError):
+            call_openai_json(
+                self._config(),
+                self._role_config(),
+                self._prompt_package(),
+                model_name="gpt-test",
+                purpose="mini_market_scan",
+            )
+
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("GPT API lỗi", message)
+        self.assertIn("OpenAI HTTP 429", message)
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_call_requires_policy_purpose(self, urlopen) -> None:
+        with self.assertRaises(RuntimeError):
+            call_openai_json(
+                self._config(),
+                self._role_config(),
+                self._prompt_package(),
+                model_name="gpt-test",
+            )
+
+        urlopen.assert_not_called()
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_okx_final_approval_is_blocked_when_auto_okx_openai_disabled(self, urlopen) -> None:
+        config = self._config()
+        config["ai"]["okx"] = {
+            "auto_openai_enabled": False,
+            "manual_openai_enabled": True,
+            "approval_enabled": True,
+        }
+
+        with self.assertRaises(RuntimeError) as error:
+            call_openai_json(
+                config,
+                self._role_config(),
+                self._prompt_package(),
+                model_name="gpt-5.5",
+                purpose="okx_final_approval",
+                route="new_vt",
+            )
+
+        self.assertIn("route=new_vt", str(error.exception))
+        urlopen.assert_not_called()
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.notifier.send_telegram_message")
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_okx_final_approval_blocks_manual_one_shot_even_when_manual_enabled(self, urlopen, _send_telegram_message) -> None:
+        config = self._config()
+        config["ai"]["okx"] = {
+            "auto_openai_enabled": False,
+            "manual_openai_enabled": True,
+            "approval_enabled": True,
+        }
+        urlopen.return_value = _FakeOpenAIResponse(
+            {
+                "choices": [{"message": {"content": "{\"approved\": true, \"decision\": \"APPROVE\"}"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            }
+        )
+
+        with self.assertRaises(RuntimeError) as error:
+            call_openai_json(
+                config,
+                self._role_config(),
+                self._prompt_package(),
+                model_name="gpt-5.5",
+                purpose="okx_final_approval",
+                route="lc_okx_setup_review",
+                manual_trigger=True,
+            )
+
+        self.assertIn("manual 5.5 calls are disabled", str(error.exception))
+        urlopen.assert_not_called()
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY_TEST": "test-key"})
+    @patch("crypto_trader.notifier.send_telegram_message")
+    @patch("crypto_trader.codex_features.urllib.request.urlopen")
+    def test_openai_okx_final_approval_allows_lc_okx_review_once_when_auto_is_disabled(
+        self,
+        urlopen,
+        _send_telegram_message,
+    ) -> None:
+        config = self._config()
+        config["ai"]["okx"] = {
+            "auto_openai_enabled": False,
+            "auto_lc_okx_review_once_enabled": True,
+            "manual_openai_enabled": False,
+            "approval_enabled": True,
+        }
+        urlopen.return_value = _FakeOpenAIResponse(
+            {
+                "choices": [{"message": {"content": "{\"approved\": true, \"decision\": \"APPROVE\"}"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            }
+        )
+
+        result = call_openai_json(
+            config,
+            self._role_config(),
+            self._prompt_package(),
+            model_name="gpt-5.5",
+            purpose="okx_final_approval",
+            route="lc_okx_setup_review",
+            lc_okx_review_once=True,
+        )
+
+        self.assertTrue(result["parsed"]["approved"])
+        urlopen.assert_called_once()
+
+    def test_okx_review_explanation_treats_vao_market_as_market_entry(self) -> None:
+        item = {
+            "status": "VÀO MARKET",
+            "market_reason": "risk sạch và setup đủ điều kiện",
+            "keep_reason": "setup cần chờ xác nhận thêm",
+        }
+
+        message = okx_review_explanation_vi(item)
+
+        self.assertIn("đồng ý mở Market", message)
+        self.assertNotIn("giữ setup", message)
+
+    def test_lc_okx_review_message_labels_market_entry(self) -> None:
+        message = _ai_call_message(
+            {
+                "created_at": "2026-07-20T05:02:11+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "VÀO MARKET",
+                "symbol": "BILL/USDT:USDT",
+                "side": "short",
+                "lc_okx_id": 6,
+                "market_reason": "risk sạch và setup đủ điều kiện",
+                "keep_reason": "setup cần chờ xác nhận thêm",
+            }
+        )
+
+        self.assertIn("5.5 DUYỆT VÀO MARKET #6", message)
+        self.assertIn("5.5 đồng ý mở Market", message)
+        self.assertNotIn("5.5 chưa mở Market", message)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_lc_okx_review_message_is_single_vietnamese_explanation(self, send_telegram_message) -> None:
+        record_ai_call_event(
+            self._config(),
+            {
+                "created_at": "2026-07-12T05:23:21+07:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+                "symbol": "SUI/USDT:USDT",
+                "side": "long",
+                "lc_okx_id": 63,
+                "market_reason": "-",
+                "keep_reason": "-",
+                "delete_reason": "Missing 4h bias and 15m confirmation; volume ratio 0.774 is weak",
+            },
+        )
+
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("Giải thích:", message)
+        self.assertIn("5.5 từ chối vì", message)
+        self.assertIn("Thiếu bias 4h và xác nhận 15m", message)
+        self.assertIn("volume ratio 0.774 còn yếu", message)
+        self.assertNotIn("Lý do mở Market", message)
+        self.assertNotIn("Lý do giữ setup", message)
+        self.assertNotIn("Lý do xóa setup", message)
+
+    @patch("crypto_trader.codex_features.list_ai_trade_decision_stat_rows")
+    def test_ai_trade_decision_stats_uses_lightweight_rows_without_json_parsing(self, list_rows) -> None:
+        list_rows.return_value = [
+            {
+                "decision": "ENTER_LONG",
+                "trade_status": "WIN",
+                "confidence": 91,
+                "pnl": 1.25,
+                "reason_json": "{not-valid-json",
+                "snapshot_json": "{not-valid-json",
+            },
+            {
+                "decision": "ENTER_SHORT",
+                "trade_status": "LOSS",
+                "confidence": 83,
+                "pnl": -0.5,
+                "reason_json": "{still-invalid",
+                "snapshot_json": "{still-invalid",
+            },
+            {
+                "decision": "NO_TRADE",
+                "trade_status": None,
+                "confidence": None,
+                "pnl": 0,
+            },
+        ]
+
+        stats = ai_trade_decision_stats(self._config())
+
+        self.assertEqual(stats["totalDecisions"], 2)
+        self.assertEqual(stats["totalRecords"], 3)
+        self.assertEqual(stats["longCount"], 1)
+        self.assertEqual(stats["shortCount"], 1)
+        self.assertEqual(stats["noTradeCount"], 0)
+        self.assertEqual(stats["longPercent"], 50.0)
+        self.assertEqual(stats["shortPercent"], 50.0)
+        self.assertEqual(stats["winrateLong"], 100.0)
+        self.assertEqual(stats["winrateShort"], 0.0)
+        self.assertEqual(stats["avgConfidenceLong"], 91.0)
+        self.assertEqual(stats["avgConfidenceShort"], 83.0)
+        self.assertEqual(stats["profitFactorLong"], 999.0)
+        self.assertEqual(stats["profitFactorShort"], 0.0)
+
+    @patch("crypto_trader.codex_features.list_ai_trade_decision_stat_rows")
+    def test_ai_trade_decision_stats_counts_only_gpt55_delete_or_reject_as_no_trade(self, list_rows) -> None:
+        config = self._config()
+        list_rows.return_value = [
+            {"decision": "ENTER_LONG", "trade_status": None, "confidence": 91, "pnl": 0},
+            {"decision": "ENTER_SHORT", "trade_status": None, "confidence": 83, "pnl": 0},
+            {"decision": "NO_TRADE", "trade_status": None, "confidence": None, "pnl": 0},
+        ]
+
+        record_ai_call_event(
+            config,
+            {"role": "okx", "review_kind": "lc_okx_review", "model": "gpt-5.5", "status": "GIỮ SETUP"},
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {"role": "okx", "review_kind": "lc_okx_review", "model": "gpt-5.5", "status": "GIỮ THEO DÕI"},
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {"role": "okx", "review_kind": "lc_okx_review", "model": "gpt-5.5", "status": "XÓA SETUP"},
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {"role": "okx", "model": "gpt-5.5", "status": "KHÔNG VÀO LỆNH"},
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {"role": "okx", "model": "gpt-5.5", "status": "NO_TRADE"},
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {"role": "mini", "model": "gpt-5.4-mini", "status": "NO_TRADE"},
+            notify_telegram=False,
+        )
+
+        stats = ai_trade_decision_stats(config)
+
+        self.assertEqual(stats["totalDecisions"], 5)
+        self.assertEqual(stats["totalRecords"], 3)
+        self.assertEqual(stats["longCount"], 1)
+        self.assertEqual(stats["shortCount"], 1)
+        self.assertEqual(stats["noTradeCount"], 3)
+        self.assertEqual(stats["longPercent"], 20.0)
+        self.assertEqual(stats["shortPercent"], 20.0)
+
+    @patch("crypto_trader.codex_features.list_ai_trade_decision_stat_rows_for_period")
+    def test_ai_trade_decision_stats_filters_real_decisions_and_gpt55_rejects_by_period(self, list_rows) -> None:
+        config = self._config()
+        list_rows.return_value = [
+            {"decision": "ENTER_LONG", "trade_status": None, "confidence": 91, "pnl": 0},
+            {"decision": "ENTER_SHORT", "trade_status": None, "confidence": 83, "pnl": 0},
+            {"decision": "ENTER_LONG", "trade_status": None, "confidence": 88, "pnl": 0},
+        ]
+        created_from = "2026-07-16T17:00:00+00:00"
+        created_to = "2026-07-17T17:00:00+00:00"
+
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T16:59:59+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T17:00:00+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-17T17:00:00+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+            },
+            notify_telegram=False,
+        )
+
+        stats = ai_trade_decision_stats(config, created_from=created_from, created_to=created_to)
+
+        list_rows.assert_called_once_with(config, created_from=created_from, created_to=created_to, limit=5000)
+        self.assertEqual(stats["longCount"], 2)
+        self.assertEqual(stats["shortCount"], 1)
+        self.assertEqual(stats["noTradeCount"], 1)
+        self.assertEqual(stats["totalDecisions"], 4)
+
+    def test_ai_call_decision_stats_counts_real_mini_and_gpt55_calls(self) -> None:
+        config = self._config()
+        created_from = "2026-07-16T17:00:00+00:00"
+        created_to = "2026-07-17T17:00:00+00:00"
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T17:01:00+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "approved_symbols": ["BTC/USDT:USDT"],
+                "candidate_details": [{"symbol": "BTC/USDT:USDT", "side": "long", "confidence": 90}],
+                "status": "MINI ĐỀ XUẤT LC",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T18:01:00+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "approved_symbols": ["ETH/USDT:USDT"],
+                "candidate_details": [{"symbol": "ETH/USDT:USDT", "side": "short", "confidence": 80}],
+                "status": "MINI ĐỀ XUẤT LC",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T19:01:00+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "approved_symbols": [],
+                "candidate_details": [{"symbol": "SOL/USDT:USDT", "side": "long", "confidence": 70}],
+                "status": "NO_TRADE",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T20:01:00+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-16T21:01:00+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "GIỮ SETUP",
+            },
+            notify_telegram=False,
+        )
+
+        stats = ai_call_decision_stats(config, created_from=created_from, created_to=created_to)
+
+        self.assertEqual(stats["totalDecisions"], 5)
+        self.assertEqual(stats["miniCallCount"], 3)
+        self.assertEqual(stats["okxCallCount"], 2)
+        self.assertEqual(stats["longCount"], 1)
+        self.assertEqual(stats["shortCount"], 1)
+        self.assertEqual(stats["miniNoTradeCount"], 1)
+        self.assertEqual(stats["noTradeCount"], 1)
+        self.assertEqual(stats["avgConfidenceLong"], 90.0)
+        self.assertEqual(stats["avgConfidenceShort"], 80.0)
+
+    def test_ai_call_decision_stats_without_period_counts_all_stored_history(self) -> None:
+        config = self._config()
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-15T01:00:00+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "approved_symbols": ["BTC/USDT:USDT"],
+                "candidate_details": [{"symbol": "BTC/USDT:USDT", "side": "long", "confidence": 88}],
+                "status": "MINI ĐỀ XUẤT LC",
+            },
+            notify_telegram=False,
+        )
+        record_ai_call_event(
+            config,
+            {
+                "created_at": "2026-07-17T01:00:00+00:00",
+                "role": "okx",
+                "review_kind": "lc_okx_review",
+                "model": "gpt-5.5",
+                "status": "XÓA SETUP",
+            },
+            notify_telegram=False,
+        )
+
+        stats = ai_call_decision_stats(config)
+
+        self.assertEqual(stats["totalDecisions"], 2)
+        self.assertEqual(stats["miniCallCount"], 1)
+        self.assertEqual(stats["okxCallCount"], 1)
+        self.assertEqual(stats["longCount"], 1)
+        self.assertEqual(stats["noTradeCount"], 1)
+
+    def test_default_strategy_syncs_but_cannot_override_deployed_risk_config(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["_atlas_test_mode"] = True
+        config["_config_path"] = str(Path(self._tmpdir.name) / "strategy-config.yaml")
+        config["_config_dir"] = self._tmpdir.name
+        config["risk"]["max_active_trades"] = 5
+        config["risk"]["cooldown_minutes"] = 0
+        config["trading_risk"]["max_concurrent_positions"] = 5
+        stale_payload = {
+            "risk": {**config["risk"], "max_active_trades": 1, "cooldown_minutes": 60},
+            "trading_risk": {**config["trading_risk"], "max_concurrent_positions": 1},
+        }
+        save_strategy_version(
+            config,
+            {
+                "version": "strategy-v1",
+                "name": "STRATEGY-V1",
+                "is_active": 1,
+                "traffic_percent": 100,
+                "payload_json": json.dumps(stale_payload),
+            },
+        )
+
+        runtime = select_runtime_config(config)
+        stored = get_strategy_version(config, "strategy-v1")
+        stored_payload = json.loads(str((stored or {}).get("payload_json") or "{}"))
+
+        self.assertEqual(runtime["risk"]["max_active_trades"], 5)
+        self.assertEqual(runtime["risk"]["cooldown_minutes"], 0)
+        self.assertEqual(runtime["trading_risk"]["max_concurrent_positions"], 5)
+        self.assertEqual(stored_payload["risk"]["max_active_trades"], 5)
+        self.assertEqual(stored_payload["risk"]["cooldown_minutes"], 0)
+
+    def test_health_monitor_does_not_evaluate_a_single_loss(self) -> None:
+        config = self._config()
+        config["bunny_health_monitor"] = {
+            "lookback_trades": 20,
+            "min_trades_for_evaluation": 5,
+        }
+        rows = [
+            {
+                "id": 1,
+                "status": "LOSS",
+                "pnl": -3.164076,
+                "closed_at": "2026-07-19T17:03:01+00:00",
+            }
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows):
+            health = refresh_bunny_health_state(config)
+
+        self.assertTrue(health["isHealthy"])
+        self.assertFalse(health["isWarning"])
+        self.assertFalse(health["isCritical"])
+        self.assertFalse(health["isPaused"])
+        self.assertEqual(health["totalTrades"], 1)
+        self.assertEqual(health["minimumTradesForEvaluation"], 5)
+        self.assertEqual(health["totalPnl"], -3.164076)
+        self.assertEqual(health["reason"], "Not enough trades (1/5)")
+
+    def test_health_monitor_drawdown_only_does_not_pause_when_multiple_breaches_required(self) -> None:
+        config = self._config()
+        config["bunny_health_monitor"] = {
+            "lookback_trades": 20,
+            "min_trades_for_evaluation": 5,
+            "min_win_rate": 50,
+            "min_profit_factor": 1.2,
+            "max_drawdown_percent": 20,
+            "min_drawdown_usdt_for_warning": 2,
+            "critical_win_rate": 35,
+            "critical_profit_factor": 0.8,
+            "critical_drawdown_percent": 35,
+            "min_drawdown_usdt_for_critical": 5,
+            "min_effective_peak_usdt": 10,
+            "critical_requires_multiple_breaches": True,
+            "critical_pause_hours": 3,
+        }
+        pnl_oldest_to_newest = [0.35, -6.35, 8.0, 1.0, -0.5]
+        rows = [
+            {
+                "id": index,
+                "status": "WIN" if pnl > 0 else "LOSS",
+                "pnl": pnl,
+                "closed_at": f"2026-07-19T17:0{index}:00+00:00",
+            }
+            for index, pnl in enumerate(reversed(pnl_oldest_to_newest), start=1)
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows):
+            health = refresh_bunny_health_state(config)
+
+        self.assertFalse(health["isHealthy"])
+        self.assertTrue(health["isWarning"])
+        self.assertFalse(health["isCritical"])
+        self.assertFalse(health["isPaused"])
+        self.assertEqual(health["criticalBreaches"], ["drawdown"])
+        self.assertIn("drawdown", health["warningBreaches"])
+        self.assertEqual(health["maxDrawdownUsdt"], 6.35)
+        self.assertEqual(health["effectivePeakUsdt"], 10.0)
+        self.assertEqual(health["reason"], "Warning health threshold breached")
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_sends_telegram_when_enabled(self, send_telegram_message) -> None:
+        config = self._config()
+        config["trading_risk"] = {
+            "global_loss_streak_threshold": 2,
+            "recovery_min_rule_score": 90,
+            "recovery_min_gpt_confidence": 92,
+            "recovery_min_risk_reward": 2.5,
+            "recovery_mode_risk_percent": 0.5,
+        }
+        rows = [
+            {"id": 2, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T12:00:00+00:00"},
+            {"id": 1, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T11:00:00+00:00"},
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 0},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"), patch(
+            "crypto_trader.codex_features._utcnow",
+            return_value=datetime(2026, 7, 20, 12, 30, tzinfo=timezone.utc),
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertTrue(state["isRecoveryMode"])
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("Bunny Risk Mode: HARD RECOVERY", message)
+        self.assertIn("19:30:00 20/07/26", message)
+        self.assertIn("Chuyển từ: NORMAL → HARD RECOVERY", message)
+        self.assertIn("Chuỗi thua hệ thống: 2", message)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_sends_telegram_when_disabled(self, send_telegram_message) -> None:
+        config = self._config()
+        config["trading_risk"] = {"global_loss_streak_threshold": 2, "normal_min_risk_reward": 1.5}
+        rows = [
+            {"id": 3, "status": "WIN", "pnl": 0.77, "closed_at": "2026-07-20T12:00:00+00:00"},
+            {"id": 2, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T11:00:00+00:00"},
+            {"id": 1, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T10:00:00+00:00"},
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"), patch(
+            "crypto_trader.codex_features._utcnow",
+            return_value=datetime(2026, 7, 20, 12, 45, tzinfo=timezone.utc),
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertTrue(state["isRecoveryMode"])
+        self.assertEqual(state["recoveryMode"], "SOFT_RECOVERY")
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("Bunny Risk Mode: SOFT RECOVERY", message)
+        self.assertIn("19:45:00 20/07/26", message)
+        self.assertIn("HARD RECOVERY", message)
+        self.assertIn("SOFT RECOVERY", message)
+        self.assertIn("Chuỗi thua hệ thống: 0", message)
+
+    def test_validate_entry_treats_rr_as_advisory_by_default(self) -> None:
+        config = self._config()
+        config.setdefault("trading_risk", {}).update(
+            {
+                "recovery_min_rule_score": 90,
+                "recovery_min_gpt_confidence": 92,
+                "recovery_min_win_probability_pct": 80,
+                "recovery_min_risk_reward": 2.5,
+                "rr_hard_block_enabled": False,
+            }
+        )
+        hard_state = {
+            "isPaused": False,
+            "isRecoveryMode": True,
+            "recoveryMode": "HARD_RECOVERY",
+            "currentNormalMinRuleScore": 75,
+            "currentNormalMinGptConfidence": 82,
+        }
+        health = {"isPaused": False, "isWarning": False, "isCritical": False}
+
+        with patch("crypto_trader.codex_features.get_trading_system_state", return_value=hard_state), patch(
+            "crypto_trader.codex_features.get_bunny_health_state", return_value=health
+        ), patch("crypto_trader.codex_features._open_trade_executions", return_value=[]):
+            result = validate_entry(
+                config,
+                {
+                    "ruleScore": 95,
+                    "gptConfidence": 93,
+                    "winProbability": 82,
+                    "riskReward": 1.5,
+                    "volumeConfirmed": True,
+                    "entryPrice": 100,
+                    "currentPrice": 100,
+                },
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["riskRewardIsAdvisory"])
+        self.assertIn("Risk reward 1.50", result["riskRewardWarnings"][0])
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_sends_telegram_when_soft_recovery(self, send_telegram_message) -> None:
+        config = self._config()
+        config["trading_risk"] = {
+            "global_loss_streak_threshold": 2,
+            "soft_recovery_min_rule_score": 87,
+            "soft_recovery_min_gpt_confidence": 89,
+            "soft_recovery_min_risk_reward": 2.0,
+            "soft_recovery_risk_percent": 0.75,
+        }
+        rows = [
+            {"id": 3, "status": "WIN", "pnl": 0.77, "closed_at": "2026-07-20T12:00:00+00:00"},
+            {"id": 2, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T11:00:00+00:00"},
+            {"id": 1, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T10:00:00+00:00"},
+        ]
+        sizing_state = {"cycle_pnl_usdt": -4.8}
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps({"recoveryMode": "HARD_RECOVERY"})},
+        ), patch("crypto_trader.codex_features.get_journal_state", return_value=json.dumps(sizing_state)), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ), patch("crypto_trader.codex_features._utcnow", return_value=datetime(2026, 7, 20, 12, 45, tzinfo=timezone.utc)):
+            state = refresh_trading_system_state(config)
+
+        self.assertTrue(state["isRecoveryMode"])
+        self.assertEqual(state["recoveryMode"], "SOFT_RECOVERY")
+        send_telegram_message.assert_called_once()
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("Bunny Risk Mode: SOFT RECOVERY", message)
+        self.assertIn("Chuyển từ: HARD RECOVERY → SOFT RECOVERY", message)
+        self.assertIn("Cycle PnL: -4.8000 USDT", message)
+
+    def test_trend_review_message_includes_watchlist_remaining_and_extension(self) -> None:
+        message = _ai_call_message(
+            {
+                "created_at": "2026-07-30T16:47:22+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "symbols": ["CAP/USDT:USDT"],
+                "status": "REVIEW",
+                "prompt_version": "trend-setup-review-v1",
+                "sl_tp_method": "atr_volatility_rr",
+                "watchlist_remaining_minutes": 12,
+                "watchlist_ai_review_extend_minutes": 30,
+                "reason": "wait for confirmation",
+            }
+        )
+
+        self.assertIn("Thời gian còn lại watchlist: 12p (+30p)", message)
+
+    def test_trend_reject_message_explains_watchlist_remove(self) -> None:
+        message = _ai_call_message(
+            {
+                "created_at": "2026-07-30T16:47:22+00:00",
+                "role": "mini",
+                "model": "gpt-5.4-mini",
+                "symbols": ["CAP/USDT:USDT"],
+                "status": "REJECT",
+                "decision": "REJECT",
+                "reject_scope": "WATCHLIST_REMOVE",
+                "reject_reason_type": "TREND_INVALID",
+                "watchlist_reject_cooldown_minutes": 120,
+                "prompt_version": "trend-setup-review-v1",
+                "reason": "trend invalid",
+            }
+        )
+
+        self.assertIn("REJECT (REMOVE_PAIR)", message)
+        self.assertIn("cooldown cặp/side", message)
+        self.assertIn("Cooldown: 120p", message)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_bunny_minimize_losses_tracks_hard_peak_and_soft_threshold(self, _send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {"target_profit_usdt": 0.30}
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=2), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-20.0,
+        ), patch("crypto_trader.codex_features.get_trading_system_state_row", return_value=None), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "HARD_RECOVERY")
+        self.assertEqual(state["recoveryBand"], "hard")
+        self.assertAlmostEqual(state["hardRecoveryEntryCyclePnlUsdt"], -20.0)
+        self.assertAlmostEqual(state["hardRecoveryPeakLossUsdt"], -20.0)
+        self.assertAlmostEqual(state["hardRecoverySoftExitThresholdUsdt"], -10.0)
+        self.assertAlmostEqual(state["needToSoftUsdt"], 10.0)
+        self.assertAlmostEqual(state["needToNormalUsdt"], 20.3)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_bunny_minimize_losses_updates_hard_peak_when_loss_deepens(self, _send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {"target_profit_usdt": 0.30}
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+        previous = {
+            "recoveryMode": "HARD_RECOVERY",
+            "recoveryBand": "hard",
+            "hardRecoveryStartedAt": "2026-07-20T00:00:00+00:00",
+            "hardRecoveryEntryCyclePnlUsdt": -20.0,
+            "hardRecoveryPeakLossUsdt": -20.0,
+        }
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=2), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-30.0,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps(previous)},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "HARD_RECOVERY")
+        self.assertAlmostEqual(state["hardRecoveryPeakLossUsdt"], -30.0)
+        self.assertAlmostEqual(state["hardRecoverySoftExitThresholdUsdt"], -15.0)
+        self.assertAlmostEqual(state["needToSoftUsdt"], 15.0)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_bunny_minimize_losses_returns_to_soft_after_half_recovery_and_waits_for_normal_target(
+        self,
+        _send_telegram_message,
+    ) -> None:
+        config = self._config()
+        config["position_sizing"] = {"target_profit_usdt": 0.30}
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+        previous = {
+            "recoveryMode": "HARD_RECOVERY",
+            "recoveryBand": "hard",
+            "hardRecoveryStartedAt": "2026-07-20T00:00:00+00:00",
+            "hardRecoveryEntryCyclePnlUsdt": -20.0,
+            "hardRecoveryPeakLossUsdt": -20.0,
+            "hardRecoverySoftExitThresholdUsdt": -10.0,
+        }
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=2), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-9.0,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps(previous)},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "SOFT_RECOVERY")
+        self.assertEqual(state["recoveryBand"], "soft")
+        self.assertAlmostEqual(state["needToSoftUsdt"], 0.0)
+        self.assertAlmostEqual(state["needToNormalUsdt"], 9.3)
+
+        previous_soft = dict(previous, recoveryMode="SOFT_RECOVERY", recoveryBand="soft")
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=0.29,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps(previous_soft)},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            nearly_normal = refresh_trading_system_state(config)
+
+        self.assertEqual(nearly_normal["recoveryMode"], "SOFT_RECOVERY")
+        self.assertAlmostEqual(nearly_normal["needToNormalUsdt"], 0.01)
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=0.30,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps(previous_soft)},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            normal = refresh_trading_system_state(config)
+
+        self.assertEqual(normal["recoveryMode"], "NORMAL")
+        self.assertEqual(normal["recoveryBand"], "normal")
+        self.assertAlmostEqual(normal["needToNormalUsdt"], 0.0)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_bunny_minimize_losses_debounces_hard_to_soft_flapping(self, _send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {"target_profit_usdt": 0.30}
+        config["trading_risk"] = {
+            "global_loss_streak_threshold": 2,
+            "hard_to_soft_transition_cooldown_seconds": 900,
+        }
+        previous = {
+            "recoveryMode": "HARD_RECOVERY",
+            "recoveryBand": "hard",
+            "updatedAt": "2026-07-30T16:36:40+00:00",
+            "hardRecoveryStartedAt": "2026-07-30T16:30:35+00:00",
+            "hardRecoveryEntryCyclePnlUsdt": -17.408398,
+            "hardRecoveryPeakLossUsdt": -29.250977,
+            "hardRecoverySoftExitThresholdUsdt": -14.625488,
+        }
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-12.608914,
+        ), patch(
+            "crypto_trader.codex_features._utcnow",
+            return_value=datetime(2026, 7, 30, 16, 37, 29, tzinfo=timezone.utc),
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1, "payload_json": json.dumps(previous)},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "HARD_RECOVERY")
+        self.assertEqual(state["recoveryBand"], "hard")
+        self.assertAlmostEqual(state["needToSoftUsdt"], 0.0)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_bunny_minimize_losses_uses_current_sizing_hard_band(self, _send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "target_profit_usdt": 0.30,
+        }
+        sizing_state = {
+            "cycle_start_at": "2026-07-04T17:00:00+00:00",
+            "cycle_pnl_usdt": -22.361896,
+            "recovery_band": "hard",
+            "hard_started_at": "2026-07-20T00:00:00+00:00",
+            "hard_start_pnl_usdt": -29.814672,
+            "hard_peak_loss_usdt": -29.814672,
+            "soft_return_pnl_usdt": -14.907336,
+        }
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-17.822675,
+        ), patch(
+            "crypto_trader.codex_features.get_journal_state",
+            return_value=json.dumps(sizing_state),
+        ), patch("crypto_trader.codex_features.get_trading_system_state_row", return_value=None), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "HARD_RECOVERY")
+        self.assertEqual(state["recoveryBand"], "hard")
+        self.assertAlmostEqual(state["recoveryCyclePnlUsdt"], -17.822675)
+        self.assertAlmostEqual(state["hardRecoveryPeakLossUsdt"], -29.814672)
+        self.assertAlmostEqual(state["hardRecoverySoftExitThresholdUsdt"], -14.907336)
+        self.assertAlmostEqual(state["needToSoftUsdt"], 2.915339, places=5)
+
+    def test_recovery_cycle_pnl_returns_none_when_okx_unavailable_with_configured_start(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-24T00:00:00+00:00",
+            "cycle_start_pnl_fallback_usdt": -25.275453,
+        }
+
+        with patch("crypto_trader.market.create_exchange", side_effect=RuntimeError("okx unavailable")), patch(
+            "crypto_trader.codex_features.get_journal_state",
+            return_value=json.dumps({"cycle_pnl_usdt": -58.658771}),
+        ), patch("crypto_trader.codex_features._closed_trade_executions") as closed_trade_executions:
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertIsNone(pnl)
+        closed_trade_executions.assert_not_called()
+
+    def test_recovery_cycle_pnl_can_fallback_to_local_closed_trades_when_enabled(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "cycle_pnl_use_trade_executions_fallback": True,
+        }
+        closed_trades = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "pnl": -20.3289,
+                "closed_at": "2026-07-30T16:24:43+00:00",
+            },
+        ]
+
+        with patch("crypto_trader.market.create_exchange", side_effect=RuntimeError("okx unavailable")), patch(
+            "crypto_trader.codex_features._closed_trade_executions",
+            return_value=closed_trades,
+        ):
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertAlmostEqual(pnl, -20.3289, places=6)
+
+    def test_recovery_cycle_pnl_uses_okx_closed_position_realized_pnl(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "history_limit": 100,
+        }
+        rows = [
+            {
+                "instId": "SHIB-USDT-SWAP",
+                "posId": "shib",
+                "realizedPnl": "5.689893",
+                "uTime": str(int(datetime(2026, 7, 26, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "eth",
+                "realizedPnl": "-4.932118",
+                "uTime": str(int(datetime(2026, 7, 27, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "instId": "OLD-USDT-SWAP",
+                "posId": "old",
+                "realizedPnl": "-99",
+                "uTime": str(int(datetime(2026, 7, 4, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+        ]
+        exchange = SimpleNamespace(
+            load_markets=lambda: {},
+            privateGetAccountPositionsHistory=lambda params: {"data": rows},
+        )
+
+        with patch("crypto_trader.market.create_exchange", return_value=exchange):
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertAlmostEqual(pnl, 0.757775, places=6)
+
+    def test_recovery_cycle_pnl_rejects_okx_history_outlier_against_local_closed_trades(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "history_limit": 100,
+        }
+        rows = [
+            {
+                "instId": "BAD-USDT-SWAP",
+                "posId": "bad",
+                "realizedPnl": "-884.854803",
+                "uTime": str(int(datetime(2026, 7, 30, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+        ]
+        exchange = SimpleNamespace(
+            load_markets=lambda: {},
+            privateGetAccountPositionsHistory=lambda params: {"data": rows},
+        )
+        closed_trades = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "pnl": -20.3289,
+                "closed_at": "2026-07-30T16:24:43+00:00",
+            },
+        ]
+
+        with patch("crypto_trader.market.create_exchange", return_value=exchange), patch(
+            "crypto_trader.codex_features._closed_trade_executions",
+            return_value=closed_trades,
+        ):
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertAlmostEqual(pnl, -20.3289, places=6)
+
+    def test_recovery_cycle_pnl_excludes_partial_okx_position_closes(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "history_limit": 100,
+        }
+        rows = [
+            {
+                "instId": "BOME-USDT-SWAP",
+                "posId": "partial-bome",
+                "realizedPnl": "-3.790009",
+                "openMaxPos": "100",
+                "closeTotalPos": "30",
+                "uTime": str(int(datetime(2026, 7, 30, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "instId": "LAB-USDT-SWAP",
+                "posId": "full-lab",
+                "realizedPnl": "0.296297",
+                "openMaxPos": "12.9",
+                "closeTotalPos": "12.9",
+                "uTime": str(int(datetime(2026, 7, 30, 1, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+        ]
+        exchange = SimpleNamespace(
+            load_markets=lambda: {},
+            privateGetAccountPositionsHistory=lambda params: {"data": rows},
+        )
+
+        with patch("crypto_trader.market.create_exchange", return_value=exchange):
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertAlmostEqual(pnl or 0.0, 0.296297, places=6)
+
+    def test_recovery_cycle_pnl_ignores_partial_fills_and_bot_rows(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "history_limit": 100,
+        }
+        partial_fills = [
+            {
+                "tradeId": "partial-profit",
+                "billId": "200",
+                "fillPnl": "1.25",
+                "fillTime": str(int(datetime(2026, 7, 26, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "tradeId": "partial-loss",
+                "billId": "100",
+                "fillPnl": "-3.5",
+                "fillTime": str(int(datetime(2026, 7, 25, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+        ]
+        bot_rows = [
+            {
+                "id": 18,
+                "symbol": "LAB/USDT:USDT",
+                "side": "SHORT",
+                "pnl": 1.1457,
+                "closed_at": "2026-07-26T07:38:02+00:00",
+            },
+            {
+                "id": 13,
+                "symbol": "BICO/USDT:USDT",
+                "side": "LONG",
+                "pnl": 0.13468,
+                "closed_at": "2026-07-26T07:38:02+00:00",
+            },
+            {
+                "id": 16,
+                "symbol": "BEAT/USDT:USDT",
+                "side": "SHORT",
+                "pnl": -2.763008,
+                "closed_at": "2026-07-25T09:40:00+00:00",
+                "exchange_close_history_json": json.dumps({"source": "old-position-history"}),
+            },
+            {
+                "id": 2,
+                "symbol": "TAO/USDT:USDT",
+                "side": "LONG",
+                "pnl": -13.736128,
+                "closed_at": "2026-07-24T13:13:00+00:00",
+            },
+        ]
+
+        exchange = SimpleNamespace(
+            load_markets=lambda: {},
+            privateGetAccountPositionsHistory=lambda params: {"data": []},
+            privateGetTradeFillsHistory=lambda params: {"data": partial_fills},
+        )
+
+        with patch("crypto_trader.market.create_exchange", return_value=exchange), patch(
+            "crypto_trader.codex_features._closed_trade_executions", return_value=bot_rows
+        ) as closed_trade_executions:
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertIsNone(pnl)
+        closed_trade_executions.assert_not_called()
+
+    def test_recovery_cycle_pnl_counts_okx_rows_with_same_pos_id_different_close_time(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "history_limit": 100,
+        }
+        rows = [
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "same-pos",
+                "realizedPnl": "-4.94",
+                "uTime": str(int(datetime(2026, 7, 27, 4, 18, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "same-pos",
+                "realizedPnl": "3.76",
+                "uTime": str(int(datetime(2026, 7, 7, 4, 30, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "same-pos",
+                "realizedPnl": "-2.75",
+                "uTime": str(int(datetime(2026, 7, 6, 13, 20, tzinfo=timezone.utc).timestamp() * 1000)),
+            },
+        ]
+        exchange = SimpleNamespace(
+            load_markets=lambda: {},
+            privateGetAccountPositionsHistory=lambda params: {"data": rows},
+        )
+
+        with patch("crypto_trader.market.create_exchange", return_value=exchange):
+            pnl = _recovery_cycle_pnl(config)
+
+        self.assertAlmostEqual(pnl, -3.93, places=6)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_stays_soft_when_cycle_pnl_negative_and_loss_streak_below_hard(
+        self,
+        send_telegram_message,
+    ) -> None:
+        config = self._config()
+        config["trading_risk"] = {
+            "global_loss_streak_threshold": 2,
+            "soft_recovery_min_rule_score": 87,
+            "soft_recovery_min_gpt_confidence": 89,
+            "soft_recovery_min_risk_reward": 2.0,
+            "soft_recovery_risk_percent": 0.75,
+        }
+        rows = [
+            {"id": 3, "status": "LOSS", "pnl": -0.77, "closed_at": "2026-07-20T12:00:00+00:00"},
+            {"id": 2, "status": "WIN", "pnl": 0.77, "closed_at": "2026-07-20T11:00:00+00:00"},
+            {"id": 1, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T10:00:00+00:00"},
+        ]
+        sizing_state = {"cycle_pnl_usdt": -1.77}
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 0, "payload_json": json.dumps({"recoveryMode": "NORMAL"})},
+        ), patch("crypto_trader.codex_features.get_journal_state", return_value=json.dumps(sizing_state)), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertTrue(state["isRecoveryMode"])
+        self.assertEqual(state["recoveryMode"], "SOFT_RECOVERY")
+        self.assertEqual(state["globalLossStreak"], 1)
+        self.assertEqual(state["recoveryCyclePnlUsdt"], -1.77)
+        send_telegram_message.assert_called_once()
+
+    def test_global_loss_streak_respects_cycle_start_reset(self) -> None:
+        config = self._config()
+        config["position_sizing"] = {"cycle_start_at": "2026-08-15T14:50:52+07:00"}
+        rows = [
+            {"id": 3, "symbol": "BTC/USDT:USDT", "status": "LOSS", "closed_at": "2026-08-15T07:49:00+00:00"},
+            {"id": 2, "symbol": "ETH/USDT:USDT", "status": "LOSS", "closed_at": "2026-08-15T07:48:00+00:00"},
+            {"id": 1, "symbol": "BTC/USDT:USDT", "status": "LOSS", "closed_at": "2026-08-15T07:47:00+00:00"},
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows):
+            self.assertEqual(get_global_loss_streak(config), 0)
+            self.assertEqual(get_symbol_loss_streak(config, "BTC/USDT:USDT"), 0)
+
+    def test_trading_system_pause_clears_after_cycle_start_reset(self) -> None:
+        config = self._config()
+        config["trading_risk"] = {"pause_trading_loss_streak": 4, "pause_trading_hours": 24}
+        existing = {
+            "paused_until": "2026-08-29T01:30:00+00:00",
+            "payload_json": json.dumps({"recoveryMode": "NORMAL"}),
+        }
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=0.0,
+        ), patch("crypto_trader.codex_features.get_trading_system_state_row", return_value=existing), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertFalse(state["isPaused"])
+        self.assertIsNone(state["pausedUntil"])
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_does_not_send_telegram_without_transition(self, send_telegram_message) -> None:
+        config = self._config()
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+        rows = [
+            {"id": 2, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T12:00:00+00:00"},
+            {"id": 1, "status": "LOSS", "pnl": -1.0, "closed_at": "2026-07-20T11:00:00+00:00"},
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={"is_recovery_mode": 1},
+        ), patch("crypto_trader.codex_features.upsert_trading_system_state_row"):
+            state = refresh_trading_system_state(config)
+
+        self.assertTrue(state["isRecoveryMode"])
+        send_telegram_message.assert_not_called()
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_recovery_mode_notification_rejects_cycle_pnl_outlier(self, send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "target_profit_usdt": 0.3,
+        }
+        config["trading_risk"] = {
+            "global_loss_streak_threshold": 2,
+            "soft_recovery_min_rule_score": 87,
+            "soft_recovery_min_gpt_confidence": 89,
+            "soft_recovery_min_risk_reward": 2.0,
+            "soft_recovery_risk_percent": 0.75,
+        }
+        previous_payload = {
+            "recoveryMode": "NORMAL",
+            "recoveryCyclePnlUsdt": -20.835449,
+        }
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-884.8548,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={
+                "is_recovery_mode": 0,
+                "payload_json": json.dumps(previous_payload),
+            },
+        ), patch("crypto_trader.codex_features.get_journal_state", return_value=None), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "SOFT_RECOVERY")
+        self.assertAlmostEqual(state["recoveryCyclePnlUsdt"], -20.835449, places=6)
+        self.assertTrue(state["cyclePnlOutlierRejected"])
+        self.assertAlmostEqual(state["cyclePnlRejectedRawUsdt"], -884.8548, places=4)
+        message = send_telegram_message.call_args.args[1]
+        self.assertIn("Cycle PnL: -20.8354 USDT", message)
+        self.assertNotIn("-884.8548", message)
+
+    @patch("crypto_trader.notifier.send_telegram_message")
+    def test_hard_recovery_stays_hard_until_soft_exit_threshold_is_recovered(self, send_telegram_message) -> None:
+        config = self._config()
+        config["position_sizing"] = {
+            "cycle_start_at": "2026-07-05T00:00:00+07:00",
+            "target_profit_usdt": 0.3,
+        }
+        config["trading_risk"] = {"global_loss_streak_threshold": 2}
+
+        with patch("crypto_trader.codex_features.get_global_loss_streak", return_value=0), patch(
+            "crypto_trader.codex_features._recovery_cycle_pnl",
+            return_value=-20.835449,
+        ), patch(
+            "crypto_trader.codex_features.get_trading_system_state_row",
+            return_value={
+                "is_recovery_mode": 1,
+                "payload_json": json.dumps(
+                    {
+                        "recoveryMode": "HARD_RECOVERY",
+                        "recoveryBand": "hard",
+                        "recoveryCyclePnlUsdt": -20.835449,
+                        "hardRecoveryPeakLossUsdt": -33.790195,
+                        "hardRecoverySoftExitThresholdUsdt": -16.895097,
+                    }
+                ),
+            },
+        ), patch("crypto_trader.codex_features.get_journal_state", return_value=json.dumps({"cycle_pnl_usdt": -20.835449})), patch(
+            "crypto_trader.codex_features.upsert_trading_system_state_row"
+        ):
+            state = refresh_trading_system_state(config)
+
+        self.assertEqual(state["recoveryMode"], "HARD_RECOVERY")
+        self.assertEqual(state["recoveryBand"], "hard")
+        self.assertFalse(state["cyclePnlOutlierRejected"])
+        send_telegram_message.assert_not_called()
+
+    def test_health_monitor_reuses_pause_deadline_for_same_trade_sample(self) -> None:
+        config = self._config()
+        config["bunny_health_monitor"] = {
+            "lookback_trades": 20,
+            "min_trades_for_evaluation": 5,
+            "critical_pause_hours": 12,
+        }
+        rows = [
+            {
+                "id": index,
+                "status": "LOSS",
+                "pnl": -1.0,
+                "closed_at": f"2026-07-19T17:0{index}:00+00:00",
+            }
+            for index in range(1, 6)
+        ]
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows):
+            first = refresh_bunny_health_state(config)
+            second = refresh_bunny_health_state(config)
+
+        self.assertTrue(first["isCritical"])
+        self.assertTrue(first["isPaused"])
+        self.assertEqual(second["pausedUntil"], first["pausedUntil"])
+        self.assertEqual(second["evaluationKey"], first["evaluationKey"])
+
+    def test_health_monitor_downgrades_same_sample_after_critical_cooldown(self) -> None:
+        config = self._config()
+        config["bunny_health_monitor"] = {
+            "lookback_trades": 20,
+            "min_trades_for_evaluation": 5,
+            "risk_reduction_percent": 40,
+            "score_increase_step": 4,
+            "confidence_increase_step": 4,
+        }
+        rows = [
+            {
+                "id": index,
+                "status": "LOSS",
+                "pnl": -1.0,
+                "closed_at": f"2026-07-19T17:0{index}:00+00:00",
+            }
+            for index in range(1, 6)
+        ]
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows):
+            initial = refresh_bunny_health_state(config)
+        previous = dict(initial)
+        previous["pausedUntil"] = "2026-07-19T18:00:00+00:00"
+
+        with patch("crypto_trader.codex_features._closed_trade_executions", return_value=rows), patch(
+            "crypto_trader.codex_features.get_trading_health_state_row",
+            return_value={"payload_json": json.dumps(previous)},
+        ), patch(
+            "crypto_trader.codex_features._utcnow",
+            return_value=datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc),
+        ):
+            health = refresh_bunny_health_state(config)
+
+        self.assertFalse(health["isCritical"])
+        self.assertTrue(health["isWarning"])
+        self.assertFalse(health["isPaused"])
+        self.assertTrue(health["criticalCooldownCompleted"])
+        self.assertEqual(health["riskMultiplier"], 0.6)
+        self.assertEqual(
+            health["reason"],
+            "Critical cooldown completed; waiting for a new closed trade",
+        )

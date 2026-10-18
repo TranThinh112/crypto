@@ -1,0 +1,11 @@
+user_total_budget_usd: 100
+default_allocation:
+  crypto: 45
+  stocks: 30
+  commodities: 15
+  cash: 10
+rebalance:
+  enabled: true
+  min_change_usd: 5
+  max_group_change_pct_per_cycle: 20
+

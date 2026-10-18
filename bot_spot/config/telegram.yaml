@@ -1,0 +1,11 @@
+commands:
+  status: /status
+  run_once: /run_once
+  portfolio: /portfolio
+  pause: /pause
+  resume: /resume
+approval_buttons:
+  approve: Approve
+  skip: Skip
+  reduce_half: Reduce 50%
+

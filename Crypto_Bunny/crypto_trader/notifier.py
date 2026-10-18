@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any
+
+from dotenv import load_dotenv
+
+from .storage import get_journal_state, is_retryable_storage_error, set_journal_state
+
+TELEGRAM_COMMANDS_SYNC_KEY = "telegram_commands_last_sync_at"
+_TELEGRAM_STARTUP_QUIET_LOCK = threading.Lock()
+_TELEGRAM_STARTUP_QUIET_UNTIL: datetime | None = None
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def set_telegram_startup_quiet_until(quiet_until: datetime | None) -> None:
+    global _TELEGRAM_STARTUP_QUIET_UNTIL
+    with _TELEGRAM_STARTUP_QUIET_LOCK:
+        _TELEGRAM_STARTUP_QUIET_UNTIL = _utc_datetime(quiet_until) if quiet_until is not None else None
+
+
+def telegram_startup_quiet_active(now: datetime | None = None) -> bool:
+    with _TELEGRAM_STARTUP_QUIET_LOCK:
+        quiet_until = _TELEGRAM_STARTUP_QUIET_UNTIL
+    if quiet_until is None:
+        return False
+    now = _utc_datetime(now or datetime.now(timezone.utc))
+    return now < quiet_until
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def telegram_enabled(config: dict[str, Any]) -> bool:
+    load_dotenv()
+    telegram_config = config.get("notifications", {}).get("telegram", {})
+    if not telegram_config.get("enabled", True):
+        return False
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def telegram_notify_scans(config: dict[str, Any]) -> bool:
+    telegram_config = config.get("notifications", {}).get("telegram", {})
+    default = bool(telegram_config.get("notify_scans", True))
+    if not default:
+        return False
+    return _env_bool("TELEGRAM_NOTIFY_SCANS", default)
+
+
+def telegram_buttons_enabled(config: dict[str, Any]) -> bool:
+    telegram_config = config.get("notifications", {}).get("telegram", {})
+    return bool(telegram_config.get("buttons_enabled", True))
+
+
+def telegram_replace_previous_enabled(config: dict[str, Any]) -> bool:
+    # Chỉ cho phép thay thế message ở những luồng gọi explicit `replace_previous=True`
+    # như SC định kỳ. Mọi tin nhắn Telegram khác giữ nguyên, không tự xóa.
+    return False
+
+
+def telegram_command_list() -> list[dict[str, str]]:
+    return [
+        {"command": "menu", "description": "Mo bang dieu khien"},
+        {"command": "setup", "description": "Mo menu setup"},
+        {"command": "guard", "description": "Xem Market Guard"},
+        {"command": "vt", "description": "Xem vi the va PNL"},
+        {"command": "lc", "description": "Xem lenh cho"},
+        {"command": "thongbao", "description": "Xem thong bao noi bo"},
+        {"command": "trend", "description": "Xem trend scan watchlist"},
+        {"command": "memory", "description": "Xem bo nho scan"},
+        {"command": "ai", "description": "Xem lich su goi AI"},
+        {"command": "usdt", "description": "Chinh USDT cho lenh sau"},
+        {"command": "lev", "description": "Chinh don bay cho lenh sau"},
+        {"command": "maxvt", "description": "Chinh so vi the toi da"},
+    ]
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def sync_telegram_commands(config: dict[str, Any], *, force: bool = False, max_age_seconds: int = 21_600) -> bool:
+    if not telegram_enabled(config):
+        return False
+    if not force:
+        try:
+            last_synced = _parse_time(get_journal_state(config, TELEGRAM_COMMANDS_SYNC_KEY))
+        except Exception as exc:
+            if not is_retryable_storage_error(exc):
+                raise
+            last_synced = None
+        if last_synced is not None:
+            age_seconds = (datetime.now(timezone.utc) - last_synced).total_seconds()
+            if age_seconds < max(300, int(max_age_seconds or 21_600)):
+                return True
+    response = _telegram_api_request(
+        config,
+        "setMyCommands",
+        {"commands": json.dumps(telegram_command_list(), ensure_ascii=False)},
+    )
+    if not response or not response.get("ok"):
+        return False
+    _telegram_api_request(
+        config,
+        "setChatMenuButton",
+        {"menu_button": json.dumps({"type": "commands"}, ensure_ascii=False)},
+    )
+    try:
+        set_journal_state(config, TELEGRAM_COMMANDS_SYNC_KEY, datetime.now(timezone.utc).isoformat())
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+    return True
+
+
+def telegram_control_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "\U0001f4ca VT/PNL/SD", "callback_data": "view_positions_account"},
+                {"text": "\U0001f7e1 LC", "callback_data": "view_lc"},
+            ],
+            [
+                {"text": "\U0001f4cb Chưa Duyệt", "callback_data": "view_undecided_lc"},
+                {"text": "\U0001f514 Thông báo nội bộ", "callback_data": "view_internal_notifications"},
+            ],
+            [
+                {"text": "\U0001f916 AI", "callback_data": "view_ai"},
+                {"text": "\U0001f4c8 Trend", "callback_data": "view_trend_watchlist"},
+            ],
+            [
+                {"text": "\U0001f6e1 Guard", "callback_data": "view_guard"},
+                {"text": "\U0001f9e0 Memory", "callback_data": "view_memory"},
+                {"text": "\U0001f7e1 Wait Slot", "callback_data": "view_wait_slot_notifications"},
+            ],
+            [
+                {"text": "\u2699\ufe0f Setup", "callback_data": "setup_menu"},
+            ],
+        ]
+    }
+
+
+def telegram_setup_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "\U0001f4b0 Set USDT", "callback_data": "set_order_usdt"},
+                {"text": "\u2699\ufe0f Đòn bẩy", "callback_data": "set_leverage"},
+            ],
+            [
+                {"text": "\U0001f4c8 Max VT", "callback_data": "set_max_positions"},
+                {"text": "\u2b05\ufe0f Dashboard", "callback_data": "view_menu"},
+            ],
+        ]
+    }
+
+
+def _format_usdt_button(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def telegram_order_usdt_keyboard(config: dict[str, Any]) -> dict[str, Any]:
+    sizing = config.get("position_sizing", {})
+    raw_presets = sizing.get("base_margin_presets_usdt") or [2, 3, 5, 10, 15, 20]
+    try:
+        current = float(sizing.get("base_margin_usdt", 2) or 2)
+    except (TypeError, ValueError):
+        current = 2.0
+
+    presets: list[float] = []
+    for item in raw_presets:
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in presets:
+            presets.append(value)
+    if current not in presets:
+        presets.insert(0, current)
+
+    rows: list[list[dict[str, str]]] = []
+    row: list[dict[str, str]] = []
+    for value in presets[:9]:
+        selected = abs(value - current) < 1e-9
+        label = f"{'✅ ' if selected else ''}{_format_usdt_button(value)} USDT"
+        row.append({"text": label, "callback_data": f"set_order_usdt:{value:g}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "⬅️ Dashboard", "callback_data": "view_menu"}])
+    return {"inline_keyboard": rows}
+
+
+def telegram_leverage_keyboard(config: dict[str, Any]) -> dict[str, Any]:
+    exchange = config.get("exchange", {})
+    raw_presets = exchange.get("leverage_presets") or [5, 10, 15, 20, 25]
+    try:
+        current = int(float(exchange.get("leverage", 10) or 10))
+    except (TypeError, ValueError):
+        current = 10
+
+    presets: list[int] = []
+    for item in raw_presets:
+        try:
+            value = int(float(item))
+        except (TypeError, ValueError):
+            continue
+        if 5 <= value <= 25 and value not in presets:
+            presets.append(value)
+    if current not in presets and 5 <= current <= 25:
+        presets.insert(0, current)
+
+    rows: list[list[dict[str, str]]] = []
+    row: list[dict[str, str]] = []
+    for value in presets[:9]:
+        label = f"{'✅ ' if value == current else ''}{value}x"
+        row.append({"text": label, "callback_data": f"set_leverage:{value}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "⬅️ Dashboard", "callback_data": "view_menu"}])
+    return {"inline_keyboard": rows}
+
+
+def telegram_max_positions_keyboard(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        current = int(float(config.get("risk", {}).get("max_active_trades", 1) or 1))
+    except (TypeError, ValueError):
+        current = 1
+    presets = [1, 2, 3, 4, 5, 7, 10]
+    if current not in presets and 1 <= current <= 10:
+        presets.insert(0, current)
+    rows: list[list[dict[str, str]]] = []
+    row: list[dict[str, str]] = []
+    for value in presets:
+        prefix = "\u2705 " if value == current else ""
+        label = f"{prefix}{value} VT"
+        row.append({"text": label, "callback_data": f"set_max_positions:{value}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "\u2b05\ufe0f Dashboard", "callback_data": "view_menu"}])
+    return {"inline_keyboard": rows}
+
+
+def _telegram_api_request(config: dict[str, Any], method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    # Tests may load the developer's real Telegram credentials from .env. Never
+    # allow a test config or a pytest process to reach the external bot API.
+    if os.getenv("PYTEST_CURRENT_TEST") or config.get("_atlas_test_mode"):
+        return None
+    if not telegram_enabled(config):
+        return None
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    timeout = float(config.get("notifications", {}).get("telegram", {}).get("timeout_seconds", 8))
+    retries = int(config.get("notifications", {}).get("telegram", {}).get("retry_count", 2) or 0)
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=data,
+        method="POST",
+    )
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {"ok": 200 <= response.status < 300}
+        except urllib.error.HTTPError as exc:
+            retry_after = 0.0
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                retry_after = float(error_payload.get("parameters", {}).get("retry_after") or 0)
+            except Exception:
+                retry_after = 0.0
+            if attempt >= retries:
+                return None
+            time.sleep(min(max(retry_after, 1.0), 5.0))
+        except Exception:
+            if attempt >= retries:
+                return None
+            time.sleep(1.0)
+    return None
+
+
+def _message_state_key(chat_id: str | int, thread_id: str | int | None = None) -> str:
+    suffix = f":{thread_id}" if thread_id else ""
+    return f"telegram_last_message_id:{chat_id}{suffix}"
+
+
+def delete_telegram_message(config: dict[str, Any], chat_id: str | int, message_id: str | int) -> bool:
+    response = _telegram_api_request(
+        config,
+        "deleteMessage",
+        {"chat_id": chat_id, "message_id": message_id},
+    )
+    return bool(response and response.get("ok"))
+
+
+def edit_telegram_chat_message(
+    config: dict[str, Any],
+    chat_id: str | int,
+    message_id: str | int,
+    text: str,
+    *,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:3900],
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    response = _telegram_api_request(config, "editMessageText", payload)
+    return bool(response and response.get("ok"))
+
+
+def _remember_sent_message(
+    config: dict[str, Any],
+    chat_id: str | int,
+    thread_id: str | int | None,
+    response: dict[str, Any] | None,
+    *,
+    replace_previous: bool,
+) -> bool:
+    if not response or not response.get("ok"):
+        return False
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    message_id = result.get("message_id")
+    if message_id is None:
+        return True
+
+    key = _message_state_key(chat_id, thread_id)
+    try:
+        old_message_id = get_journal_state(config, key)
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+        old_message_id = None
+    if replace_previous and old_message_id and str(old_message_id) != str(message_id):
+        delete_telegram_message(config, chat_id, old_message_id)
+    try:
+        set_journal_state(config, key, str(message_id))
+    except Exception as exc:
+        if not is_retryable_storage_error(exc):
+            raise
+    return True
+
+
+def send_telegram_message(
+    config: dict[str, Any],
+    text: str,
+    *,
+    with_buttons: bool | None = None,
+    replace_previous: bool | None = None,
+    reply_markup: dict[str, Any] | None = None,
+    allow_during_startup_quiet: bool = False,
+) -> bool:
+    if telegram_startup_quiet_active() and not allow_during_startup_quiet:
+        return False
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text[:3900],
+        "disable_web_page_preview": "true",
+    }
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    if with_buttons is None:
+        with_buttons = telegram_buttons_enabled(config)
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    elif with_buttons:
+        payload["reply_markup"] = json.dumps(telegram_control_keyboard(), ensure_ascii=False)
+    response = _telegram_api_request(config, "sendMessage", payload)
+    if replace_previous is None:
+        replace_previous = telegram_replace_previous_enabled(config)
+    return _remember_sent_message(config, chat_id, thread_id or None, response, replace_previous=replace_previous)
+
+
+def send_telegram_chat_message(
+    config: dict[str, Any],
+    chat_id: str | int,
+    text: str,
+    *,
+    with_buttons: bool = True,
+    message_thread_id: str | int | None = None,
+    replace_previous: bool | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text[:3900],
+        "disable_web_page_preview": "true",
+    }
+    if message_thread_id:
+        payload["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    elif with_buttons:
+        payload["reply_markup"] = json.dumps(telegram_control_keyboard(), ensure_ascii=False)
+    response = _telegram_api_request(config, "sendMessage", payload)
+    if replace_previous is None:
+        replace_previous = telegram_replace_previous_enabled(config)
+    return _remember_sent_message(config, chat_id, message_thread_id, response, replace_previous=replace_previous)
+
+
+def answer_callback_query(config: dict[str, Any], callback_query_id: str, text: str = "Đã nhận") -> bool:
+    response = _telegram_api_request(
+        config,
+        "answerCallbackQuery",
+        {"callback_query_id": callback_query_id, "text": text[:180]},
+    )
+    return bool(response and response.get("ok"))
+
+
+def fetch_telegram_updates(config: dict[str, Any], *, offset: int | None = None) -> list[dict[str, Any]]:
+    if not telegram_enabled(config):
+        return []
+    poll_timeout = int(config.get("notifications", {}).get("telegram", {}).get("poll_timeout_seconds", 5) or 5)
+    payload: dict[str, Any] = {
+        "timeout": poll_timeout,
+        "allowed_updates": json.dumps(["message", "callback_query"]),
+    }
+    if offset is not None:
+        payload["offset"] = offset
+    response = _telegram_api_request(config, "getUpdates", payload)
+    if not response or not response.get("ok"):
+        return []
+    result = response.get("result")
+    return result if isinstance(result, list) else []
+
+
+def format_automation_message(status: dict[str, Any]) -> str:
+    result = status.get("last_result", "unknown")
+    mode = status.get("mode", "-")
+    lines = [f"🔎 Bot crypto scan: {result}", f"⚙️ Chế độ: {mode}"]
+    if status.get("selected_symbol"):
+        lines.append(f"🎯 Đã chọn: {status.get('selected_symbol')}")
+    elif status.get("top_symbol"):
+        lines.append(f"🏆 Top: {status.get('top_symbol')} tin cậy={status.get('top_confidence')}")
+    if status.get("action"):
+        lines.append(f"🎬 Hành động: {status.get('action')}")
+    if status.get("risk_passed") is not None:
+        lines.append(f"🛡️ Qua kiểm tra rủi ro: {status.get('risk_passed')}")
+    reasons = status.get("risk_reasons") or []
+    if reasons:
+        lines.append("⚠️ Rủi ro: " + " | ".join(str(item) for item in reasons[:3]))
+    if status.get("execution_submitted"):
+        lines.append(f"🟢 Đã gửi lệnh: {status.get('order_id') or '-'}")
+    if status.get("error"):
+        lines.append(f"🚨 Lỗi: {status.get('error')}")
+    if status.get("next_scan_at"):
+        lines.append(f"⏭️ Scan tiếp: {status.get('next_scan_at')}")
+    return "\n".join(lines)

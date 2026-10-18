@@ -1,0 +1,1 @@
+JSON only. Keep reason short. Use numbers for confidence/scores.

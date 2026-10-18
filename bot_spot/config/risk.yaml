@@ -1,0 +1,18 @@
+global:
+  live_trading_enabled: false
+  paper_trading_enabled: true
+  max_trade_pct_of_group: 35
+  min_liquidity_score: 60
+  max_volatility_score: 80
+  require_telegram_approval_for_live: true
+groups:
+  crypto:
+    max_positions: 5
+    max_single_position_pct_of_group: 35
+  stocks:
+    max_positions: 5
+    max_single_position_pct_of_group: 30
+  commodities:
+    max_positions: 3
+    max_single_position_pct_of_group: 40
+

@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS audit_events(id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, payload JSONB NOT NULL, ts DOUBLE PRECISION NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_kind_ts ON audit_events(kind, ts DESC);
+CREATE TABLE IF NOT EXISTS system_events(id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS market_candles(symbol TEXT, timeframe TEXT, ts TIMESTAMPTZ, open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume NUMERIC, PRIMARY KEY(symbol,timeframe,ts));
+CREATE TABLE IF NOT EXISTS agent_decisions(id BIGSERIAL PRIMARY KEY, decision JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS consensus_decisions(id BIGSERIAL PRIMARY KEY, decision JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS risk_checks(id BIGSERIAL PRIMARY KEY, result JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS orders(id BIGSERIAL PRIMARY KEY, order_id TEXT UNIQUE, decision_id TEXT, status TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS fills(id BIGSERIAL PRIMARY KEY, order_id TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS equity_snapshots(id BIGSERIAL PRIMARY KEY, equity NUMERIC, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS features(id BIGSERIAL PRIMARY KEY, symbol TEXT, ts TIMESTAMPTZ, payload JSONB);
+CREATE TABLE IF NOT EXISTS orderbook_snapshots(id BIGSERIAL PRIMARY KEY, symbol TEXT, ts TIMESTAMPTZ, payload JSONB);
+CREATE INDEX IF NOT EXISTS idx_market_candles_symbol_ts ON market_candles(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_snapshots(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_features_symbol_ts ON features(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_decision_id ON orders(decision_id);
+
+CREATE TABLE IF NOT EXISTS market_scan_hourly(bucket_start TIMESTAMPTZ NOT NULL, symbol TEXT NOT NULL, scans INTEGER NOT NULL, buy_count INTEGER NOT NULL, sell_count INTEGER NOT NULL, hold_count INTEGER NOT NULL, min_price DOUBLE PRECISION, max_price DOUBLE PRECISION, last_price DOUBLE PRECISION, avg_rsi DOUBLE PRECISION, ai_calls INTEGER NOT NULL DEFAULT 0, ai_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(bucket_start, symbol));

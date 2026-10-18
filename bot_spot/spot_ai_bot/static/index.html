@@ -1,0 +1,306 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Crypto Spot AI Bot</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260729-guards" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Bot navigation">
+        <div class="brand">
+          <div class="brand-mark">CS</div>
+          <div>
+            <strong>Crypto Spot</strong>
+            <span>AI Bot</span>
+          </div>
+        </div>
+
+        <nav>
+          <a href="#command" class="active">Command</a>
+          <a href="#market">Market</a>
+          <a href="#thesis">Thesis</a>
+          <a href="#risk">Risk</a>
+          <a href="#proposals">Proposals</a>
+          <a href="/docs">API Docs</a>
+        </nav>
+
+        <div class="sidebar-note">
+          <span id="modePill" class="pill">Loading</span>
+          <small id="sidebarModeText">Checking trading mode...</small>
+        </div>
+      </aside>
+
+      <main>
+        <section id="command" class="hero-band">
+          <div>
+            <span class="eyebrow">Trading control center</span>
+            <h1>Crypto Spot AI Bot</h1>
+            <p>Market scan, AI allocation, risk checks, execution mode, and proposal review in one place.</p>
+            <div class="system-strip">
+              <span><b id="stripMode">-</b> mode</span>
+              <span><b id="stripExchange">-</b> exchange</span>
+              <span><b id="stripBudget">-</b> capital</span>
+              <span><b id="stripGuard">-</b> guard</span>
+            </div>
+          </div>
+          <div class="command-card">
+            <div>
+              <span>Session</span>
+              <strong id="sessionStatus">Ready</strong>
+            </div>
+            <div class="actions">
+              <button id="themeBtn" class="secondary" type="button">Dark Mode</button>
+              <button id="refreshBtn" class="secondary" type="button">Refresh</button>
+              <button id="scanBtn" class="secondary" type="button">Scan</button>
+              <button id="runBtn" type="button">Run Cycle</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="overview" class="metrics-grid">
+          <article class="metric-card status-card">
+            <span>Status</span>
+            <strong id="statusText">-</strong>
+            <small id="envText">-</small>
+          </article>
+          <article class="metric-card">
+            <span>Budget</span>
+            <strong id="budgetText">-</strong>
+            <small>Configured user capital</small>
+          </article>
+          <article class="metric-card">
+            <span>Exchange</span>
+            <strong id="exchangeText">-</strong>
+            <small id="exchangeConfigText">-</small>
+          </article>
+          <article class="metric-card">
+            <span>AI Advisor</span>
+            <strong id="modelText">-</strong>
+            <small id="openaiText">-</small>
+          </article>
+        </section>
+
+        <section class="workspace">
+          <div id="market" class="panel market-panel">
+            <div class="panel-head">
+              <div>
+                <span class="section-kicker">Market intelligence</span>
+                <h2>Candidate Scan</h2>
+                <p id="symbolsText">-</p>
+              </div>
+              <div id="scanSummary" class="scan-summary">
+                <strong>0</strong>
+                <small>candidates</small>
+              </div>
+            </div>
+            <div id="dataSourceBanner" class="data-source-banner">Waiting for market scan.</div>
+            <div id="lastScanAt" class="scan-timestamp">Last scan: -</div>
+            <div id="marketCards" class="market-cards"></div>
+            <div class="grouped-scans">
+              <div class="panel-head grouped-head">
+                <div>
+                  <span class="section-kicker">Sector scan</span>
+                  <h2>Top 5 by group</h2>
+                </div>
+              </div>
+              <div id="groupedScanGrid" class="grouped-grid">
+                <div class="empty-state">
+                  <strong>No grouped scan yet</strong>
+                  <span>Run a scan to see the strongest coins per sector.</span>
+                </div>
+              </div>
+            </div>
+            <div class="top-score-panel">
+              <div class="panel-head grouped-head">
+                <div>
+                  <span class="section-kicker">Score board</span>
+                  <h2>Top 10 highest score</h2>
+                </div>
+              </div>
+              <div class="table-wrap scoreboard-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Symbol</th>
+                      <th>Score</th>
+                      <th>Pattern</th>
+                      <th>24h</th>
+                      <th>Scan</th>
+                    </tr>
+                  </thead>
+                  <tbody id="topScoreRows">
+                    <tr><td colspan="6">No scan yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="watchlist-panel">
+              <div class="panel-head grouped-head">
+                <div>
+                  <span class="section-kicker">Watchlist</span>
+                  <h2>Cap dang theo doi</h2>
+                </div>
+                <div id="watchlistCount" class="pill muted-pill">0 cap</div>
+              </div>
+              <div class="table-wrap watchlist-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Uu tien</th>
+                      <th>Cap</th>
+                      <th>Ly do</th>
+                      <th>Trang thai</th>
+                      <th>Da theo doi</th>
+                      <th>Het han</th>
+                    </tr>
+                  </thead>
+                  <tbody id="watchlistRows">
+                    <tr><td colspan="6">Chua co cap nao trong watchlist.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="insight-grid">
+              <div>
+                <span>Best Trend</span>
+                <strong id="bestTrend">-</strong>
+              </div>
+              <div>
+                <span>Best Liquidity</span>
+                <strong id="bestLiquidity">-</strong>
+              </div>
+              <div>
+                <span>Lowest Volatility</span>
+                <strong id="lowestVolatility">-</strong>
+              </div>
+              <div>
+                <span>Trade Candidates</span>
+                <strong id="candidateCount">-</strong>
+              </div>
+            </div>
+            <div class="table-wrap candidate-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Price</th>
+                    <th>Trend</th>
+                    <th>Liquidity</th>
+                    <th>Volatility</th>
+                    <th>Signal</th>
+                    <th>Change</th>
+                  </tr>
+                </thead>
+                <tbody id="marketRows">
+                  <tr><td colspan="7">No scan yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <aside class="stack">
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <span class="section-kicker">Strategy</span>
+                  <h2>Decision Rules</h2>
+                </div>
+              </div>
+              <div class="rule-stack">
+                <div class="rule-row"><span>Trend threshold</span><b>>= 65%</b></div>
+                <div class="rule-row"><span>Liquidity threshold</span><b>>= 70%</b></div>
+                <div class="rule-row"><span>Max volatility</span><b><= 80%</b></div>
+                <div class="rule-row"><span>Order sizing</span><b>20% group</b></div>
+              </div>
+            </div>
+
+            <div class="panel" id="risk">
+              <div class="panel-head">
+                <div>
+                  <span class="section-kicker">Safety</span>
+                  <h2>Risk Guard</h2>
+                </div>
+              </div>
+              <div id="riskGuard" class="risk-guard"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <span class="section-kicker">Integrations</span>
+                  <h2>Readiness</h2>
+                </div>
+              </div>
+              <div id="configList" class="config-list"></div>
+            </div>
+          </aside>
+        </section>
+
+        <section id="proposals" class="panel run-panel">
+          <div class="panel-head">
+            <div>
+              <span class="section-kicker">Execution review</span>
+              <h2>Latest Run</h2>
+              <p id="latestRunText">No bot cycle has been run in this browser session.</p>
+            </div>
+            <div id="runBadge" class="pill muted-pill">Idle</div>
+          </div>
+          <div class="run-summary-grid">
+            <div><span>Allocation Source</span><strong id="allocationSource">-</strong></div>
+            <div><span>Executed Mode</span><strong id="executedMode">-</strong></div>
+            <div><span>Total Proposed</span><strong id="totalProposed">-</strong></div>
+            <div><span>Risk Blocks</span><strong id="riskBlocks">-</strong></div>
+          </div>
+          <div id="allocationBar" class="allocation-bar"></div>
+          <div class="timeline">
+            <div class="timeline-step"><b>1</b><span>Allocate</span></div>
+            <div class="timeline-step"><b>2</b><span>Scan</span></div>
+            <div class="timeline-step"><b>3</b><span>Advise</span></div>
+            <div class="timeline-step"><b>4</b><span>Risk</span></div>
+            <div class="timeline-step"><b>5</b><span>Execute</span></div>
+          </div>
+          <div id="proposalList" class="proposal-list">
+            <div class="empty-state">
+              <strong>No proposals yet</strong>
+              <span>Run a cycle to review allocation, advisor opinion, risk notes, and execution status.</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="thesis" class="panel">
+          <div class="panel-head">
+            <div>
+              <span class="section-kicker">Trade assistant</span>
+              <h2>Trade Thesis</h2>
+              <p id="thesisSummaryText">No thesis loaded yet.</p>
+            </div>
+            <button id="careBtn" class="secondary" type="button">Care Loop</button>
+          </div>
+          <div id="thesisGrid" class="thesis-grid">
+            <div class="empty-state">
+              <strong>No trade thesis yet</strong>
+              <span>Watchlist care will create thesis records for active watchlist pairs.</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <span class="section-kicker">Audit trail</span>
+              <h2>Activity</h2>
+            </div>
+          </div>
+          <div id="activityLog" class="activity-log"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import tempfile
+from copy import deepcopy
+from unittest import TestCase
+from unittest.mock import patch
+
+from crypto_trader.codex_features import get_trading_system_state, validate_entry
+from crypto_trader.config import DEFAULT_CONFIG
+from crypto_trader.models import TradeCandidate
+from crypto_trader.risk import evaluate_candidate
+
+
+def _candidate(symbol: str = "BTC/USDT:USDT", side: str = "long") -> TradeCandidate:
+    return TradeCandidate(
+        symbol=symbol,
+        base=symbol.split("/")[0],
+        side=side,  # type: ignore[arg-type]
+        confidence=82.0,
+        entry=100.0,
+        stop_loss=97.5,
+        take_profit=103.75,
+        risk_reward=1.5,
+        order_usdt=20.0,
+        quantity=1.0,
+        spread_pct=0.01,
+        news_score=0.0,
+        news_count=1,
+        take_profit_pct=75,
+        stop_loss_pct=50,
+        win_probability_pct=75.0,
+    )
+
+
+class RiskTest(TestCase):
+    def setUp(self) -> None:
+        self.system_validation = patch(
+            "crypto_trader.risk.apply_system_validation_to_candidate",
+            return_value=([], []),
+        )
+        self.system_validation.start()
+
+    def _config(self) -> dict:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["mode"] = "demo"
+        config["strategy"]["min_confidence"] = 75
+        config["strategy"]["min_risk_reward"] = 1.5
+        config["news"]["require_symbol_news"] = False
+        config["risk"]["max_active_trades"] = 5
+        config["risk"]["max_daily_orders"] = 100
+        config["risk"]["max_daily_planned_risk_usdt"] = 1000
+        config["risk"]["cooldown_minutes"] = 0
+        self.tmpdir = tempfile.TemporaryDirectory()
+        config["_config_dir"] = self.tmpdir.name
+        config["ledger_path"] = "empty-ledger.jsonl"
+        return config
+
+    def tearDown(self) -> None:
+        self.system_validation.stop()
+        tmpdir = getattr(self, "tmpdir", None)
+        if tmpdir:
+            tmpdir.cleanup()
+
+    def test_blocks_any_existing_symbol_even_when_side_differs(self) -> None:
+        check = evaluate_candidate(
+            self._config(),
+            _candidate(symbol="BTC/USDT:USDT", side="short"),
+            active_summary=(1, {"BTC/USDT:USDT"}, []),
+            enforce_active_limit=False,
+        )
+
+        self.assertFalse(check.passed)
+        self.assertIn("Active OKX position/order already exists for BTC/USDT:USDT", check.reasons)
+
+    def test_pending_can_ignore_only_active_limit_for_new_symbol(self) -> None:
+        config = self._config()
+        candidate = _candidate(symbol="ETH/USDT:USDT", side="long")
+
+        market_check = evaluate_candidate(config, candidate, active_summary=(5, set(), []))
+        pending_check = evaluate_candidate(
+            config,
+            candidate,
+            active_summary=(5, set(), []),
+            enforce_active_limit=False,
+        )
+
+        self.assertFalse(market_check.passed)
+        self.assertIn("Active trade limit reached: 5/5", market_check.reasons)
+        self.assertTrue(pending_check.passed)
+
+    def test_blocks_candidate_below_min_win_probability(self) -> None:
+        config = self._config()
+        config["strategy"]["min_win_probability_pct"] = 80
+        config["trading_risk"]["probation_entry"]["enabled"] = False
+        candidate = _candidate()
+        candidate.win_probability_pct = 76.5
+
+        blocked = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        candidate.win_probability_pct = 82.0
+        passed = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertFalse(blocked.passed)
+        self.assertIn("Win probability 76.50% is below minimum 80.00%", blocked.reasons)
+        self.assertTrue(passed.passed)
+
+    def test_low_volatility_quality_setup_uses_dynamic_win_threshold(self) -> None:
+        config = self._config()
+        config["strategy"]["min_win_probability_pct"] = 72
+        candidate = _candidate()
+        candidate.market_regime = "LOW_VOLATILITY"
+        candidate.confidence = 92
+        candidate.risk_reward = 2.0
+        candidate.win_probability_pct = 67.5
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(
+            candidate.decision_metadata["risk_win_probability_threshold"]["effective_threshold"],
+            63.0,
+        )
+
+    def test_health_warning_keeps_normal_win_probability_floor(self) -> None:
+        config = self._config()
+        config["strategy"]["min_win_probability_pct"] = 72
+        candidate = _candidate()
+        candidate.market_regime = "LOW_VOLATILITY"
+        candidate.confidence = 95
+        candidate.risk_reward = 2.0
+        candidate.win_probability_pct = 67.5
+        candidate.warnings.append("Bunny Health Monitor dang o trang thai warning")
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertFalse(check.passed)
+        self.assertIn("Win probability 67.50% is below minimum 68.00%", check.reasons)
+
+    def test_missing_symbol_news_does_not_block_entry(self) -> None:
+        config = self._config()
+        config["news"]["require_symbol_news"] = True
+        candidate = _candidate()
+        candidate.news_count = 0
+        candidate.news_score = 0.0
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertNotIn("No recent symbol-specific news confirmed the setup", check.reasons)
+
+    def test_news_conflict_is_warning_not_hard_block(self) -> None:
+        config = self._config()
+        candidate = _candidate(side="long")
+        candidate.news_score = -3.0
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(check.reasons, [])
+        self.assertIn("News sentiment conflicts with LONG setup (-3.00)", check.warnings)
+
+    def test_missing_news_score_is_treated_as_neutral(self) -> None:
+        config = self._config()
+        candidate = _candidate(side="long")
+        candidate.news_score = None  # type: ignore[assignment]
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(check.reasons, [])
+        self.assertNotIn("News sentiment conflicts", " | ".join(check.warnings))
+
+    def test_confidence_fallback_uses_available_quality_scores(self) -> None:
+        config = self._config()
+        candidate = _candidate()
+        candidate.confidence = 0.0
+        candidate.win_probability_pct = 71.0
+        candidate.rule_score = 79.0
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(candidate.confidence, 79.0)
+        self.assertTrue(candidate.decision_metadata["confidence_fallback"]["applied"])
+
+    def test_probation_entry_allows_small_size_for_near_quality_setup(self) -> None:
+        config = self._config()
+        config["strategy"]["min_confidence"] = 82
+        config["strategy"]["min_win_probability_pct"] = 72
+        config["trading_risk"]["probation_entry"]["enabled"] = True
+        config["trading_risk"]["probation_entry"]["min_confidence"] = 78
+        config["trading_risk"]["probation_entry"]["min_risk_reward"] = 1.5
+        config["exchange"]["leverage"] = 25
+        candidate = _candidate()
+        candidate.confidence = 79.0
+        candidate.win_probability_pct = 67.0
+        candidate.order_usdt = 0.0
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(candidate.order_usdt, 25.0)
+        self.assertEqual(candidate.margin_usdt, 1.0)
+        self.assertTrue(candidate.decision_metadata["probation_entry"]["enabled"])
+
+    def test_probation_entry_default_allows_balanced_small_size_setup(self) -> None:
+        config = self._config()
+        config["strategy"]["min_confidence"] = 82
+        config["strategy"]["min_win_probability_pct"] = 68
+        config["trading_risk"]["probation_entry"]["enabled"] = True
+        candidate = _candidate()
+        candidate.confidence = 79.0
+        candidate.win_probability_pct = 67.0
+        candidate.risk_reward = 2.0
+        candidate.order_usdt = 0.0
+
+        check = evaluate_candidate(config, candidate, active_summary=(0, set(), []))
+
+        self.assertTrue(check.passed)
+        self.assertEqual(candidate.margin_usdt, 1.0)
+        self.assertTrue(candidate.decision_metadata["probation_entry"]["enabled"])
+        self.assertEqual(candidate.decision_metadata["probation_entry_sizing"]["reason"], "small_size_probation_entry")
+
+    def test_trading_system_prefers_risk_max_active_when_trading_risk_not_overridden(self) -> None:
+        state = get_trading_system_state(self._config())
+
+        self.assertEqual(state["maxConcurrentPositions"], 5)
+        self.assertEqual(state["globalLossStreakThreshold"], 2)
+        self.assertEqual(state["normalRiskPercent"], 1.0)
+        self.assertEqual(state["recoveryModeRiskPercent"], 0.5)
+        self.assertEqual(state["recoveryMinRiskReward"], 2.5)
+
+    def test_validate_entry_context_timeout_uses_lightweight_fallback(self) -> None:
+        config = self._config()
+        payload = {
+            "symbol": "ETH/USDT:USDT",
+            "side": "long",
+            "ruleScore": 90,
+            "gptConfidence": 90,
+            "winProbability": 80,
+            "riskReward": 2.0,
+            "entryPrice": 100,
+            "currentPrice": 100,
+        }
+
+        with patch("crypto_trader.codex_features.get_trading_system_state") as system_state, patch(
+            "crypto_trader.codex_features.get_bunny_health_state"
+        ) as health_state, patch("crypto_trader.codex_features._open_trade_executions") as open_rows:
+            result = validate_entry(
+                config,
+                payload,
+                validation_context={
+                    "timeout": True,
+                    "warnings": ["Entry validation context timed out after 8s; using lightweight fallback"],
+                },
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertIn("Entry validation context timed out", " | ".join(result["riskRewardWarnings"]))
+        system_state.assert_not_called()
+        health_state.assert_not_called()
+        open_rows.assert_not_called()

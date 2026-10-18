@@ -1,0 +1,1884 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from .codex_features import (
+    candidate_from_payload,
+    ensure_prompt_version,
+    prompt_status,
+    refresh_bunny_health_state,
+    refresh_trading_system_state,
+)
+from .active_position_manager import evaluate_open_positions
+from .executor import candidate_client_order_id
+from .market import create_exchange
+from .models import TradeCandidate, to_jsonable
+from .storage import (
+    append_trade_execution_event,
+    ensure_ai_model_version,
+    get_journal_state,
+    get_prompt_metric,
+    insert_trade_execution_row,
+    list_pending_orders,
+    list_trade_execution_rows,
+    refresh_pending_order,
+    reclassify_unknown_trade_closures,
+    save_pending_order,
+    save_prompt_metric_snapshot,
+    set_journal_state,
+    set_pending_order_exchange_order,
+    update_trade_execution,
+)
+from .trade_memory import record_trade_memory_from_execution
+
+EXCHANGE_CLOSE_NOTIFICATION_PREFIX = "runtime_sync_exchange_close_notified"
+MANUAL_POSITION_TARGET_NOTIFICATION_PREFIX = "runtime_sync_manual_position_target_notified"
+POSITION_QUANTITY_CHANGE_NOTIFICATION_PREFIX = "runtime_sync_position_quantity_change_notified"
+POSITION_TARGET_CHANGE_NOTIFICATION_PREFIX = "runtime_sync_position_target_change_notified"
+
+
+def _float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    number = _float(value)
+    return default if number is None else number
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    number = _float(value)
+    if number is not None and number > 10_000:
+        try:
+            seconds = number / 1000 if number > 10_000_000_000 else number
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OSError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _execution_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(row.get("symbol") or "").strip(),
+        str(row.get("side") or "").strip().upper(),
+    )
+
+
+def _trade_row_payload(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("snapshot_json", "payload_json"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+def _position_opened_at(position: dict[str, Any]) -> datetime | None:
+    info = _payload_info(position)
+    for key in ("timestamp", "created_at", "createdAt"):
+        parsed = _parse_time(position.get(key))
+        if parsed is not None:
+            return parsed
+    for key in ("cTime", "openTime"):
+        parsed = _parse_time(info.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+def _position_identity(position: dict[str, Any]) -> tuple[str, str]:
+    info = _payload_info(position)
+    pos_id = str(position.get("id") or position.get("posId") or info.get("posId") or "").strip()
+    opened_at = _position_opened_at(position)
+    opened_key = opened_at.isoformat() if opened_at is not None else str(info.get("cTime") or position.get("timestamp") or "").strip()
+    return pos_id, opened_key
+
+def _position_margin_mode(position: dict[str, Any]) -> str | None:
+    info = _payload_info(position)
+    value = position.get("marginMode") or position.get("margin_mode") or info.get("mgnMode") or info.get("tdMode")
+    text = str(value or "").strip().lower()
+    return text if text in {"cross", "isolated"} else None
+
+def _row_position_identity(row: dict[str, Any]) -> tuple[str, str]:
+    pos_id = str(row.get("exchange_position_id") or "").strip()
+    opened_key = str(row.get("exchange_position_opened_at") or "").strip()
+    if pos_id and opened_key:
+        return pos_id, opened_key
+    position = _trade_row_payload(row).get("position")
+    if isinstance(position, dict):
+        return _position_identity(position)
+    return pos_id, opened_key
+
+def _position_identity_matches(row: dict[str, Any], position: dict[str, Any]) -> bool | None:
+    row_pos_id, row_opened = _row_position_identity(row)
+    pos_id, opened = _position_identity(position)
+    if not row_pos_id or not pos_id:
+        return None
+    if row_pos_id != pos_id:
+        return False
+    if row_opened and opened:
+        return row_opened == opened
+    return True
+
+def _position_matches_execution(row: dict[str, Any], position: dict[str, Any], entry_price: float | None) -> bool:
+    identity_match = _position_identity_matches(row, position)
+    if identity_match is not None:
+        return identity_match
+    opened_at = _position_opened_at(position)
+    row_created = _parse_time(row.get("created_at"))
+    if opened_at is None or row_created is None:
+        return True
+    if opened_at <= row_created + timedelta(seconds=90):
+        return True
+    row_entry = _float(row.get("entry_price") or row.get("initial_entry_price"))
+    if row_entry is None or entry_price is None or row_entry <= 0:
+        return False
+    entry_diff_pct = abs(entry_price - row_entry) / row_entry * 100.0
+    row_quantity = _float(row.get("quantity") or row.get("max_contracts_seen") or row.get("initial_quantity"))
+    info = _payload_info(position)
+    contracts = abs(_safe_float(position.get("contracts") or info.get("pos"), 0.0))
+    quantity_diff_pct = (
+        abs(contracts - row_quantity) / row_quantity * 100.0
+        if row_quantity is not None and row_quantity > 0
+        else 100.0
+    )
+    return entry_diff_pct < 0.25 and quantity_diff_pct < 25.0
+
+def _trade_event_history(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = row.get("trade_event_history_json")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+def _position_protection_state_is_stale(
+    row: dict[str, Any],
+    position: dict[str, Any],
+    *,
+    entry_price: float | None,
+    contracts: float | None,
+) -> bool:
+    opened_at = _position_opened_at(position)
+    if opened_at is None:
+        return False
+    partial_at = _parse_time(row.get("partial_take_profit_at"))
+    trailing_at = _parse_time(row.get("trailing_stop_updated_at"))
+    event_times = [
+        parsed
+        for parsed in (
+            _parse_time(event.get("created_at"))
+            for event in _trade_event_history(row)
+            if str(event.get("type") or "") in {"open", "partial_close", "trailing_stop_update"}
+        )
+        if parsed is not None
+    ]
+    stale_event_seen = any(
+        event_time < opened_at - timedelta(seconds=90)
+        for event_time in ([partial_at, trailing_at] + event_times)
+        if event_time is not None
+    )
+    if not stale_event_seen:
+        return False
+    initial_entry = _float(row.get("initial_entry_price"))
+    initial_quantity = _float(row.get("initial_quantity"))
+    entry_changed = (
+        initial_entry is not None
+        and entry_price is not None
+        and initial_entry > 0
+        and abs(entry_price - initial_entry) / initial_entry * 100.0 >= 0.25
+    )
+    quantity_changed = (
+        initial_quantity is not None
+        and contracts is not None
+        and initial_quantity > 0
+        and abs(contracts - initial_quantity) / initial_quantity * 100.0 >= 25.0
+    )
+    return entry_changed or quantity_changed
+
+def _status_from_realized_pnl(pnl: float | None) -> str:
+    if pnl is None:
+        return "CLOSED"
+    if pnl > 0:
+        return "WIN"
+    if pnl < 0:
+        return "LOSS"
+    return "BREAKEVEN"
+
+
+def _close_reason_from_realized_pnl(pnl: float | None) -> str:
+    if pnl is None:
+        return "exchange_position_no_longer_open"
+    if pnl < 0:
+        return "stop_loss"
+    if pnl > 0:
+        return "take_profit"
+    return "exchange_position_no_longer_open"
+
+def _number_from_payloads(payloads: list[dict[str, Any]], *keys: str) -> float | None:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        info = _payload_info(payload)
+        for source in (payload, info):
+            for key in keys:
+                value = _float(source.get(key))
+                if value is not None:
+                    return value
+    return None
+
+def _history_close_price(row: dict[str, Any] | None) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    return _number_from_payloads(
+        [row],
+        "closeAvgPx",
+        "closePrice",
+        "closePx",
+        "avgPx",
+        "fillPx",
+        "price",
+        "markPx",
+    )
+
+def _row_close_targets(row: dict[str, Any]) -> dict[str, float | None]:
+    payload = _row_payload(row)
+    position = payload.get("position") if isinstance(payload.get("position"), dict) else {}
+    target = {
+        "take_profit": _float(row.get("take_profit")),
+        "stop_loss": _float(row.get("stop_loss")),
+    }
+    if target["take_profit"] is None:
+        target["take_profit"] = _target_price_from_snapshot(position, "take_profit") if position else None
+    if target["stop_loss"] is None:
+        target["stop_loss"] = _target_price_from_snapshot(position, "stop_loss") if position else None
+    return target
+
+def _price_near_target(price: float, target: float) -> bool:
+    tolerance = max(abs(target) * 0.001, 1e-8)
+    return abs(price - target) <= tolerance
+
+def _close_reason_from_exchange_close(
+    row: dict[str, Any],
+    *,
+    pnl: float | None,
+    history: dict[str, Any] | None = None,
+) -> str:
+    close_price = _history_close_price(history)
+    targets = _row_close_targets(row)
+    side = str(row.get("side") or "").strip().lower()
+    take_profit = targets.get("take_profit")
+    stop_loss = targets.get("stop_loss")
+    if close_price is not None:
+        if take_profit is not None and _price_near_target(close_price, take_profit):
+            return "take_profit"
+        if stop_loss is not None and _price_near_target(close_price, stop_loss):
+            return "stop_loss"
+        if side == "long":
+            if take_profit is not None and close_price >= take_profit:
+                return "take_profit"
+            if stop_loss is not None and close_price <= stop_loss:
+                return "stop_loss"
+        if side == "short":
+            if take_profit is not None and close_price <= take_profit:
+                return "take_profit"
+            if stop_loss is not None and close_price >= stop_loss:
+                return "stop_loss"
+    if pnl is not None:
+        return _close_reason_from_realized_pnl(pnl)
+    return "exchange_position_no_longer_open"
+
+
+def _payload_info(payload: dict[str, Any]) -> dict[str, Any]:
+    return payload.get("info", {}) if isinstance(payload.get("info"), dict) else {}
+
+
+def _history_symbol(row: dict[str, Any]) -> str:
+    info = _payload_info(row)
+    symbol = str(row.get("symbol") or "")
+    if symbol:
+        return symbol
+    inst_id = str(row.get("instId") or info.get("instId") or "")
+    if inst_id.endswith("-SWAP"):
+        parts = inst_id[:-5].split("-")
+        if len(parts) >= 2:
+            base = "-".join(parts[:-1])
+            quote = parts[-1]
+            return f"{base}/{quote}:{quote}"
+    return inst_id
+
+
+def _history_side(row: dict[str, Any]) -> str:
+    info = _payload_info(row)
+    side = str(row.get("side") or row.get("posSide") or row.get("direction") or info.get("posSide") or info.get("direction") or "").strip().lower()
+    return side.upper()
+
+
+def _history_pnl(row: dict[str, Any]) -> float | None:
+    info = _payload_info(row)
+    for key in ("realizedPnl", "realisedPnl", "netPnl", "netProfit"):
+        value = _float(row.get(key))
+        if value is not None:
+            return value
+    for key in ("realizedPnl", "realisedPnl", "netPnl", "netProfit"):
+        value = _float(info.get(key))
+        if value is not None:
+            return value
+    pnl = _float(row.get("pnl"))
+    if pnl is None:
+        pnl = _float(info.get("pnl"))
+    if pnl is None:
+        return None
+    adjustments = 0.0
+    adjusted = False
+    for payload in (row, info):
+        for key in ("fee", "fundingFee", "funding", "settledPnl"):
+            value = _float(payload.get(key))
+            if value is None:
+                continue
+            adjustments += value
+            adjusted = True
+    return round(pnl + adjustments, 6) if adjusted else pnl
+
+
+def _history_pnl_pct(row: dict[str, Any]) -> float | None:
+    info = _payload_info(row)
+    for key in ("percentage", "pnlRatio"):
+        value = _float(row.get(key))
+        if value is not None:
+            pct = value * 100 if abs(value) <= 5 else value
+            return round(pct, 6)
+    for key in ("pnlRatio", "uplRatio"):
+        value = _float(info.get(key))
+        if value is not None:
+            pct = value * 100 if abs(value) <= 5 else value
+            return round(pct, 6)
+    return None
+
+
+def _history_closed_at(row: dict[str, Any]) -> datetime | None:
+    info = _payload_info(row)
+    for key in ("lastUpdateTimestamp", "updatedAt", "closed_at", "closedAt"):
+        parsed = _parse_time(row.get(key))
+        if parsed is not None:
+            return parsed
+    for key in ("uTime", "cTime", "closeTime"):
+        parsed = _parse_time(row.get(key))
+        if parsed is not None:
+            return parsed
+    for key in ("uTime", "closeTime", "lastUpdateTimestamp"):
+        parsed = _parse_time(info.get(key))
+        if parsed is not None:
+            return parsed
+    for key in ("timestamp", "cTime"):
+        parsed = _parse_time(row.get(key))
+        if parsed is not None:
+            return parsed
+    parsed = _parse_time(info.get("cTime"))
+    if parsed is not None:
+        return parsed
+    return None
+
+
+def _row_payload(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("snapshot_json", "payload_json"):
+        raw = row.get(key)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _row_payload_by_key(row: dict[str, Any], key: str) -> dict[str, Any]:
+    raw = row.get(key)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _snapshot_position(row: dict[str, Any]) -> dict[str, Any]:
+    payload = _row_payload(row)
+    position = payload.get("position")
+    return position if isinstance(position, dict) else {}
+
+
+def _target_price_from_snapshot(position: dict[str, Any], close_reason: str) -> float | None:
+    info = _payload_info(position)
+    orders = info.get("closeOrderAlgo")
+    if isinstance(orders, str):
+        try:
+            orders = json.loads(orders)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            orders = []
+    key = "tpTriggerPx" if close_reason == "take_profit" else "slTriggerPx"
+    fallback_key = "tpOrdPx" if close_reason == "take_profit" else "slOrdPx"
+    if isinstance(orders, list):
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            value = _float(order.get(key) or order.get(fallback_key))
+            if value is not None:
+                return value
+    return None
+
+
+def _estimated_closed_pnl_from_snapshot(config: dict[str, Any], row: dict[str, Any], close_reason: str) -> tuple[float | None, float | None]:
+    position = _snapshot_position(row)
+    if not position:
+        return None, None
+    info = _payload_info(position)
+    entry = _float(row.get("entry_price") or position.get("entryPrice") or info.get("avgPx"))
+    close_price = _target_price_from_snapshot(position, close_reason)
+    contracts = abs(_safe_float(position.get("contracts") or info.get("pos"), 0.0))
+    contract_size = _safe_float(position.get("contractSize") or info.get("ctVal"), 1.0)
+    if entry is None or close_price is None or contracts <= 0 or contract_size <= 0:
+        return None, None
+    side = str(row.get("side") or position.get("side") or info.get("posSide") or "").lower()
+    gross = (close_price - entry) * contracts * contract_size
+    if side == "short":
+        gross = -gross
+    carried_realized = _safe_float(position.get("realizedPnl") or info.get("realizedPnl"), 0.0)
+    fee_rate = _safe_float(config.get("exchange", {}).get("close_fee_rate", config.get("exchange", {}).get("taker_fee_rate", 0.0005)), 0.0005)
+    estimated_close_fee = abs(close_price * contracts * contract_size) * max(0.0, fee_rate)
+    pnl = gross + carried_realized - estimated_close_fee
+    original_payload = _row_payload_by_key(row, "payload_json")
+    original_position = original_payload.get("position") if isinstance(original_payload.get("position"), dict) else {}
+    original_info = _payload_info(original_position) if original_position else {}
+    margin = _float(
+        original_position.get("initialMargin")
+        or original_info.get("imr")
+        or original_info.get("margin")
+        or position.get("initialMargin")
+        or info.get("imr")
+        or info.get("margin")
+    )
+    pnl_pct = pnl / margin * 100 if margin and margin > 0 else None
+    return round(pnl, 6), None if pnl_pct is None else round(pnl_pct, 6)
+
+
+def _matching_position_history(
+    row: dict[str, Any],
+    positions_history: list[dict[str, Any]],
+    snapshot_time: datetime,
+) -> dict[str, Any] | None:
+    key = _execution_key(row)
+    created_at = _parse_time(row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    target_time = (
+        _parse_time(row.get("closed_at"))
+        or _parse_time(row.get("updated_at"))
+        or snapshot_time
+    )
+    best: tuple[float, dict[str, Any]] | None = None
+    for history in positions_history:
+        if not isinstance(history, dict):
+            continue
+        if (_history_symbol(history), _history_side(history)) != key:
+            continue
+        closed_at = _history_closed_at(history)
+        if closed_at is None:
+            continue
+        if closed_at < created_at - timedelta(minutes=5):
+            continue
+        distance = abs((target_time - closed_at).total_seconds())
+        if best is None or distance < best[0]:
+            best = (distance, history)
+    return best[1] if best else None
+
+
+def _exchange_close_notification_key(row: dict[str, Any]) -> str:
+    return (
+        f"{EXCHANGE_CLOSE_NOTIFICATION_PREFIX}:"
+        f"{row.get('id')}:"
+        f"{row.get('closed_at') or row.get('updated_at') or ''}"
+    )
+
+
+def _close_stale_open_execution(
+    config: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    closed_at: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    return update_trade_execution(
+        config,
+        int(row["id"]),
+        {
+            "status": "RECONCILED",
+            "close_reason": reason,
+            "closed_at": closed_at,
+            "updated_at": closed_at,
+            "position_slot": None,
+        },
+    )
+
+
+def _notify_exchange_closed_execution(config: dict[str, Any], row: dict[str, Any]) -> None:
+    key = _exchange_close_notification_key(row)
+    if get_journal_state(config, key):
+        return
+    try:
+        from .notifier import send_telegram_message
+        from .reporting import format_trade_execution_close_message
+
+        sent = send_telegram_message(
+            config,
+            format_trade_execution_close_message(config, row),
+            with_buttons=False,
+            replace_previous=False,
+            allow_during_startup_quiet=True,
+        )
+        if sent:
+            set_journal_state(config, key, datetime.now(timezone.utc).isoformat())
+    except Exception:
+        pass
+
+def _manual_position_target_notification_key(event: dict[str, Any]) -> str:
+    return (
+        f"{MANUAL_POSITION_TARGET_NOTIFICATION_PREFIX}:"
+        f"{event.get('trade_execution_id') or '-'}:"
+        f"{event.get('symbol') or '-'}:"
+        f"{str(event.get('side') or '-').upper()}:"
+        f"{event.get('stop_loss') or '-'}:"
+        f"{event.get('take_profit') or '-'}"
+    )
+
+def _notify_manual_position_targets(config: dict[str, Any], event: dict[str, Any]) -> bool:
+    key = _manual_position_target_notification_key(event)
+    if get_journal_state(config, key):
+        return False
+    try:
+        from .notifier import send_telegram_message
+        from .reporting import format_manual_position_target_message
+
+        sent = send_telegram_message(
+            config,
+            format_manual_position_target_message(config, event),
+            with_buttons=False,
+            replace_previous=False,
+            allow_during_startup_quiet=True,
+        )
+        if sent:
+            set_journal_state(config, key, datetime.now(timezone.utc).isoformat())
+        return bool(sent)
+    except Exception:
+        return False
+
+def _value_changed(previous: float | None, current: float | None, *, tolerance: float = 1e-9) -> bool:
+    if previous is None or current is None:
+        return False
+    return abs(previous - current) > tolerance
+
+def _position_change_notification_key(prefix: str, event: dict[str, Any], *fields: str) -> str:
+    parts = [
+        prefix,
+        str(event.get("trade_execution_id") or "-"),
+        str(event.get("symbol") or "-"),
+        str(event.get("side") or "-").upper(),
+    ]
+    parts.extend(str(event.get(field) if event.get(field) is not None else "-") for field in fields)
+    return ":".join(parts)
+
+def _notify_position_quantity_changed(config: dict[str, Any], event: dict[str, Any]) -> bool:
+    key = _position_change_notification_key(
+        POSITION_QUANTITY_CHANGE_NOTIFICATION_PREFIX,
+        event,
+        "old_quantity",
+        "new_quantity",
+        "entry",
+    )
+    if get_journal_state(config, key):
+        return False
+    try:
+        from .notifier import send_telegram_message
+        from .reporting import format_position_quantity_change_message
+
+        sent = send_telegram_message(
+            config,
+            format_position_quantity_change_message(config, event),
+            with_buttons=False,
+            replace_previous=False,
+            allow_during_startup_quiet=True,
+        )
+        if sent:
+            set_journal_state(config, key, datetime.now(timezone.utc).isoformat())
+        return bool(sent)
+    except Exception:
+        return False
+
+def _notify_position_targets_changed(config: dict[str, Any], event: dict[str, Any]) -> bool:
+    key = _position_change_notification_key(
+        POSITION_TARGET_CHANGE_NOTIFICATION_PREFIX,
+        event,
+        "old_stop_loss",
+        "new_stop_loss",
+        "old_take_profit",
+        "new_take_profit",
+    )
+    if get_journal_state(config, key):
+        return False
+    try:
+        from .notifier import send_telegram_message
+        from .reporting import format_position_target_change_message
+
+        sent = send_telegram_message(
+            config,
+            format_position_target_change_message(config, event),
+            with_buttons=False,
+            replace_previous=False,
+            allow_during_startup_quiet=True,
+        )
+        if sent:
+            set_journal_state(config, key, datetime.now(timezone.utc).isoformat())
+        return bool(sent)
+    except Exception:
+        return False
+
+
+def _close_missing_exchange_execution(
+    config: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    closed_at: str,
+    history: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    pnl = _history_pnl(history or {}) if history else None
+    pnl = pnl if pnl is not None else _float(row.get("pnl"))
+    pnl_pct = _history_pnl_pct(history or {}) if history else None
+    close_reason = _close_reason_from_exchange_close(row, pnl=pnl, history=history)
+    if history is None and close_reason in {"take_profit", "stop_loss"}:
+        estimated_pnl, estimated_pct = _estimated_closed_pnl_from_snapshot(config, row, close_reason)
+        if estimated_pnl is not None:
+            pnl = estimated_pnl
+            pnl_pct = estimated_pct
+    history_closed_at = _history_closed_at(history or {}) if history else None
+    actual_closed_at = history_closed_at.isoformat() if history_closed_at else closed_at
+    payload = update_trade_execution(
+        config,
+        int(row["id"]),
+        {
+            "status": _status_from_realized_pnl(pnl),
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "close_reason": close_reason,
+            "closed_at": actual_closed_at,
+            "updated_at": closed_at,
+            "position_slot": None,
+            "exchange_close_source": "okx_positions_history" if history else "estimated_from_position_snapshot",
+            "exchange_close_history_json": json.dumps(to_jsonable(history), ensure_ascii=False) if history else None,
+        },
+    )
+    append_trade_execution_event(
+        config,
+        int(row["id"]),
+        {
+            "type": "exchange_close",
+            "created_at": closed_at,
+            "closed_at": actual_closed_at,
+            "status": _status_from_realized_pnl(pnl),
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "close_reason": close_reason,
+            "source": "okx_positions_history" if history else "estimated_from_position_snapshot",
+            "history": to_jsonable(history) if history else None,
+        },
+    )
+    if payload:
+        record_trade_memory_from_execution(config, payload, history=history)
+        _notify_exchange_closed_execution(config, payload)
+    return payload
+
+
+def _backfill_reconciled_exchange_close_notifications(
+    config: dict[str, Any],
+    now: datetime,
+    positions_history: list[dict[str, Any]] | None = None,
+) -> int:
+    max_age_hours = float(config.get("runtime_sync", {}).get("reconciled_close_backfill_hours", 24) or 24)
+    cutoff = now - timedelta(hours=max(0.0, max_age_hours))
+    notified = 0
+    rows = list_trade_execution_rows(config, statuses=["RECONCILED"], limit=200, order="closed_desc")
+    for row in rows:
+        if str(row.get("close_reason") or "") != "exchange_position_no_longer_open":
+            continue
+        closed_at = _parse_time(row.get("closed_at") or row.get("updated_at"))
+        if closed_at is not None and closed_at < cutoff:
+            continue
+        history = _matching_position_history(row, positions_history or [], now)
+        pnl = _history_pnl(history or {}) if history else None
+        pnl = pnl if pnl is not None else _float(row.get("pnl"))
+        pnl_pct = _history_pnl_pct(history or {}) if history else None
+        history_closed_at = _history_closed_at(history or {}) if history else None
+        close_reason = _close_reason_from_exchange_close(row, pnl=pnl, history=history)
+        payload = update_trade_execution(
+            config,
+            int(row["id"]),
+            {
+                "status": _status_from_realized_pnl(pnl),
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "close_reason": close_reason,
+                "closed_at": history_closed_at.isoformat() if history_closed_at else row.get("closed_at"),
+                "exchange_close_source": "okx_positions_history" if history else "runtime_sync",
+                "exchange_close_history_json": json.dumps(to_jsonable(history), ensure_ascii=False) if history else row.get("exchange_close_history_json"),
+                "updated_at": now.isoformat(),
+                "position_slot": None,
+            },
+        )
+        append_trade_execution_event(
+            config,
+            int(row["id"]),
+            {
+                "type": "exchange_close_backfill",
+                "created_at": now.isoformat(),
+                "closed_at": history_closed_at.isoformat() if history_closed_at else row.get("closed_at"),
+                "status": _status_from_realized_pnl(pnl),
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "close_reason": close_reason,
+                "source": "okx_positions_history" if history else "runtime_sync",
+                "history": to_jsonable(history) if history else None,
+            },
+        )
+        if payload:
+            record_trade_memory_from_execution(config, payload, history=history)
+            before = get_journal_state(config, _exchange_close_notification_key(payload))
+            _notify_exchange_closed_execution(config, payload)
+            after = get_journal_state(config, _exchange_close_notification_key(payload))
+            if not before and after:
+                notified += 1
+    return notified
+
+
+def _correct_recent_exchange_closes_from_history(
+    config: dict[str, Any],
+    now: datetime,
+    positions_history: list[dict[str, Any]] | None,
+) -> int:
+    max_age_hours = float(config.get("runtime_sync", {}).get("exchange_close_pnl_correction_hours", 24) or 24)
+    cutoff = now - timedelta(hours=max(0.0, max_age_hours))
+    corrected = 0
+    rows = list_trade_execution_rows(config, statuses=["WIN", "LOSS", "BREAKEVEN", "CLOSED"], limit=200, order="closed_desc")
+    for row in rows:
+        reason = str(row.get("close_reason") or "")
+        if reason not in {"stop_loss", "take_profit", "exchange_position_no_longer_open", "manual"}:
+            continue
+        closed_at = _parse_time(row.get("closed_at") or row.get("updated_at"))
+        if closed_at is not None and closed_at < cutoff:
+            continue
+        history = _matching_position_history(row, positions_history, now)
+        pnl = _history_pnl(history) if history else None
+        pnl_pct = _history_pnl_pct(history) if history else None
+        close_reason = _close_reason_from_exchange_close(row, pnl=pnl, history=history)
+        source = "okx_positions_history" if history else "runtime_sync"
+        if pnl is None:
+            estimate_reason = close_reason if close_reason in {"take_profit", "stop_loss"} else reason
+            if estimate_reason in {"take_profit", "stop_loss"}:
+                pnl, pnl_pct = _estimated_closed_pnl_from_snapshot(config, row, estimate_reason)
+                source = "estimated_from_position_snapshot"
+        if pnl is None:
+            continue
+        current_pnl = _float(row.get("pnl"))
+        history_closed_at = _history_closed_at(history) if history else None
+        updates: dict[str, Any] = {
+            "status": _status_from_realized_pnl(pnl),
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "close_reason": close_reason,
+            "closed_at": history_closed_at.isoformat() if history_closed_at else row.get("closed_at"),
+            "updated_at": now.isoformat(),
+            "exchange_close_source": source,
+            "exchange_close_history_json": json.dumps(to_jsonable(history), ensure_ascii=False) if history else row.get("exchange_close_history_json"),
+            "position_slot": None,
+        }
+        current_pct = _float(row.get("pnl_pct"))
+        pct_changed = (
+            pnl_pct is not None
+            and (current_pct is None or abs(current_pct - pnl_pct) > 1e-9)
+        )
+        reason_changed = reason != close_reason
+        if current_pnl is None or abs(current_pnl - pnl) > 1e-9 or pct_changed or reason_changed:
+            payload = update_trade_execution(config, int(row["id"]), updates)
+            append_trade_execution_event(
+                config,
+                int(row["id"]),
+                {
+                    "type": "exchange_close_correction",
+                    "created_at": now.isoformat(),
+                    "closed_at": updates.get("closed_at"),
+                    "previous_pnl": current_pnl,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "close_reason": close_reason,
+                    "source": source,
+                    "history": to_jsonable(history) if history else None,
+                },
+            )
+            if payload:
+                record_trade_memory_from_execution(config, payload, history=history)
+            corrected += 1
+    return corrected
+
+
+def _retry_unnotified_exchange_closes(config: dict[str, Any], now: datetime) -> int:
+    max_age_hours = float(config.get("runtime_sync", {}).get("exchange_close_notification_retry_hours", 24) or 24)
+    cutoff = now - timedelta(hours=max(0.0, max_age_hours))
+    retried = 0
+    rows = list_trade_execution_rows(config, statuses=["WIN", "LOSS", "BREAKEVEN", "CLOSED"], limit=200, order="closed_desc")
+    for row in rows:
+        reason = str(row.get("close_reason") or "")
+        if reason not in {"stop_loss", "take_profit", "exchange_position_no_longer_open"}:
+            continue
+        closed_at = _parse_time(row.get("closed_at") or row.get("updated_at"))
+        if closed_at is not None and closed_at < cutoff:
+            continue
+        key = _exchange_close_notification_key(row)
+        if get_journal_state(config, key):
+            continue
+        _notify_exchange_closed_execution(config, row)
+        if get_journal_state(config, key):
+            retried += 1
+    return retried
+
+
+def _position_side(position: dict[str, Any]) -> str:
+    info = position.get("info", {}) if isinstance(position.get("info"), dict) else {}
+    side = position.get("side") or info.get("posSide")
+    if side and side != "net":
+        return str(side).lower()
+    contracts = _float(position.get("contracts") or info.get("pos")) or 0
+    if contracts > 0:
+        return "long"
+    if contracts < 0:
+        return "short"
+    return "long"
+
+
+def _order_side(order: dict[str, Any]) -> str:
+    raw_side = str(order.get("side") or "").lower()
+    return "long" if raw_side == "buy" else "short" if raw_side == "sell" else raw_side
+
+
+def _order_client_id(order: dict[str, Any]) -> str:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    return str(order.get("clientOrderId") or info.get("clOrdId") or "").strip()
+
+
+def _order_exchange_id(order: dict[str, Any]) -> str:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    return str(order.get("id") or info.get("ordId") or "").strip()
+
+
+def _base_symbol(symbol: str) -> str:
+    return str(symbol or "").split("/")[0].split("-")[0].upper()
+
+
+def _tp_sl_from_order(order: dict[str, Any]) -> tuple[float | None, float | None]:
+    raw = order.get("raw") if isinstance(order.get("raw"), dict) else {}
+    stop_loss = None
+    take_profit = None
+    attach_orders = raw.get("attachAlgoOrds")
+    if isinstance(attach_orders, str):
+        try:
+            attach_orders = json.loads(attach_orders)
+        except json.JSONDecodeError:
+            attach_orders = []
+    if isinstance(attach_orders, list):
+        for item in attach_orders:
+            if not isinstance(item, dict):
+                continue
+            if stop_loss is None:
+                stop_loss = _float(item.get("slTriggerPx") or item.get("slOrdPx"))
+            if take_profit is None:
+                take_profit = _float(item.get("tpTriggerPx") or item.get("tpOrdPx"))
+    return stop_loss, take_profit
+
+
+def _symbol_from_inst_id(exchange: Any, inst_id: str) -> str:
+    if not inst_id:
+        return ""
+    markets_by_id = getattr(exchange, "markets_by_id", {}) or {}
+    market = markets_by_id.get(inst_id)
+    if isinstance(market, list):
+        market = market[0] if market else None
+    if isinstance(market, dict) and market.get("symbol"):
+        return str(market["symbol"])
+    if inst_id.endswith("-SWAP"):
+        parts = inst_id[:-5].split("-")
+        if len(parts) >= 2:
+            base = "-".join(parts[:-1])
+            quote = parts[-1]
+            return f"{base}/{quote}:{quote}"
+    return inst_id
+
+
+def _side_from_algo(row: dict[str, Any]) -> str:
+    pos_side = str(row.get("posSide") or "").strip().lower()
+    if pos_side in {"long", "short"}:
+        return pos_side
+    raw_side = str(row.get("side") or "").strip().lower()
+    return "long" if raw_side == "sell" else "short" if raw_side == "buy" else raw_side
+
+
+def _target_from_algo_payload(payload: dict[str, Any]) -> dict[str, float | None]:
+    return {
+        "stop_loss": _float(payload.get("slTriggerPx") or payload.get("slOrdPx")),
+        "take_profit": _float(payload.get("tpTriggerPx") or payload.get("tpOrdPx")),
+    }
+
+
+def _target_from_position_close_algo(info: dict[str, Any]) -> dict[str, float | None]:
+    close_orders = info.get("closeOrderAlgo") if isinstance(info, dict) else None
+    if isinstance(close_orders, str):
+        try:
+            close_orders = json.loads(close_orders)
+        except json.JSONDecodeError:
+            close_orders = []
+    target = {"stop_loss": None, "take_profit": None}
+    if not isinstance(close_orders, list):
+        return target
+    for item in close_orders:
+        if not isinstance(item, dict):
+            continue
+        item_target = _target_from_algo_payload(item)
+        if target["stop_loss"] is None:
+            target["stop_loss"] = item_target.get("stop_loss")
+        if target["take_profit"] is None:
+            target["take_profit"] = item_target.get("take_profit")
+        if target["stop_loss"] is not None and target["take_profit"] is not None:
+            break
+    return target
+
+def _pending_algo_targets(exchange: Any) -> dict[tuple[str, str], dict[str, float | None]]:
+    fetch_algos = getattr(exchange, "privateGetTradeOrdersAlgoPending", None)
+    if not callable(fetch_algos):
+        fetch_algos = getattr(exchange, "private_get_trade_orders_algo_pending", None)
+    if not callable(fetch_algos):
+        return {}
+    targets: dict[tuple[str, str], dict[str, float | None]] = {}
+    seen: set[str] = set()
+    for ord_type in ("oco", "conditional", "trigger"):
+        try:
+            response = fetch_algos({"ordType": ord_type})
+        except Exception:
+            continue
+        rows = response.get("data") if isinstance(response, dict) else response
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("algoId") or f"{row.get('instId')}:{row.get('ordType')}:{row.get('side')}:{row.get('posSide')}")
+            if key in seen:
+                continue
+            seen.add(key)
+            symbol = _symbol_from_inst_id(exchange, str(row.get("instId") or ""))
+            side = _side_from_algo(row)
+            if not symbol or side not in {"long", "short"}:
+                continue
+            target = _target_from_algo_payload(row)
+            if target.get("stop_loss") is None and target.get("take_profit") is None:
+                continue
+            current = targets.setdefault((symbol, side.upper()), {"stop_loss": None, "take_profit": None})
+            current["stop_loss"] = current.get("stop_loss") or target.get("stop_loss")
+            current["take_profit"] = current.get("take_profit") or target.get("take_profit")
+    return targets
+
+
+def _strategy_target_settings(config: dict[str, Any]) -> dict[str, float]:
+    strategy = config.get("strategy", {}) if isinstance(config.get("strategy"), dict) else {}
+    target = strategy.get("target", {}) if isinstance(strategy.get("target"), dict) else {}
+    leverage = max(1.0, _safe_float(config.get("exchange", {}).get("leverage"), 1.0))
+    stop_roi_pct = _safe_float(target.get("stop_loss_pct"), 50.0)
+    take_roi_pct = _safe_float(target.get("take_profit_pct"), 75.0)
+    rr = take_roi_pct / stop_roi_pct if stop_roi_pct > 0 else _safe_float(strategy.get("min_risk_reward"), 1.5)
+    return {
+        "leverage": leverage,
+        "stop_price_pct": stop_roi_pct / leverage,
+        "take_price_pct": take_roi_pct / leverage,
+        "risk_reward": max(0.01, rr or 1.5),
+    }
+
+def _manual_target_settings(config: dict[str, Any]) -> dict[str, float | bool | str]:
+    raw = config.get("manual_position_targets", {}) if isinstance(config.get("manual_position_targets"), dict) else {}
+    fallback = _strategy_target_settings(config)
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "risk_reward": max(0.01, _safe_float(raw.get("risk_reward"), fallback["risk_reward"])),
+        "extended_risk_reward": max(0.01, _safe_float(raw.get("extended_risk_reward"), 1.75)),
+        "extended_requires_unrealized_pnl_non_negative": bool(raw.get("extended_requires_unrealized_pnl_non_negative", True)),
+        "extended_max_atr_pct": max(0.0, _safe_float(raw.get("extended_max_atr_pct"), 2.5)),
+        "trend_fast_ema": max(1.0, _safe_float(raw.get("trend_fast_ema"), 34.0)),
+        "trend_slow_ema": max(1.0, _safe_float(raw.get("trend_slow_ema"), 89.0)),
+        "default_stop_distance_pct": max(0.01, _safe_float(raw.get("default_stop_distance_pct"), 3.0)),
+        "medium_volatility_stop_distance_pct": max(0.01, _safe_float(raw.get("medium_volatility_stop_distance_pct"), 4.0)),
+        "high_volatility_stop_distance_pct": max(0.01, _safe_float(raw.get("high_volatility_stop_distance_pct"), 5.0)),
+        "medium_volatility_atr_pct": max(0.0, _safe_float(raw.get("medium_volatility_atr_pct"), 1.5)),
+        "high_volatility_atr_pct": max(0.0, _safe_float(raw.get("high_volatility_atr_pct"), 3.0)),
+        "atr_timeframe": str(raw.get("atr_timeframe") or "15m"),
+        "atr_period": max(1.0, _safe_float(raw.get("atr_period"), 14.0)),
+        "ohlcv_limit": max(20.0, _safe_float(raw.get("ohlcv_limit"), 80.0)),
+    }
+
+def _ema(values: list[float], period: int) -> float | None:
+    if period <= 0 or len(values) < period:
+        return None
+    alpha = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period
+    for value in values[period:]:
+        ema = value * alpha + ema * (1.0 - alpha)
+    return ema
+
+def _manual_stop_distance_pct(config: dict[str, Any], volatility_pct: float | None = None) -> float:
+    settings = _manual_target_settings(config)
+    stop_pct = float(settings["default_stop_distance_pct"])
+    atr_pct = _float(volatility_pct)
+    if atr_pct is None:
+        return stop_pct
+    if atr_pct >= float(settings["high_volatility_atr_pct"]):
+        return float(settings["high_volatility_stop_distance_pct"])
+    if atr_pct >= float(settings["medium_volatility_atr_pct"]):
+        return float(settings["medium_volatility_stop_distance_pct"])
+    return stop_pct
+
+def _atr_volatility_pct(exchange: Any, config: dict[str, Any], symbol: str) -> float | None:
+    context = _manual_market_context(exchange, config, symbol)
+    return _float(context.get("atr_pct")) if context else None
+
+def _manual_market_context(exchange: Any, config: dict[str, Any], symbol: str) -> dict[str, float | None]:
+    fetch_ohlcv = getattr(exchange, "fetch_ohlcv", None)
+    if not callable(fetch_ohlcv):
+        return {}
+    settings = _manual_target_settings(config)
+    period = int(settings["atr_period"])
+    slow_period = int(settings["trend_slow_ema"])
+    limit = max(period + 1, slow_period + 5, int(settings["ohlcv_limit"]))
+    try:
+        rows = fetch_ohlcv(symbol, timeframe=str(settings["atr_timeframe"]), limit=limit)
+    except Exception:
+        return {}
+    if not isinstance(rows, list) or len(rows) < period + 1:
+        return {}
+    true_ranges: list[float] = []
+    closes: list[float] = []
+    previous_close: float | None = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        high = _float(row[2])
+        low = _float(row[3])
+        close = _float(row[4])
+        if high is None or low is None or close is None:
+            continue
+        closes.append(close)
+        if previous_close is None:
+            true_range = high - low
+        else:
+            true_range = max(high - low, abs(high - previous_close), abs(low - previous_close))
+        if true_range >= 0:
+            true_ranges.append(true_range)
+        previous_close = close
+    if len(true_ranges) < period or previous_close is None or previous_close <= 0:
+        return {}
+    atr = sum(true_ranges[-period:]) / period
+    fast_ema = _ema(closes, int(settings["trend_fast_ema"]))
+    slow_ema = _ema(closes, slow_period)
+    return {
+        "atr_pct": atr / previous_close * 100.0,
+        "fast_ema": fast_ema,
+        "slow_ema": slow_ema,
+        "last_close": previous_close,
+    }
+
+def _manual_rr_decision(
+    config: dict[str, Any],
+    *,
+    side: str,
+    unrealized_pnl: float | None,
+    market_context: dict[str, float | None] | None,
+) -> dict[str, Any]:
+    settings = _manual_target_settings(config)
+    base_rr = float(settings["risk_reward"])
+    extended_rr = float(settings["extended_risk_reward"])
+    reasons: list[str] = []
+    atr_pct = _float((market_context or {}).get("atr_pct"))
+    fast_ema = _float((market_context or {}).get("fast_ema"))
+    slow_ema = _float((market_context or {}).get("slow_ema"))
+    trend_ok = False
+    if fast_ema is not None and slow_ema is not None:
+        trend_ok = fast_ema >= slow_ema if side == "long" else fast_ema <= slow_ema
+        reasons.append("trend_ema_aligned" if trend_ok else "trend_ema_not_aligned")
+    else:
+        reasons.append("trend_unavailable")
+    pnl_ok = True
+    if bool(settings["extended_requires_unrealized_pnl_non_negative"]):
+        pnl_ok = unrealized_pnl is not None and unrealized_pnl >= 0
+        reasons.append("pnl_non_negative" if pnl_ok else "pnl_negative_or_unavailable")
+    atr_ok = atr_pct is not None and atr_pct <= float(settings["extended_max_atr_pct"])
+    reasons.append("atr_ok_for_extended_rr" if atr_ok else "atr_too_high_or_unavailable")
+    use_extended = trend_ok and pnl_ok and atr_ok and extended_rr > base_rr
+    return {
+        "risk_reward": extended_rr if use_extended else base_rr,
+        "mode": "extended" if use_extended else "base",
+        "reasons": reasons,
+        "atr_pct": atr_pct,
+        "fast_ema": fast_ema,
+        "slow_ema": slow_ema,
+    }
+
+def _manual_position_targets(
+    config: dict[str, Any],
+    *,
+    side: str,
+    entry: float | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+    volatility_pct: float | None = None,
+    unrealized_pnl: float | None = None,
+    market_context: dict[str, float | None] | None = None,
+) -> dict[str, Any]:
+    if entry is None or entry <= 0:
+        return {"stop_loss": stop_loss, "take_profit": take_profit, "risk_reward": None}
+    rr_decision = _manual_rr_decision(config, side=side, unrealized_pnl=unrealized_pnl, market_context=market_context)
+    rr = float(rr_decision["risk_reward"])
+    if stop_loss is not None and take_profit is None:
+        risk = abs(entry - stop_loss)
+        take_profit = entry + risk * rr if side == "long" else entry - risk * rr
+    elif take_profit is not None and stop_loss is None:
+        reward = abs(take_profit - entry)
+        risk = reward / rr
+        stop_loss = entry - risk if side == "long" else entry + risk
+    elif stop_loss is None and take_profit is None:
+        stop_pct = _manual_stop_distance_pct(config, volatility_pct)
+        stop_move = entry * stop_pct / 100.0
+        take_move = stop_move * rr
+        stop_loss = entry - stop_move if side == "long" else entry + stop_move
+        take_profit = entry + take_move if side == "long" else entry - take_move
+    risk = abs(entry - stop_loss) if stop_loss is not None else None
+    reward = abs(take_profit - entry) if take_profit is not None else None
+    actual_rr = reward / risk if risk and reward is not None else None
+    return {
+        "stop_loss": None if stop_loss is None else round(stop_loss, 8),
+        "take_profit": None if take_profit is None else round(take_profit, 8),
+        "risk_reward": None if actual_rr is None else round(actual_rr, 6),
+        "rr_mode": rr_decision.get("mode"),
+        "rr_reasons": rr_decision.get("reasons"),
+    }
+
+def _price_to_precision(exchange: Any, symbol: str, price: float) -> str:
+    method = getattr(exchange, "price_to_precision", None)
+    if callable(method):
+        return str(method(symbol, price))
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+def _amount_to_precision(exchange: Any, symbol: str, amount: float) -> str:
+    method = getattr(exchange, "amount_to_precision", None)
+    if callable(method):
+        return str(method(symbol, amount))
+    return f"{amount:.8f}".rstrip("0").rstrip(".")
+
+def _okx_algo_response_error(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    code = str(response.get("code") or "0")
+    rows = response.get("data")
+    row_errors: list[str] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            s_code = str(row.get("sCode") or "0")
+            if s_code != "0":
+                message = str(row.get("sMsg") or "").strip()
+                row_errors.append(f"{s_code}: {message}" if message else s_code)
+    if code != "0" or row_errors:
+        message = str(response.get("msg") or "").strip()
+        details = "; ".join(row_errors)
+        return "; ".join(item for item in [f"code={code}" if code != "0" else "", message, details] if item)
+    return None
+
+def _place_missing_position_targets(
+    exchange: Any,
+    config: dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+    contracts: float,
+    stop_loss: float | None,
+    take_profit: float | None,
+    existing_stop_loss: float | None,
+    existing_take_profit: float | None,
+    td_mode: str | None = None,
+) -> dict[str, Any]:
+    missing_sl = existing_stop_loss is None and stop_loss is not None
+    missing_tp = existing_take_profit is None and take_profit is not None
+    if not missing_sl and not missing_tp:
+        return {"submitted": False, "reason": "targets already present"}
+    place_algo = getattr(exchange, "privatePostTradeOrderAlgo", None)
+    if not callable(place_algo):
+        place_algo = getattr(exchange, "private_post_trade_order_algo", None)
+    if not callable(place_algo):
+        return {"submitted": False, "error": "OKX order algo endpoint is unavailable"}
+    market = exchange.market(symbol) if hasattr(exchange, "market") else {"id": symbol}
+    inst_id = str(market.get("id") or symbol)
+    trigger_type = str(config.get("trailing_stop", {}).get("trigger_price_type") or "last")
+    payload: dict[str, Any] = {
+        "instId": inst_id,
+        "tdMode": str(td_mode or config.get("exchange", {}).get("td_mode", "isolated")),
+        "side": "sell" if side == "long" else "buy",
+        "ordType": "oco" if missing_sl and missing_tp else "conditional",
+        "sz": _amount_to_precision(exchange, symbol, contracts),
+    }
+    if config.get("exchange", {}).get("position_side_mode") == "long_short":
+        payload["posSide"] = side
+    if missing_sl and stop_loss is not None:
+        payload.update({"slTriggerPx": _price_to_precision(exchange, symbol, stop_loss), "slOrdPx": "-1", "slTriggerPxType": trigger_type})
+    if missing_tp and take_profit is not None:
+        payload.update({"tpTriggerPx": _price_to_precision(exchange, symbol, take_profit), "tpOrdPx": "-1", "tpTriggerPxType": trigger_type})
+    variants = [dict(payload)]
+    for retry_td_mode in ("cross", "isolated"):
+        retry = dict(payload)
+        retry["tdMode"] = retry_td_mode
+        variants.append(retry)
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    last_exc: Exception | None = None
+    for request_payload in variants:
+        key = tuple(sorted((str(item_key), str(item_value)) for item_key, item_value in request_payload.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            response = place_algo(request_payload)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        response_error = _okx_algo_response_error(response)
+        if response_error:
+            last_exc = RuntimeError(response_error)
+            continue
+        return {"submitted": True, "request": request_payload, "response": response}
+    return {
+        "submitted": False,
+        "request": payload,
+        "attempted_requests": variants,
+        "error": str(last_exc or "OKX order algo was not submitted"),
+    }
+
+def _fetch_positions_history(exchange: Any, limit: int = 100) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_rows(rows: Any) -> None:
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            info = _payload_info(row)
+            key = str(row.get("id") or row.get("posId") or info.get("posId") or info.get("uTime") or info.get("cTime") or row)
+            if key in seen:
+                continue
+            seen.add(key)
+            history.append(row)
+
+    fetch_history = getattr(exchange, "fetch_positions_history", None)
+    if callable(fetch_history):
+        try:
+            add_rows(fetch_history(None, None, limit))
+        except Exception:
+            pass
+
+    fetch_raw = getattr(exchange, "privateGetAccountPositionsHistory", None)
+    if not callable(fetch_raw):
+        fetch_raw = getattr(exchange, "private_get_account_positions_history", None)
+    if callable(fetch_raw):
+        try:
+            response = fetch_raw({"instType": "SWAP", "limit": str(limit)})
+            rows = response.get("data") if isinstance(response, dict) else response
+            add_rows(rows)
+        except Exception:
+            pass
+
+    return history
+
+
+def _fallback_take_profit(entry: float, side: str, pct: float) -> float:
+    move = entry * max(0.0, pct) / 100.0
+    return entry + move if side == "long" else entry - move
+
+
+def _fallback_stop_loss(entry: float, side: str, pct: float) -> float:
+    move = entry * max(0.0, pct) / 100.0
+    return entry - move if side == "long" else entry + move
+
+
+def _candidate_from_open_order(config: dict[str, Any], order: dict[str, Any]) -> TradeCandidate:
+    symbol = str(order.get("symbol") or "")
+    side = _order_side(order) or "long"
+    price = _safe_float(order.get("price") or order.get("triggerPrice") or order.get("last"), 0.0)
+    amount = _safe_float(order.get("remaining") or order.get("amount"), 0.0)
+    stop_loss, take_profit = _tp_sl_from_order(order)
+    stop_loss = stop_loss if stop_loss is not None else _fallback_stop_loss(price, side, 2.0)
+    take_profit = take_profit if take_profit is not None else _fallback_take_profit(price, side, 3.0)
+    leverage = max(1.0, _safe_float(config.get("exchange", {}).get("leverage"), 1.0))
+    notional = price * amount
+    order_usdt = notional / leverage if leverage else notional
+    return TradeCandidate(
+        symbol=symbol,
+        base=_base_symbol(symbol),
+        side=side,  # type: ignore[arg-type]
+        confidence=0.0,
+        entry=price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        risk_reward=0.0,
+        order_usdt=order_usdt,
+        quantity=amount,
+        spread_pct=None,
+        news_score=0.0,
+        news_count=0,
+        scan_source="okx_runtime_sync",
+        decision_metadata={"source": "okx_open_order_sync"},
+    )
+
+
+def _candidate_from_pending_row(row: dict[str, Any]) -> TradeCandidate | None:
+    try:
+        payload = json.loads(str(row.get("payload_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    candidate = candidate_from_payload(payload)
+    if not candidate.symbol or candidate.side not in {"long", "short"}:
+        return None
+    return candidate
+
+
+def _mini_pending_placeholder_candidate(row: dict[str, Any]) -> TradeCandidate | None:
+    if str(row.get("exchange_order_id") or ""):
+        return None
+    candidate = _candidate_from_pending_row(row)
+    if candidate is None:
+        return None
+    metadata = candidate.decision_metadata
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("mini_setup"), dict):
+        return None
+    review = metadata.get("okx_review")
+    if not isinstance(review, dict) or not bool(review.get("accepted_for_okx")):
+        return None
+    return candidate
+
+
+def _fetch_account_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    exchange = create_exchange(config, authenticated=True)
+    exchange.load_markets()
+    positions = list(exchange.fetch_positions() or [])
+    open_orders = list(exchange.fetch_open_orders() or [])
+    positions_history = _fetch_positions_history(exchange, 100)
+    return {
+        "enabled": True,
+        "mode": config.get("mode"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "_exchange": exchange,
+        "positions": positions,
+        "open_orders": open_orders,
+        "position_targets": _pending_algo_targets(exchange),
+        "positions_history": positions_history,
+    }
+
+
+def sync_ai_runtime_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    prompt_row = ensure_prompt_version(config)
+    prompt_version = str(prompt_row.get("version") or "prompt-v1")
+    prompt_hash = str(prompt_row.get("prompt_hash") or "")
+    seeded_models: list[str] = []
+    internal_model = str(config.get("ai", {}).get("internal", {}).get("model") or "").strip()
+    okx_model = str(config.get("ai", {}).get("okx", {}).get("model") or "").strip()
+    now = datetime.now(timezone.utc).isoformat()
+    for model_name in [internal_model, okx_model]:
+        if not model_name:
+            continue
+        ensure_ai_model_version(
+            config,
+            model_name=model_name,
+            model_version=model_name,
+            prompt_version=prompt_version,
+            prompt_hash=prompt_hash,
+            created_at=now,
+        )
+        seeded_models.append(model_name)
+    prompt_metric = get_prompt_metric(config, prompt_version)
+    seeded_prompt_metric = False
+    if prompt_metric is None:
+        status = prompt_status(config)
+        save_prompt_metric_snapshot(
+            config,
+            {
+                "prompt_version": prompt_version,
+                "prompt_hash": prompt_hash,
+                "total_requests": 0,
+                "average_prompt_tokens": 0,
+                "average_completion_tokens": 0,
+                "average_latency": 0,
+                "estimated_cached_tokens": status.get("estimatedStaticTokens") or 0,
+                "estimated_dynamic_tokens": status.get("estimatedDynamicTokens") or 0,
+                "cache_hit_percent": status.get("estimatedCacheHit") or 0,
+                "updated_at": now,
+                "source": "config_seed",
+                "notes": "No successful OpenAI usage recorded yet; seeded from current prompt configuration.",
+            },
+        )
+        seeded_prompt_metric = True
+    return {
+        "prompt_version": prompt_version,
+        "models_seeded": seeded_models,
+        "seeded_prompt_metric": seeded_prompt_metric,
+    }
+
+
+def sync_exchange_runtime_state(
+    config: dict[str, Any],
+    *,
+    account_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if config.get("mode") == "dry_run":
+        return {"enabled": False, "reason": "dry_run", "positions_synced": 0, "orders_synced": 0}
+    snapshot = account_snapshot or _fetch_account_snapshot(config)
+    reclassified_executions = reclassify_unknown_trade_closures(config)
+    created_at = str(snapshot.get("created_at") or datetime.now(timezone.utc).isoformat())
+    snapshot_time = _parse_time(created_at) or datetime.now(timezone.utc)
+    positions_history = [item for item in (snapshot.get("positions_history") or []) if isinstance(item, dict)]
+    exchange = snapshot.get("_exchange")
+    corrected_close_pnls = _correct_recent_exchange_closes_from_history(config, snapshot_time, positions_history)
+    backfilled_close_notifications = _backfill_reconciled_exchange_close_notifications(config, snapshot_time, positions_history)
+    retried_close_notifications = _retry_unnotified_exchange_closes(config, snapshot_time)
+    position_rows = [item for item in (snapshot.get("positions") or []) if isinstance(item, dict)]
+    open_orders = [item for item in (snapshot.get("open_orders") or []) if isinstance(item, dict)]
+    position_targets = snapshot.get("position_targets") if isinstance(snapshot.get("position_targets"), dict) else {}
+    active_pending = list_pending_orders(config, status="ACTIVE", limit=1000)
+    pending_by_exchange_id = {
+        str(row.get("exchange_order_id") or ""): row
+        for row in active_pending
+        if str(row.get("exchange_order_id") or "")
+    }
+    mini_placeholders_by_client_id: dict[str, tuple[dict[str, Any], TradeCandidate]] = {}
+    for row in active_pending:
+        placeholder_candidate = _mini_pending_placeholder_candidate(row)
+        if placeholder_candidate is None:
+            continue
+        expected_client_id = candidate_client_order_id(
+            placeholder_candidate,
+            entry_type="mini_lc_okx",
+        )
+        if expected_client_id:
+            mini_placeholders_by_client_id[expected_client_id] = (row, placeholder_candidate)
+    orders_synced = 0
+    for order in open_orders:
+        exchange_order_id = _order_exchange_id(order)
+        if not exchange_order_id:
+            continue
+        candidate = _candidate_from_open_order(config, order)
+        existing = pending_by_exchange_id.get(exchange_order_id)
+        if existing:
+            stored_candidate = _candidate_from_pending_row(existing)
+            refresh_candidate = stored_candidate or candidate
+            if candidate.quantity and candidate.quantity > 0:
+                refresh_candidate.quantity = candidate.quantity
+            refresh_pending_order(
+                config,
+                int(existing["id"]),
+                refresh_candidate,
+                status="LC_OKX",
+                max_age_days=float(config.get("pending_orders", {}).get("exchange_max_age_days", 1.5) or 1.5),
+            )
+        else:
+            placeholder = mini_placeholders_by_client_id.pop(_order_client_id(order), None)
+            if placeholder:
+                placeholder_row, placeholder_candidate = placeholder
+                set_pending_order_exchange_order(
+                    config,
+                    int(placeholder_row["id"]),
+                    placeholder_candidate,
+                    exchange_order_id,
+                    max_age_days=float(
+                        config.get("pending_orders", {}).get("exchange_max_age_days", 1.5) or 1.5
+                    ),
+                )
+            else:
+                save_pending_order(
+                    config,
+                    candidate,
+                    exchange_order_id,
+                    status="LC_OKX",
+                    max_age_days=float(
+                        config.get("pending_orders", {}).get("exchange_max_age_days", 1.5) or 1.5
+                    ),
+                )
+        orders_synced += 1
+
+    open_execution_rows = list_trade_execution_rows(config, statuses=["OPEN"], limit=1000)
+    executions_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in open_execution_rows:
+        key = _execution_key(row)
+        if all(key):
+            executions_by_key.setdefault(key, []).append(row)
+
+    active_position_keys: set[tuple[str, str]] = set()
+    matched_execution_ids: set[int] = set()
+    reopened_execution_ids: set[int] = set()
+    positions_synced = 0
+    manual_positions_imported = 0
+    position_targets_submitted = 0
+    position_target_errors = 0
+    next_slot = 1
+    for position in position_rows:
+        info = position.get("info", {}) if isinstance(position.get("info"), dict) else {}
+        contracts = abs(_safe_float(position.get("contracts") or info.get("pos"), 0.0))
+        if contracts <= 0:
+            continue
+        symbol = str(position.get("symbol") or info.get("instId") or "")
+        side = _position_side(position)
+        if not symbol or side not in {"long", "short"}:
+            continue
+        position_id, position_opened_key = _position_identity(position)
+        position_margin_mode = _position_margin_mode(position)
+        position_key = (symbol, side.upper())
+        active_position_keys.add(position_key)
+        entry_price = _float(position.get("entry_price") or position.get("entryPrice") or info.get("avgPx"))
+        mark_price = _float(position.get("mark_price") or position.get("markPrice") or info.get("markPx"))
+        leverage = _safe_float(position.get("leverage") or info.get("lever"), _strategy_target_settings(config).get("leverage", 1.0))
+        stop_loss = _float(position.get("stop_loss"))
+        take_profit = _float(position.get("take_profit"))
+        position_close_target = _target_from_position_close_algo(info)
+        if stop_loss is None:
+            stop_loss = _float(position_close_target.get("stop_loss"))
+        if take_profit is None:
+            take_profit = _float(position_close_target.get("take_profit"))
+        algo_target = position_targets.get(position_key, {}) if isinstance(position_targets, dict) else {}
+        if stop_loss is None and isinstance(algo_target, dict):
+            stop_loss = _float(algo_target.get("stop_loss"))
+        if take_profit is None and isinstance(algo_target, dict):
+            take_profit = _float(algo_target.get("take_profit"))
+        okx_stop_loss = stop_loss
+        okx_take_profit = take_profit
+        matching_rows = executions_by_key.get(position_key, [])
+        identity_matches = [row for row in matching_rows if _position_identity_matches(row, position) is True]
+        matched = identity_matches[0] if identity_matches else matching_rows[0] if matching_rows else None
+        if matched and not _position_matches_execution(matched, position, entry_price):
+            reopened_execution_ids.add(int(matched["id"]))
+            matched = None
+        if matched and _position_protection_state_is_stale(
+            matched,
+            position,
+            entry_price=entry_price,
+            contracts=contracts,
+        ):
+            reopened_execution_ids.add(int(matched["id"]))
+            matched = None
+        if matched:
+            if stop_loss is None:
+                stop_loss = _float(matched.get("stop_loss"))
+            if take_profit is None:
+                take_profit = _float(matched.get("take_profit"))
+        market_context = (
+            _manual_market_context(exchange, config, symbol)
+            if exchange is not None and (okx_stop_loss is None or okx_take_profit is None)
+            else {}
+        )
+        volatility_pct = _float(market_context.get("atr_pct"))
+        unrealized_pnl = _float(position.get("unrealized_pnl") or position.get("unrealizedPnl") or info.get("upl"))
+        target_plan = _manual_position_targets(
+            config,
+            side=side,
+            entry=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            volatility_pct=volatility_pct,
+            unrealized_pnl=unrealized_pnl,
+            market_context=market_context,
+        )
+        stop_loss = _float(target_plan.get("stop_loss"))
+        take_profit = _float(target_plan.get("take_profit"))
+        target_attach_result: dict[str, Any] | None = None
+        if exchange is not None and (okx_stop_loss is None or okx_take_profit is None):
+            target_attach_result = _place_missing_position_targets(
+                exchange,
+                config,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                existing_stop_loss=okx_stop_loss,
+                existing_take_profit=okx_take_profit,
+                td_mode=position_margin_mode,
+            )
+            if target_attach_result.get("submitted"):
+                position_targets_submitted += 1
+            elif target_attach_result.get("error"):
+                position_target_errors += 1
+        payload = {
+            "source": "okx_position_sync",
+            "position": to_jsonable(position),
+            "snapshot_created_at": created_at,
+            "manual_target_plan": to_jsonable(target_plan),
+            "manual_target_volatility_pct": volatility_pct,
+            "manual_target_market_context": to_jsonable(market_context),
+            "target_attach_result": to_jsonable(target_attach_result),
+        }
+        updates = {
+            "updated_at": created_at,
+            "status": "OPEN",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "pnl": unrealized_pnl,
+            "snapshot_json": json.dumps(payload, ensure_ascii=False),
+            "exchange_position_id": position_id or None,
+            "exchange_position_opened_at": position_opened_key or None,
+            "exchange_margin_mode": position_margin_mode,
+        }
+        if matched:
+            previous_quantity = _float(matched.get("quantity"))
+            max_contracts_seen = max(
+                value
+                for value in (contracts, previous_quantity or 0.0, _float(matched.get("max_contracts_seen")) or 0.0)
+                if value is not None
+            )
+            updates["quantity"] = contracts
+            updates["max_contracts_seen"] = max_contracts_seen
+            if _float(matched.get("initial_quantity")) is None:
+                updates["initial_quantity"] = max_contracts_seen
+            if _float(matched.get("initial_entry_price")) is None and entry_price is not None:
+                updates["initial_entry_price"] = _float(matched.get("entry_price")) or entry_price
+            if _float(matched.get("initial_stop_loss")) is None and stop_loss is not None:
+                updates["initial_stop_loss"] = stop_loss
+        trade_execution_id: int | None = None
+        manual_imported = False
+        if matched:
+            update_trade_execution(config, int(matched["id"]), updates)
+            trade_execution_id = int(matched["id"])
+            matched_execution_ids.add(int(matched["id"]))
+            previous_stop_loss = _float(matched.get("stop_loss"))
+            previous_take_profit = _float(matched.get("take_profit"))
+            previous_entry = _float(matched.get("entry_price") or matched.get("initial_entry_price"))
+            contract_size = _safe_float(position.get("contractSize") or info.get("ctVal"), 1.0)
+            quantity_changed = _value_changed(previous_quantity, contracts)
+            stop_loss_changed = _value_changed(previous_stop_loss, stop_loss)
+            take_profit_changed = _value_changed(previous_take_profit, take_profit)
+            targets_changed = stop_loss_changed or take_profit_changed
+            if quantity_changed:
+                _notify_position_quantity_changed(
+                    config,
+                    {
+                        "trade_execution_id": trade_execution_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "old_quantity": previous_quantity,
+                        "new_quantity": contracts,
+                        "old_entry": previous_entry,
+                        "entry": entry_price,
+                        "contract_size": contract_size,
+                        "leverage": leverage,
+                        "changed_at": created_at,
+                    },
+                )
+            if targets_changed:
+                _notify_position_targets_changed(
+                    config,
+                    {
+                        "trade_execution_id": trade_execution_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": contracts,
+                        "contract_size": contract_size,
+                        "entry": entry_price,
+                        "leverage": leverage,
+                        "old_stop_loss": previous_stop_loss,
+                        "new_stop_loss": stop_loss,
+                        "old_take_profit": previous_take_profit,
+                        "new_take_profit": take_profit,
+                        "stop_loss_changed": stop_loss_changed,
+                        "take_profit_changed": take_profit_changed,
+                        "changed_at": created_at,
+                    },
+                )
+        else:
+            prompt_row = ensure_prompt_version(config)
+            inserted = insert_trade_execution_row(
+                config,
+                {
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "symbol": symbol,
+                    "position_slot": next_slot,
+                    "parent_position_id": None,
+                    "side": side.upper(),
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "initial_entry_price": entry_price,
+                    "initial_stop_loss": stop_loss,
+                    "risk_reward": target_plan.get("risk_reward"),
+                    "risk_percent": 0,
+                    "rule_score": None,
+                    "gpt_confidence": None,
+                    "status": "OPEN",
+                    "quantity": contracts,
+                    "initial_quantity": contracts,
+                    "max_contracts_seen": contracts,
+                    "pnl": unrealized_pnl,
+                    "reject_reason": None,
+                    "closed_at": None,
+                    "payload_json": json.dumps(payload, ensure_ascii=False),
+                    "exchange_position_id": position_id or None,
+                    "exchange_position_opened_at": position_opened_key or None,
+                    "exchange_margin_mode": position_margin_mode,
+                    "market_regime": None,
+                    "regime_confidence": None,
+                    "strategy_version": str(config.get("selected_strategy_version") or config.get("strategy_versioning", {}).get("default_version", "strategy-v1")),
+                    "rule_engine_version": str(config.get("strategy_versioning", {}).get("rule_engine_version", "rule-engine-v1")),
+                    "validator_version": str(config.get("strategy_versioning", {}).get("validator_version", "validator-v1")),
+                    "recovery_version": str(config.get("strategy_versioning", {}).get("recovery_version", "recovery-v1")),
+                    "health_version": str(config.get("strategy_versioning", {}).get("health_version", "health-v1")),
+                    "prompt_version": str(prompt_row.get("version") or "prompt-v1"),
+                    "prompt_hash": str(prompt_row.get("prompt_hash") or ""),
+                    "model_name": str(config.get("ai", {}).get("okx", {}).get("model", "gpt-5.5")),
+                    "model_version": str(config.get("ai", {}).get("okx", {}).get("model", "gpt-5.5")),
+                    "system_version": str(config.get("prompt_engine", {}).get("system_version", "system-v1")),
+                    "decision_engine_version": str(config.get("prompt_engine", {}).get("decision_engine_version", "decision-engine-v1")),
+                    "bunny_version": str(config.get("prompt_engine", {}).get("bunny_version", "bunny-v1")),
+                    "health_monitor_version": str(config.get("prompt_engine", {}).get("health_version", "health-v1")),
+                    "slot_refill_version": str(config.get("prompt_engine", {}).get("slot_refill_version", "slot-refill-v1")),
+                    "experiment_name": None,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "latency_ms": None,
+                    "snapshot_json": json.dumps(payload, ensure_ascii=False),
+                    "entry_mode": config.get("mode"),
+                    "import_source": "manual_okx_position",
+                    "exchange_leverage": leverage,
+                },
+            )
+            trade_execution_id = int(inserted["id"])
+            manual_imported = True
+            manual_positions_imported += 1
+            next_slot += 1
+        if target_attach_result and target_attach_result.get("submitted") and trade_execution_id is not None:
+            _notify_manual_position_targets(
+                config,
+                {
+                    "trade_execution_id": trade_execution_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "entry": entry_price,
+                    "quantity": contracts,
+                    "contract_size": _safe_float(position.get("contractSize") or info.get("ctVal"), 1.0),
+                    "leverage": leverage,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "risk_reward": target_plan.get("risk_reward"),
+                    "rr_mode": target_plan.get("rr_mode"),
+                    "rr_reasons": target_plan.get("rr_reasons"),
+                    "manual_import": manual_imported,
+                    "request": target_attach_result.get("request"),
+                    "response": target_attach_result.get("response"),
+                },
+            )
+        positions_synced += 1
+
+    # A successful OKX snapshot is authoritative. Close internal OPEN rows that
+    # no longer have a matching exchange position, and collapse duplicate rows.
+    snapshot_authoritative = snapshot.get("enabled", True) is not False
+    grace_seconds = max(0, int(config.get("runtime_sync", {}).get("position_close_grace_seconds", 120) or 0))
+    executions_closed = 0
+    duplicate_executions_closed = 0
+    for row in open_execution_rows:
+        row_id = int(row["id"])
+        key = _execution_key(row)
+        if row_id in matched_execution_ids:
+            continue
+        if not snapshot_authoritative:
+            continue
+        created_time = _parse_time(row.get("created_at"))
+        age_seconds = (snapshot_time - created_time).total_seconds() if created_time else grace_seconds + 1
+        if row_id in reopened_execution_ids:
+            history = _matching_position_history(row, positions_history, snapshot_time)
+            _close_missing_exchange_execution(config, row, closed_at=created_at, history=history)
+            executions_closed += 1
+            continue
+        if key not in active_position_keys and age_seconds < grace_seconds:
+            continue
+        if key in active_position_keys:
+            reason = "duplicate_open_execution_reconciled"
+            duplicate_executions_closed += 1
+            _close_stale_open_execution(config, row, closed_at=created_at, reason=reason)
+        else:
+            history = _matching_position_history(row, positions_history, snapshot_time)
+            _close_missing_exchange_execution(config, row, closed_at=created_at, history=history)
+        executions_closed += 1
+
+    refresh_trading_system_state(config)
+    refresh_bunny_health_state(config)
+    try:
+        active_position_review = evaluate_open_positions(config, rows=list_trade_execution_rows(config, statuses=["OPEN"], limit=100, order="created_asc"))
+    except Exception as exc:
+        active_position_review = {"enabled": False, "error": str(exc)}
+    return {
+        "enabled": True,
+        "created_at": created_at,
+        "positions_seen": len(position_rows),
+        "open_orders_seen": len(open_orders),
+        "positions_synced": positions_synced,
+        "orders_synced": orders_synced,
+        "manual_positions_imported": manual_positions_imported,
+        "position_targets_submitted": position_targets_submitted,
+        "position_target_errors": position_target_errors,
+        "executions_closed": executions_closed,
+        "duplicate_executions_closed": duplicate_executions_closed,
+        "reclassified_executions": reclassified_executions,
+        "corrected_close_pnls": corrected_close_pnls,
+        "active_position_review": active_position_review,
+        "backfilled_close_notifications": backfilled_close_notifications,
+        "retried_close_notifications": retried_close_notifications,
+    }
+
+
+def sync_runtime_state(
+    config: dict[str, Any],
+    *,
+    account_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ai": sync_ai_runtime_metadata(config),
+        "exchange": sync_exchange_runtime_state(config, account_snapshot=account_snapshot),
+    }

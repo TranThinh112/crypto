@@ -1,0 +1,23 @@
+"""Initial audited trading schema.
+
+Revision ID: 0001_initial
+Revises:
+"""
+
+from alembic import op
+
+from app.database import Base
+from app.models import basket, bot_state, event_log, trade  # noqa: F401
+
+revision = "0001_initial"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    Base.metadata.create_all(bind=op.get_bind())
+
+
+def downgrade() -> None:
+    Base.metadata.drop_all(bind=op.get_bind())

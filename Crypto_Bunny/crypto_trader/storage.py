@@ -1,0 +1,2979 @@
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import re
+import threading
+import time
+import zlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from .atlas_mirror import (
+    atlas_database,
+    atlas_database_for_collection,
+    atlas_collection_database_name,
+    atlas_database_name,
+    atlas_runtime_is_primary,
+)
+from .config import project_path
+from .models import Decision, TradeCandidate, to_jsonable
+
+
+PENDING_OKX_COLLECTION = "pending_orders"
+PENDING_INTERNAL_COLLECTION = "internal_pending_orders"
+ACTIVE_PENDING_STATUSES = ("LC_OKX", "WAIT_SLOT", "OPEN")
+OKX_PENDING_STATUSES = ("LC_OKX",)
+INTERNAL_PENDING_STATUSES = ("WAIT_SLOT", "OPEN")
+LEGACY_INTERNAL_PENDING_STATUSES = ("WATCHLIST",)
+DEFAULT_MARKET_SCAN_MAX_JSON_BYTES = 8000
+DEPRECATED_JOURNAL_STATE_KEYS = {
+    "ai_internal_market_scan_latest",
+}
+DASHBOARD_SNAPSHOT_PREFIX = "dashboard_snapshot:"
+DASHBOARD_SNAPSHOT_VERSION_KEY = "dashboard_snapshot:version"
+JOURNAL_STATE_COMPRESSION_THRESHOLD_BYTES = 8_192
+DEFAULT_JOURNAL_STATE_CACHE_TTL_SECONDS = 60.0
+DEFAULT_JOURNAL_STATE_STALE_FALLBACK_SECONDS = 21600.0
+DEFAULT_MONGO_OPERATION_RETRY_ATTEMPTS = 3
+DEFAULT_MONGO_OPERATION_RETRY_DELAY_SECONDS = 0.35
+DEFAULT_MONGO_CIRCUIT_BREAKER_SECONDS = 8.0
+LOCAL_MARKET_SCAN_CACHE_FILENAME = "latest_market_scan_memory.json"
+
+_JOURNAL_STATE_CACHE_LOCK = threading.Lock()
+_JOURNAL_STATE_CACHE: dict[str, tuple[float, str]] = {}
+_JOURNAL_STATE_FALLBACK_LOCK = threading.Lock()
+_MONGO_CIRCUIT_LOCK = threading.Lock()
+_MONGO_CIRCUIT_OPEN_UNTIL: dict[str, tuple[float, str]] = {}
+LOGGER = logging.getLogger(__name__)
+
+
+class _RetryingCollectionProxy:
+    _READ_METHODS = {
+        "aggregate",
+        "count_documents",
+        "distinct",
+        "estimated_document_count",
+        "find_one",
+    }
+
+    def __init__(self, config: dict[str, Any], collection: Any) -> None:
+        self._config = config
+        self._collection = collection
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._collection, name)
+        if not callable(attr) or name == "find":
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return _mongo_call_with_retry(
+                self._config,
+                lambda: attr(*args, **kwargs),
+                respect_circuit=name in self._READ_METHODS,
+            )
+
+        return _wrapped
+
+
+def _journal_state_cache_namespace(config: dict[str, Any]) -> str:
+    return str(
+        config.get("_config_path")
+        or config.get("_config_dir")
+        or config.get("database", {}).get("atlas", {}).get("database")
+        or "default"
+    )
+
+
+def _journal_state_cache_key(config: dict[str, Any], key: str) -> str:
+    return f"{_journal_state_cache_namespace(config)}::{key}"
+
+
+def _journal_state_cache_ttl_seconds(config: dict[str, Any]) -> float:
+    atlas = config.get("database", {}).get("atlas", {})
+    raw = atlas.get("journal_state_cache_ttl_seconds", DEFAULT_JOURNAL_STATE_CACHE_TTL_SECONDS)
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (TypeError, ValueError):
+        return DEFAULT_JOURNAL_STATE_CACHE_TTL_SECONDS
+
+
+def _journal_state_stale_fallback_seconds(config: dict[str, Any]) -> float:
+    atlas = config.get("database", {}).get("atlas", {})
+    raw = atlas.get("journal_state_stale_fallback_seconds", DEFAULT_JOURNAL_STATE_STALE_FALLBACK_SECONDS)
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (TypeError, ValueError):
+        return DEFAULT_JOURNAL_STATE_STALE_FALLBACK_SECONDS
+
+def _journal_state_cache_get(config: dict[str, Any], key: str, *, allow_stale: bool = False) -> str | None:
+    ttl = _journal_state_cache_ttl_seconds(config)
+    if ttl <= 0:
+        return None
+    cache_key = _journal_state_cache_key(config, key)
+    now = time.monotonic()
+    with _JOURNAL_STATE_CACHE_LOCK:
+        entry = _JOURNAL_STATE_CACHE.get(cache_key)
+        if not entry:
+            return None
+        expires_at, value = entry
+        if expires_at <= now:
+            stale_age = now - expires_at
+            stale_window = _journal_state_stale_fallback_seconds(config)
+            if allow_stale and stale_age <= stale_window:
+                return value
+            if stale_age <= stale_window:
+                return None
+            _JOURNAL_STATE_CACHE.pop(cache_key, None)
+            return None
+        return value
+
+
+def _journal_state_cache_set(config: dict[str, Any], key: str, value: str) -> None:
+    ttl = _journal_state_cache_ttl_seconds(config)
+    if ttl <= 0:
+        return
+    cache_key = _journal_state_cache_key(config, key)
+    with _JOURNAL_STATE_CACHE_LOCK:
+        _JOURNAL_STATE_CACHE[cache_key] = (time.monotonic() + ttl, value)
+
+
+def _journal_state_cache_invalidate(config: dict[str, Any], key: str) -> None:
+    cache_key = _journal_state_cache_key(config, key)
+    with _JOURNAL_STATE_CACHE_LOCK:
+        _JOURNAL_STATE_CACHE.pop(cache_key, None)
+
+
+def _journal_state_cache_invalidate_prefix(config: dict[str, Any], prefix: str) -> None:
+    match = f"{_journal_state_cache_namespace(config)}::{str(prefix or '')}"
+    with _JOURNAL_STATE_CACHE_LOCK:
+        stale_keys = [cache_key for cache_key in _JOURNAL_STATE_CACHE if cache_key.startswith(match)]
+        for cache_key in stale_keys:
+            _JOURNAL_STATE_CACHE.pop(cache_key, None)
+
+def _journal_state_fallback_path(config: dict[str, Any]) -> Path:
+    atlas = config.get("database", {}).get("atlas", {})
+    configured = atlas.get("journal_state_fallback_path")
+    if configured:
+        return project_path(config, str(configured))
+    report_path = project_path(config, config.get("report_path", "reports/latest_decision.json"))
+    return report_path.parent / "journal_state_fallback.json"
+
+def _journal_state_fallback_load(config: dict[str, Any]) -> dict[str, Any]:
+    path = _journal_state_fallback_path(config)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+def _journal_state_fallback_get(config: dict[str, Any], key: str) -> str | None:
+    namespace = _journal_state_cache_namespace(config)
+    with _JOURNAL_STATE_FALLBACK_LOCK:
+        payload = _journal_state_fallback_load(config)
+    namespace_rows = payload.get(namespace)
+    if not isinstance(namespace_rows, dict):
+        return None
+    row = namespace_rows.get(key)
+    if not isinstance(row, dict):
+        return None
+    value = row.get("value")
+    return str(value) if value is not None else None
+
+def _journal_state_fallback_set(config: dict[str, Any], key: str, value: str) -> None:
+    namespace = _journal_state_cache_namespace(config)
+    path = _journal_state_fallback_path(config)
+    with _JOURNAL_STATE_FALLBACK_LOCK:
+        payload = _journal_state_fallback_load(config)
+        namespace_rows = payload.get(namespace)
+        if not isinstance(namespace_rows, dict):
+            namespace_rows = {}
+        namespace_rows[key] = {
+            "value": str(value or ""),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        payload[namespace] = namespace_rows
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(path)
+        except OSError as exc:
+            LOGGER.warning("Could not persist local journal_state fallback for key '%s': %s", key, exc)
+
+
+def _mongo_operation_retry_attempts(config: dict[str, Any]) -> int:
+    atlas = config.get("database", {}).get("atlas", {})
+    raw = atlas.get("operation_retry_attempts", DEFAULT_MONGO_OPERATION_RETRY_ATTEMPTS)
+    try:
+        return max(1, int(raw or 1))
+    except (TypeError, ValueError):
+        return DEFAULT_MONGO_OPERATION_RETRY_ATTEMPTS
+
+
+def _mongo_operation_retry_delay_seconds(config: dict[str, Any]) -> float:
+    atlas = config.get("database", {}).get("atlas", {})
+    raw = atlas.get("operation_retry_delay_seconds", DEFAULT_MONGO_OPERATION_RETRY_DELAY_SECONDS)
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (TypeError, ValueError):
+        return DEFAULT_MONGO_OPERATION_RETRY_DELAY_SECONDS
+
+
+def _mongo_circuit_breaker_seconds(config: dict[str, Any]) -> float:
+    atlas = config.get("database", {}).get("atlas", {})
+    raw = atlas.get("circuit_breaker_seconds", DEFAULT_MONGO_CIRCUIT_BREAKER_SECONDS)
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (TypeError, ValueError):
+        return DEFAULT_MONGO_CIRCUIT_BREAKER_SECONDS
+
+
+def _mongo_circuit_key(config: dict[str, Any]) -> str:
+    atlas = config.get("database", {}).get("atlas", {})
+    return str(
+        config.get("_config_path")
+        or config.get("_config_dir")
+        or config.get("_atlas_test_database")
+        or atlas.get("database")
+        or atlas.get("database_env")
+        or "default"
+    )
+
+
+def _mongo_circuit_open_reason(config: dict[str, Any]) -> str | None:
+    key = _mongo_circuit_key(config)
+    now = time.monotonic()
+    with _MONGO_CIRCUIT_LOCK:
+        entry = _MONGO_CIRCUIT_OPEN_UNTIL.get(key)
+        if not entry:
+            return None
+        open_until, reason = entry
+        if open_until <= now:
+            _MONGO_CIRCUIT_OPEN_UNTIL.pop(key, None)
+            return None
+        return reason
+
+
+def _mongo_circuit_note_failure(config: dict[str, Any], exc: Exception) -> None:
+    seconds = _mongo_circuit_breaker_seconds(config)
+    if seconds <= 0:
+        return
+    key = _mongo_circuit_key(config)
+    with _MONGO_CIRCUIT_LOCK:
+        _MONGO_CIRCUIT_OPEN_UNTIL[key] = (time.monotonic() + seconds, str(exc)[:240])
+
+
+def _mongo_error_is_retryable(exc: Exception) -> bool:
+    if exc.__class__.__name__ in {
+        "AutoReconnect",
+        "ConnectionFailure",
+        "ExecutionTimeout",
+        "NetworkTimeout",
+        "ServerSelectionTimeoutError",
+        "WaitQueueTimeoutError",
+    }:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "no replica set members match selector",
+            "replicasetnoprimary",
+            "topology_type: replicasetnoprimary",
+            "server_type: rssecondary",
+            "primary()",
+            "read operation timed out",
+            "timed out",
+            "wait queue timeout",
+            "connection pool paused",
+            "connection reset",
+            "temporarily unavailable",
+        )
+    )
+
+
+def is_retryable_storage_error(exc: Exception) -> bool:
+    return _mongo_error_is_retryable(exc)
+
+
+def _mongo_call_with_retry(config: dict[str, Any], operation: Any, *, respect_circuit: bool = True) -> Any:
+    if respect_circuit:
+        open_reason = _mongo_circuit_open_reason(config)
+        if open_reason:
+            raise TimeoutError(f"Atlas circuit breaker open after recent timeout: {open_reason}")
+    attempts = _mongo_operation_retry_attempts(config)
+    delay = _mongo_operation_retry_delay_seconds(config)
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            retryable = _mongo_error_is_retryable(exc)
+            if retryable:
+                _mongo_circuit_note_failure(config, exc)
+            if attempt >= attempts or not retryable:
+                raise
+            time.sleep(delay * attempt)
+
+
+def _best_effort_retryable_storage_side_effect(config: dict[str, Any], operation: Any) -> Any:
+    try:
+        return operation()
+    except Exception as exc:
+        if not _mongo_error_is_retryable(exc):
+            raise
+        return None
+
+
+def _mongo_collection(config: dict[str, Any], table: str) -> Any:
+    return _RetryingCollectionProxy(config, atlas_database_for_collection(config, table)[table])
+
+
+def _mongo_meta_collection(config: dict[str, Any], table: str | None = None) -> Any:
+    database = atlas_database_for_collection(config, table) if table else atlas_database(config)
+    return _RetryingCollectionProxy(config, database["_meta_counters"])
+
+
+def _ensure_mongo_write_allowed(config: dict[str, Any]) -> None:
+    if not atlas_runtime_is_primary(config):
+        raise RuntimeError("This runtime is read-only. Only Railway primary may write Atlas state.")
+
+
+def _mongo_next_id(config: dict[str, Any], table: str) -> int:
+    from pymongo import ReturnDocument
+
+    now = datetime.now(timezone.utc).isoformat()
+    row = _mongo_meta_collection(config, table).find_one_and_update(
+        {"_id": f"{table}:id"},
+        {"$inc": {"value": 1}, "$set": {"updated_at": now}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((row or {}).get("value") or 1)
+
+
+def _mongo_reserve_ids(config: dict[str, Any], table: str, count: int) -> list[int]:
+    from pymongo import ReturnDocument
+
+    safe_count = max(0, int(count))
+    if safe_count == 0:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    row = _mongo_meta_collection(config, table).find_one_and_update(
+        {"_id": f"{table}:id"},
+        {"$inc": {"value": safe_count}, "$set": {"updated_at": now}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    end_id = int((row or {}).get("value") or safe_count)
+    return list(range(end_id - safe_count + 1, end_id + 1))
+
+
+def _next_pending_order_id(config: dict[str, Any]) -> int:
+    from pymongo import ReturnDocument
+
+    now = datetime.now(timezone.utc).isoformat()
+    meta = _mongo_meta_collection(config)
+    key = "pending_records:id"
+    existing = meta.find_one({"_id": key})
+    if existing is None:
+        max_id = 0
+        for table in (PENDING_OKX_COLLECTION, PENDING_INTERNAL_COLLECTION):
+            row = _mongo_collection(config, table).find_one({}, {"_id": 0, "id": 1}, sort=[("id", -1)])
+            if row and row.get("id") is not None:
+                max_id = max(max_id, int(row["id"]))
+        meta.update_one(
+            {"_id": key},
+            {"$setOnInsert": {"value": max_id, "updated_at": now}},
+            upsert=True,
+        )
+    row = meta.find_one_and_update(
+        {"_id": key},
+        {"$inc": {"value": 1}, "$set": {"updated_at": now}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((row or {}).get("value") or 1)
+
+
+def _mongo_upsert_by_pk(config: dict[str, Any], table: str, pk_field: str, payload: dict[str, Any]) -> dict[str, Any]:
+    document = dict(payload)
+    document["_id"] = document[pk_field]
+    _mongo_collection(config, table).replace_one({pk_field: document[pk_field]}, document, upsert=True)
+    return document
+
+
+def _mongo_find_many(
+    config: dict[str, Any],
+    table: str,
+    *,
+    query: dict[str, Any] | None = None,
+    sort: list[tuple[str, int]] | None = None,
+    limit: int | None = None,
+    projection: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    def _operation() -> list[dict[str, Any]]:
+        selected_fields = {**(projection or {}), "_id": 0}
+        cursor = _mongo_collection(config, table).find(query or {}, selected_fields)
+        if sort:
+            cursor = cursor.sort(sort)
+        if limit is not None:
+            cursor = cursor.limit(max(0, int(limit)))
+        return [dict(row) for row in cursor]
+
+    return _mongo_call_with_retry(config, _operation)
+
+
+def _mongo_find_one(
+    config: dict[str, Any],
+    table: str,
+    *,
+    query: dict[str, Any] | None = None,
+    sort: list[tuple[str, int]] | None = None,
+) -> dict[str, Any] | None:
+    rows = _mongo_find_many(config, table, query=query, sort=sort, limit=1)
+    return rows[0] if rows else None
+
+
+def _storage_retention(config: dict[str, Any]) -> dict[str, Any]:
+    return config.get("storage_retention", {})
+
+
+def _retention_days(config: dict[str, Any], key: str, default: float) -> float:
+    raw = _storage_retention(config).get(key, default)
+    try:
+        return max(0.1, float(raw or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _retention_expiry_days(days: float) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=max(0.1, float(days)))
+
+
+def _retention_expiry_hours(hours: float) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=max(1.0, float(hours)))
+
+
+def _market_scan_memory_cache_path(config: dict[str, Any]) -> Path:
+    memory_config = config.get("market_scan_memory", {})
+    configured_path = memory_config.get("cache_path")
+    if configured_path:
+        return project_path(config, configured_path)
+    report_path = project_path(config, config.get("report_path", "reports/latest_decision.json"))
+    return report_path.parent / LOCAL_MARKET_SCAN_CACHE_FILENAME
+
+
+def _json_object_or_empty(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _load_local_market_scan_cache_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
+    path = _market_scan_memory_cache_path(config)
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "created_at": item.get("created_at"),
+                "source": item.get("source"),
+                "symbol": item.get("symbol"),
+                "side": item.get("side"),
+                "timeframe": item.get("timeframe"),
+                "confidence": item.get("confidence"),
+                "win_probability_pct": item.get("win_probability_pct"),
+                "risk_reward": item.get("risk_reward"),
+                "score": item.get("score"),
+                "indicator": _json_object_or_empty(item.get("indicator")),
+                "payload": _json_object_or_empty(item.get("payload")),
+            }
+        )
+    return result
+
+
+def _store_local_market_scan_cache_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    path = _market_scan_memory_cache_path(config)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "rows": rows,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _prune_local_market_scan_cache_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    memory_config = config.get("market_scan_memory", {})
+    keep_hours = int(memory_config.get("keep_hours", 72) or 72)
+    max_rows = int(memory_config.get("max_rows_per_symbol_timeframe", 200) or 200)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, keep_hours))).isoformat()
+    ordered_rows = sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("symbol") or ""),
+            str(item.get("timeframe") or ""),
+            str(item.get("source") or ""),
+        ),
+        reverse=True,
+    )
+    counters: dict[tuple[str, str], int] = {}
+    pruned: list[dict[str, Any]] = []
+    for item in ordered_rows:
+        created_at = str(item.get("created_at") or "")
+        if created_at and created_at < cutoff:
+            continue
+        symbol = str(item.get("symbol") or "")
+        timeframe = str(item.get("timeframe") or "")
+        if not symbol or not timeframe:
+            continue
+        key = (symbol, timeframe)
+        if counters.get(key, 0) >= max(1, max_rows):
+            continue
+        pruned.append(item)
+        counters[key] = counters.get(key, 0) + 1
+    return pruned
+
+
+def _update_local_market_scan_cache(config: dict[str, Any], rows: list[tuple[Any, ...]]) -> None:
+    cache_rows = [
+        {
+            "created_at": row[0],
+            "source": row[1],
+            "symbol": row[2],
+            "side": row[3],
+            "timeframe": row[4],
+            "confidence": row[5],
+            "win_probability_pct": row[6],
+            "risk_reward": row[7],
+            "score": row[8],
+            "indicator": _json_object_or_empty(row[9]),
+            "payload": _json_object_or_empty(row[10]),
+        }
+        for row in rows
+    ]
+    merged_rows = _prune_local_market_scan_cache_rows(
+        config,
+        cache_rows + _load_local_market_scan_cache_rows(config),
+    )
+    _store_local_market_scan_cache_rows(config, merged_rows)
+
+
+def _group_recent_market_scan_rows(
+    rows: list[dict[str, Any]],
+    *,
+    per_symbol_timeframe_limit: int,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    counters: dict[tuple[str, str], int] = {}
+    for item in rows:
+        symbol = str(item.get("symbol") or "")
+        timeframe = str(item.get("timeframe") or "")
+        if not symbol or not timeframe:
+            continue
+        key = (symbol, timeframe)
+        if counters.get(key, 0) >= max(1, int(per_symbol_timeframe_limit)):
+            continue
+        indicator = _json_object_or_empty(item.get("indicator"))
+        payload = _json_object_or_empty(item.get("payload"))
+        grouped.setdefault(symbol, {}).setdefault(timeframe, []).append(
+            {
+                "created_at": item.get("created_at"),
+                "source": item.get("source"),
+                "side": item.get("side"),
+                "confidence": item.get("confidence"),
+                "win_probability_pct": item.get("win_probability_pct"),
+                "risk_reward": item.get("risk_reward"),
+                "score": item.get("score"),
+                "indicator": indicator,
+                "payload": payload,
+            }
+        )
+        counters[key] = counters.get(key, 0) + 1
+    return grouped
+
+
+def _iso_cutoff_days(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=max(0.1, float(days)))).isoformat()
+
+
+def _delete_by_ids(config: dict[str, Any], table: str, ids: list[int]) -> int:
+    if not ids:
+        return 0
+    return int(_mongo_collection(config, table).delete_many({"id": {"$in": ids}}).deleted_count or 0)
+
+
+def _prune_by_created_at(
+    config: dict[str, Any],
+    table: str,
+    *,
+    keep_days: float,
+    preserve_query: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    cutoff = _iso_cutoff_days(keep_days)
+    stale_query: dict[str, Any] = {"created_at": {"$lt": cutoff}}
+    if preserve_query:
+        stale_query = {"$and": [stale_query, {"$nor": [preserve_query]}]}
+    _ensure_mongo_write_allowed(config)
+    deleted = int(_mongo_collection(config, table).delete_many(stale_query).deleted_count or 0)
+    return {"deleted_old": deleted}
+
+
+def _journal_state_retention(config: dict[str, Any]) -> dict[str, Any]:
+    settings = config.get("journal_state_retention", {})
+    return settings if isinstance(settings, dict) else {}
+
+
+def _journal_retention_float(settings: dict[str, Any], key: str, default: float) -> float:
+    raw = settings.get(key, default)
+    try:
+        return max(0.1, float(raw or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _iso_cutoff_hours(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=max(1.0, float(hours)))).isoformat()
+
+
+def _delete_stale_journal_state_prefix(
+    config: dict[str, Any],
+    *,
+    prefix: str,
+    cutoff: str,
+    preserve_keys: set[str] | None = None,
+) -> int:
+    query: dict[str, Any] = {
+        "key": {"$regex": f"^{re.escape(prefix)}"},
+        "updated_at": {"$lt": cutoff},
+    }
+    if preserve_keys:
+        query = {
+            "$and": [
+                {"key": {"$regex": f"^{re.escape(prefix)}"}},
+                {"key": {"$nin": sorted(preserve_keys)}},
+                {"updated_at": {"$lt": cutoff}},
+            ]
+        }
+    deleted = int(_mongo_collection(config, "journal_state").delete_many(query).deleted_count or 0)
+    if deleted:
+        _journal_state_cache_invalidate_prefix(config, prefix)
+    return deleted
+
+
+def _delete_stale_journal_state_key(config: dict[str, Any], *, key: str, cutoff: str) -> int:
+    deleted = int(
+        _mongo_collection(config, "journal_state").delete_many(
+            {
+                "key": key,
+                "updated_at": {"$lt": cutoff},
+            }
+        ).deleted_count
+        or 0
+    )
+    if deleted:
+        _journal_state_cache_invalidate(config, key)
+    return deleted
+
+
+def prune_journal_state(config: dict[str, Any]) -> dict[str, Any]:
+    settings = _journal_state_retention(config)
+    if not bool(settings.get("enabled", True)):
+        return {"enabled": False, "deleted_total": 0, "rules": {}}
+    _ensure_mongo_write_allowed(config)
+    rules = {
+        "system_checklist": _delete_stale_journal_state_prefix(
+            config,
+            prefix="system_checklist:",
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "system_checklist_keep_days", 90)),
+        ),
+        "daily_start_balance": _delete_stale_journal_state_prefix(
+            config,
+            prefix="daily_start_balance:",
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "daily_start_balance_keep_days", 90)),
+        ),
+        "wait_slot_notification_history": _delete_stale_journal_state_key(
+            config,
+            key="wait_slot_notification_history_v1",
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "wait_slot_notification_history_keep_days", 30)),
+        ),
+        "lc_pipeline_candidate_cache": _delete_stale_journal_state_key(
+            config,
+            key="lc_pipeline_candidate_cache_v1",
+            cutoff=_iso_cutoff_hours(
+                _journal_retention_float(settings, "lc_pipeline_candidate_cache_keep_hours", 24)
+            ),
+        ),
+        "telegram_message_ids": _delete_stale_journal_state_prefix(
+            config,
+            prefix="telegram_last_message_id:",
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "telegram_message_id_keep_days", 30)),
+        ),
+        "dashboard_snapshots": _delete_stale_journal_state_prefix(
+            config,
+            prefix=DASHBOARD_SNAPSHOT_PREFIX,
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "dashboard_snapshot_keep_days", 7)),
+            preserve_keys={DASHBOARD_SNAPSHOT_VERSION_KEY},
+        ),
+        "mini_setup_states": _delete_stale_journal_state_prefix(
+            config,
+            prefix="mini_setup:",
+            cutoff=_iso_cutoff_days(_journal_retention_float(settings, "mini_setup_keep_days", 7)),
+        ),
+    }
+    return {
+        "enabled": True,
+        "deleted_total": sum(int(value or 0) for value in rules.values()),
+        "rules": rules,
+    }
+
+
+def _pending_collection_for_status(status: str, exchange_order_id: str | None = None) -> str:
+    normalized_status = str(status or "").upper()
+    if normalized_status in OKX_PENDING_STATUSES or str(exchange_order_id or "").strip():
+        return PENDING_OKX_COLLECTION
+    return PENDING_INTERNAL_COLLECTION
+
+
+def _find_pending_record(config: dict[str, Any], order_id: int) -> tuple[str, dict[str, Any] | None]:
+    for table in (PENDING_OKX_COLLECTION, PENDING_INTERNAL_COLLECTION):
+        row = _mongo_find_one(config, table, query={"id": int(order_id)})
+        if row is not None:
+            return table, row
+    return PENDING_OKX_COLLECTION, None
+
+
+def _merge_pending_rows(*groups: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        rows.extend(group)
+    rows.sort(key=lambda row: (str(row.get("updated_at") or row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True)
+    if limit is not None:
+        return rows[: max(0, int(limit))]
+    return rows
+
+
+def migrate_legacy_pending_orders(config: dict[str, Any]) -> dict[str, int]:
+    legacy_rows = _mongo_find_many(
+        config,
+        PENDING_OKX_COLLECTION,
+        query={"status": {"$in": list(INTERNAL_PENDING_STATUSES + LEGACY_INTERNAL_PENDING_STATUSES)}},
+        sort=[("id", 1)],
+    )
+    if not legacy_rows:
+        return {"moved": 0}
+    _ensure_mongo_write_allowed(config)
+    moved = 0
+    for row in legacy_rows:
+        _mongo_upsert_by_pk(config, PENDING_INTERNAL_COLLECTION, "id", row)
+        _mongo_collection(config, PENDING_OKX_COLLECTION).delete_one({"id": int(row["id"])})
+        moved += 1
+    return {"moved": moved}
+
+
+def list_journal_state_prefix(config: dict[str, Any], prefix: str, *, limit: int = 100) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    return _mongo_find_many(
+        config,
+        "journal_state",
+        query={"key": {"$regex": f"^{re.escape(prefix)}"}},
+        sort=[("key", -1)],
+        limit=safe_limit,
+    )
+def ensure_ai_model_version(
+    config: dict[str, Any],
+    *,
+    model_name: str,
+    model_version: str,
+    prompt_version: str,
+    prompt_hash: str,
+    created_at: str | None = None,
+) -> None:
+    filters = {
+        "model_name": model_name,
+        "model_version": model_version,
+        "prompt_version": prompt_version,
+        "prompt_hash": prompt_hash,
+    }
+    if _mongo_find_one(config, "ai_model_versions", query=filters):
+        return
+    _ensure_mongo_write_allowed(config)
+    existing = _mongo_find_one(config, "ai_model_versions", query={"model_name": model_name})
+    now = str(created_at or datetime.now(timezone.utc).isoformat())
+    row = dict(filters)
+    row["id"] = int((existing or {}).get("id") or _mongo_next_id(config, "ai_model_versions"))
+    row["created_at"] = str((existing or {}).get("created_at") or now)
+    row["updated_at"] = now
+    _mongo_upsert_by_pk(config, "ai_model_versions", "id", row)
+    return
+def get_prompt_version(config: dict[str, Any], version: str) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "prompt_versions", query={"version": version})
+def save_prompt_version(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    existing = get_prompt_version(config, str(row["version"]))
+    payload = {
+        "version": str(row["version"]),
+        "hash": row.get("hash"),
+        "description": row.get("description"),
+        "created_at": row.get("created_at") or (existing or {}).get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "is_active": int(row.get("is_active", 0) or 0),
+        "files_json": row.get("files_json") or "{}",
+        "prompt_hash": row.get("prompt_hash") or row.get("hash"),
+    }
+    _ensure_mongo_write_allowed(config)
+    payload["id"] = int((existing or {}).get("id") or _mongo_next_id(config, "prompt_versions"))
+    _mongo_upsert_by_pk(config, "prompt_versions", "version", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_prompt_versions(config))
+    return payload
+def list_prompt_versions(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return _mongo_find_many(config, "prompt_versions", sort=[("created_at", -1), ("id", -1)])
+
+
+def prune_prompt_versions(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "prompt_versions_keep_days", 365))
+    return _prune_by_created_at(config, "prompt_versions", keep_days=keep_days, preserve_query={"is_active": 1})
+def get_prompt_metric(config: dict[str, Any], prompt_version: str) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "prompt_metrics", query={"prompt_version": prompt_version})
+def save_prompt_metric_snapshot(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any] | None:
+    prompt_version = str(row.get("prompt_version") or "")
+    if not prompt_version:
+        return None
+    payload = {
+        "prompt_version": prompt_version,
+        "prompt_hash": str(row.get("prompt_hash") or ""),
+        "total_requests": int(row.get("total_requests") or 0),
+        "average_prompt_tokens": float(row.get("average_prompt_tokens") or 0),
+        "average_completion_tokens": float(row.get("average_completion_tokens") or 0),
+        "average_latency": float(row.get("average_latency") or 0),
+        "estimated_cached_tokens": float(row.get("estimated_cached_tokens") or 0),
+        "estimated_dynamic_tokens": float(row.get("estimated_dynamic_tokens") or 0),
+        "cache_hit_percent": float(row.get("cache_hit_percent") or 0),
+        "updated_at": str(row.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+    }
+    for extra_key in ("source", "notes"):
+        if row.get(extra_key) not in (None, ""):
+            payload[extra_key] = row.get(extra_key)
+    _ensure_mongo_write_allowed(config)
+    _mongo_upsert_by_pk(config, "prompt_metrics", "prompt_version", payload)
+    return payload
+def merge_prompt_metric(config: dict[str, Any], metric: dict[str, Any]) -> None:
+    prompt_version = str(metric.get("prompt_version") or "")
+    if not prompt_version:
+        return
+    prompt_tokens = float(metric.get("prompt_tokens") or 0)
+    completion_tokens = float(metric.get("completion_tokens") or 0)
+    latency_ms = float(metric.get("latency_ms") or 0)
+    cached_tokens = float(metric.get("estimated_cached_tokens") or 0)
+    dynamic_tokens = float(metric.get("estimated_dynamic_tokens") or 0)
+    cache_hit_percent = float(metric.get("cache_hit_percent") or 0)
+    existing = get_prompt_metric(config, prompt_version)
+    if existing is None:
+        payload = {
+            "prompt_version": prompt_version,
+            "prompt_hash": str(metric.get("prompt_hash") or ""),
+            "total_requests": 1,
+            "average_prompt_tokens": prompt_tokens,
+            "average_completion_tokens": completion_tokens,
+            "average_latency": latency_ms,
+            "estimated_cached_tokens": cached_tokens,
+            "estimated_dynamic_tokens": dynamic_tokens,
+            "cache_hit_percent": cache_hit_percent,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        total = int(existing.get("total_requests") or 0)
+        new_total = total + 1
+        payload = {
+            "prompt_version": prompt_version,
+            "prompt_hash": str(metric.get("prompt_hash") or existing.get("prompt_hash") or ""),
+            "total_requests": new_total,
+            "average_prompt_tokens": ((float(existing.get("average_prompt_tokens") or 0) * total) + prompt_tokens) / new_total,
+            "average_completion_tokens": ((float(existing.get("average_completion_tokens") or 0) * total) + completion_tokens) / new_total,
+            "average_latency": ((float(existing.get("average_latency") or 0) * total) + latency_ms) / new_total,
+            "estimated_cached_tokens": ((float(existing.get("estimated_cached_tokens") or 0) * total) + cached_tokens) / new_total,
+            "estimated_dynamic_tokens": ((float(existing.get("estimated_dynamic_tokens") or 0) * total) + dynamic_tokens) / new_total,
+            "cache_hit_percent": ((float(existing.get("cache_hit_percent") or 0) * total) + cache_hit_percent) / new_total,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    _ensure_mongo_write_allowed(config)
+    _mongo_upsert_by_pk(config, "prompt_metrics", "prompt_version", payload)
+    return
+def save_ai_experiment(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    name = str(row["name"])
+    _ensure_mongo_write_allowed(config)
+    existing = _mongo_find_one(config, "ai_experiments", query={"name": name})
+    payload = {
+        "id": int((existing or {}).get("id") or _mongo_next_id(config, "ai_experiments")),
+        "name": name,
+        "description": str(row.get("description") or ""),
+        "prompt_version": str(row.get("prompt_version") or ""),
+        "traffic_percent": float(row.get("traffic_percent") or 0),
+        "enabled": int(row.get("enabled", 0) or 0),
+        "created_at": str((existing or {}).get("created_at") or row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+    }
+    _mongo_upsert_by_pk(config, "ai_experiments", "name", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_ai_experiments(config))
+    return payload
+
+
+def prune_ai_experiments(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "ai_experiments_keep_days", 365))
+    return _prune_by_created_at(config, "ai_experiments", keep_days=keep_days, preserve_query={"enabled": 1})
+def list_ai_experiment_rows(config: dict[str, Any], *, enabled_only: bool = False) -> list[dict[str, Any]]:
+    query = {"enabled": 1} if enabled_only else None
+    return _mongo_find_many(config, "ai_experiments", query=query, sort=[("created_at", -1), ("id", -1)])
+def get_strategy_version(config: dict[str, Any], version: str) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "strategy_versions", query={"version": version})
+def ensure_strategy_version(config: dict[str, Any], row: dict[str, Any]) -> None:
+    if get_strategy_version(config, str(row["version"])) is not None:
+        return
+    save_strategy_version(config, row, deactivate_others=False)
+
+
+def save_strategy_version(config: dict[str, Any], row: dict[str, Any], *, deactivate_others: bool = False) -> dict[str, Any]:
+    version = str(row["version"])
+    existing = get_strategy_version(config, version)
+    payload = {
+        "version": version,
+        "name": str(row.get("name") or version.upper()),
+        "description": str(row.get("description") or ""),
+        "created_at": str((existing or {}).get("created_at") or row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        "is_active": int(row.get("is_active", 0) or 0),
+        "traffic_percent": float(row.get("traffic_percent") or 0),
+        "indicators_json": row.get("indicators_json") or "{}",
+        "rules_json": row.get("rules_json") or "{}",
+        "risk_config_json": row.get("risk_config_json") or "{}",
+        "payload_json": row.get("payload_json") or "{}",
+    }
+    _ensure_mongo_write_allowed(config)
+    collection = _mongo_collection(config, "strategy_versions")
+    if deactivate_others and payload["is_active"]:
+        collection.update_many({}, {"$set": {"is_active": 0}})
+    payload["id"] = int((existing or {}).get("id") or _mongo_next_id(config, "strategy_versions"))
+    _mongo_upsert_by_pk(config, "strategy_versions", "version", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_strategy_versions(config))
+    return payload
+def activate_strategy_version_record(config: dict[str, Any], version: str) -> dict[str, Any] | None:
+    row = get_strategy_version(config, version)
+    if row is None:
+        return None
+    _ensure_mongo_write_allowed(config)
+    collection = _mongo_collection(config, "strategy_versions")
+    collection.update_many({}, {"$set": {"is_active": 0}})
+    collection.update_one({"version": version}, {"$set": {"is_active": 1}})
+    return _mongo_find_one(config, "strategy_versions", query={"version": version})
+def list_strategy_versions(
+    config: dict[str, Any],
+    *,
+    active_only: bool | None = None,
+    order: str = "created_desc",
+) -> list[dict[str, Any]]:
+    if order == "id_asc":
+        sort = [("id", 1)]
+    elif order == "created_asc":
+        sort = [("created_at", 1), ("id", 1)]
+    else:
+        sort = [("created_at", -1), ("id", -1)]
+    query: dict[str, Any] | None = None
+    if active_only is True:
+        query = {"is_active": 1}
+    elif active_only is False:
+        query = None
+    return _mongo_find_many(config, "strategy_versions", query=query, sort=sort)
+
+
+def prune_strategy_versions(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "strategy_versions_keep_days", 365))
+    return _prune_by_created_at(config, "strategy_versions", keep_days=keep_days, preserve_query={"is_active": 1})
+def insert_market_regime_history(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "created_at": row.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "regime": row.get("regime") or "UNKNOWN",
+        "confidence": row.get("confidence") or 0,
+        "indicators_json": row.get("indicators_json") or "{}",
+        "reason": row.get("reason") or "",
+        "expires_at": _retention_expiry_days(_retention_days(config, "market_regime_history_keep_days", 14)),
+    }
+    _ensure_mongo_write_allowed(config)
+    payload["id"] = _mongo_next_id(config, "market_regime_history")
+    _mongo_upsert_by_pk(config, "market_regime_history", "id", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_market_regime_history(config))
+    return payload
+def latest_market_regime_history(config: dict[str, Any]) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "market_regime_history", sort=[("created_at", -1), ("id", -1)])
+def list_market_regime_rows(config: dict[str, Any], *, limit: int = 100) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    return _mongo_find_many(
+        config,
+        "market_regime_history",
+        sort=[("created_at", -1), ("id", -1)],
+        limit=safe_limit,
+    )
+
+
+def prune_market_regime_history(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "market_regime_history_keep_days", 14))
+    return _prune_by_created_at(config, "market_regime_history", keep_days=keep_days)
+def insert_trade_candidate_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    _ensure_mongo_write_allowed(config)
+    collection = _mongo_collection(config, "trade_candidates")
+    documents: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        payload["id"] = _mongo_next_id(config, "trade_candidates")
+        payload["is_used"] = int(payload.get("is_used", 0) or 0)
+        payload.setdefault("expires_at", _retention_expiry_days(_retention_days(config, "trade_candidates_keep_days", 2)))
+        documents.append(payload)
+    if documents:
+        collection.insert_many([{**doc, "_id": doc["id"]} for doc in documents], ordered=True)
+        _best_effort_retryable_storage_side_effect(config, lambda: prune_trade_candidates(config))
+    return len(documents)
+
+
+def prune_trade_candidates(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "trade_candidates_keep_days", 2))
+    return _prune_by_created_at(config, "trade_candidates", keep_days=keep_days)
+def list_trade_candidate_rows(
+    config: dict[str, Any],
+    *,
+    min_created_at: str | None = None,
+    unused_only: bool = False,
+    min_rule_score: float | None = None,
+    limit: int | None = None,
+    order: str = "recent",
+) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if min_created_at:
+        query["created_at"] = {"$gte": min_created_at}
+    if unused_only:
+        query["is_used"] = 0
+    if min_rule_score is not None:
+        query["rule_score"] = {"$gte": float(min_rule_score)}
+    if order == "refill":
+        sort = [("rule_score", -1), ("gpt_confidence", -1), ("risk_reward", -1), ("id", 1)]
+    else:
+        sort = [("created_at", -1), ("id", -1)]
+    return _mongo_find_many(config, "trade_candidates", query=query or None, sort=sort, limit=limit)
+def mark_trade_candidate_used(config: dict[str, Any], candidate_id: int, *, used_at: str | None = None) -> None:
+    now = str(used_at or datetime.now(timezone.utc).isoformat())
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "trade_candidates").update_one(
+        {"id": int(candidate_id)},
+        {"$set": {"is_used": 1, "used_at": now}},
+    )
+    return
+def claim_trade_candidate(config: dict[str, Any], candidate_id: int, *, used_at: str | None = None) -> bool:
+    now = str(used_at or datetime.now(timezone.utc).isoformat())
+    _ensure_mongo_write_allowed(config)
+    result = _mongo_collection(config, "trade_candidates").update_one(
+        {"id": int(candidate_id), "is_used": 0},
+        {"$set": {"is_used": 1, "used_at": now}},
+    )
+    return int(result.modified_count or 0) == 1
+def insert_ai_trade_decision_row(config: dict[str, Any], row: dict[str, Any]) -> int:
+    _ensure_mongo_write_allowed(config)
+    payload = dict(row)
+    payload["id"] = _mongo_next_id(config, "ai_trade_decisions")
+    payload.setdefault("expires_at", _retention_expiry_days(_retention_days(config, "ai_trade_decisions_keep_days", 365)))
+    _mongo_upsert_by_pk(config, "ai_trade_decisions", "id", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_ai_trade_decisions(config))
+    return int(payload["id"])
+
+
+def prune_ai_trade_decisions(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "ai_trade_decisions_keep_days", 365))
+    return _prune_by_created_at(config, "ai_trade_decisions", keep_days=keep_days)
+def list_ai_trade_decision_rows(
+    config: dict[str, Any],
+    *,
+    limit: int = 50,
+    include_details: bool = True,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    projection = None if include_details else {
+        "id": 1,
+        "created_at": 1,
+        "symbol": 1,
+        "timeframe": 1,
+        "decision": 1,
+        "confidence": 1,
+        "rule_score": 1,
+        "side": 1,
+        "trade_status": 1,
+        "pnl": 1,
+        "closed_at": 1,
+        "model_name": 1,
+        "model_version": 1,
+        "strategy_version": 1,
+        "market_regime": 1,
+    }
+    return _mongo_find_many(
+        config,
+        "ai_trade_decisions",
+        sort=[("created_at", -1), ("id", -1)],
+        limit=safe_limit,
+        projection=projection,
+    )
+
+
+def list_ai_trade_decision_stat_rows(config: dict[str, Any], *, limit: int = 50) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    return _list_ai_trade_decision_stat_rows(config, limit=safe_limit)
+
+
+def _list_ai_trade_decision_stat_rows(
+    config: dict[str, Any],
+    *,
+    limit: int,
+    created_from: str | None = None,
+    created_to: str | None = None,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    query: dict[str, Any] = {}
+    created_range: dict[str, str] = {}
+    if created_from:
+        created_range["$gte"] = str(created_from)
+    if created_to:
+        created_range["$lt"] = str(created_to)
+    if created_range:
+        query["created_at"] = created_range
+
+    def _operation() -> list[dict[str, Any]]:
+        cursor = (
+            _mongo_collection(config, "ai_trade_decisions")
+            .find(
+                query,
+                {
+                    "_id": 0,
+                    "created_at": 1,
+                    "decision": 1,
+                    "trade_status": 1,
+                    "confidence": 1,
+                    "pnl": 1,
+                },
+            )
+            .sort([("created_at", -1), ("id", -1)])
+            .limit(safe_limit)
+        )
+        return [dict(row) for row in cursor]
+
+    return _mongo_call_with_retry(config, _operation)
+
+
+def list_ai_trade_decision_stat_rows_for_period(
+    config: dict[str, Any],
+    *,
+    created_from: str,
+    created_to: str,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    return _list_ai_trade_decision_stat_rows(
+        config,
+        limit=limit,
+        created_from=created_from,
+        created_to=created_to,
+    )
+
+
+def mark_ai_trade_decisions_closed(
+    config: dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+    trade_status: str,
+    pnl: float | None,
+    closed_at: str | None,
+) -> None:
+    updates = {
+        "trade_status": trade_status,
+        "pnl": pnl,
+        "closed_at": closed_at,
+    }
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "ai_trade_decisions").update_many(
+        {"symbol": symbol, "side": side, "trade_status": None},
+        {"$set": updates},
+    )
+    return
+def insert_trade_execution_row(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    _ensure_mongo_write_allowed(config)
+    payload = dict(row)
+    payload["id"] = _mongo_next_id(config, "trade_executions")
+    payload.setdefault(
+        "trade_event_history_json",
+        json.dumps(
+            [
+                {
+                    "type": "open",
+                    "created_at": payload.get("created_at"),
+                    "status": payload.get("status"),
+                    "symbol": payload.get("symbol"),
+                    "side": payload.get("side"),
+                    "entry_price": payload.get("entry_price"),
+                    "stop_loss": payload.get("stop_loss"),
+                    "take_profit": payload.get("take_profit"),
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    _mongo_upsert_by_pk(config, "trade_executions", "id", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_trade_executions(config))
+    return payload
+
+
+def prune_trade_executions(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "trade_executions_keep_days", 365))
+    cutoff = _iso_cutoff_days(keep_days)
+    _ensure_mongo_write_allowed(config)
+    deleted = int(
+        _mongo_collection(config, "trade_executions").delete_many(
+            {
+                "$and": [
+                    {"status": {"$nin": ["OPEN", "LC_PENDING"]}},
+                    {
+                        "$or": [
+                            {"closed_at": {"$lt": cutoff}},
+                            {
+                                "$and": [
+                                    {"closed_at": {"$in": [None, ""]}},
+                                    {"created_at": {"$lt": cutoff}},
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        ).deleted_count
+        or 0
+    )
+    return {"deleted_old": deleted}
+def get_trade_execution(config: dict[str, Any], trade_execution_id: int) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "trade_executions", query={"id": int(trade_execution_id)})
+def list_trade_execution_rows(
+    config: dict[str, Any],
+    *,
+    statuses: list[str] | tuple[str, ...] | None = None,
+    strategy_version: str | None = None,
+    ids: list[int] | None = None,
+    limit: int | None = None,
+    order: str = "created_desc",
+) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if statuses:
+        query["status"] = {"$in": [str(status) for status in statuses]}
+    if strategy_version:
+        query["strategy_version"] = strategy_version
+    if ids:
+        query["id"] = {"$in": [int(value) for value in ids]}
+    if order == "created_asc":
+        sort = [("created_at", 1), ("id", 1)]
+    elif order == "closed_desc":
+        sort = [("closed_at", -1), ("updated_at", -1), ("created_at", -1), ("id", -1)]
+    else:
+        sort = [("created_at", -1), ("id", -1)]
+    return _mongo_find_many(config, "trade_executions", query=query or None, sort=sort, limit=limit)
+def update_trade_execution(config: dict[str, Any], trade_execution_id: int, updates: dict[str, Any]) -> dict[str, Any] | None:
+    if not updates:
+        return get_trade_execution(config, trade_execution_id)
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "trade_executions").update_one({"id": int(trade_execution_id)}, {"$set": dict(updates)})
+    return get_trade_execution(config, trade_execution_id)
+
+def append_trade_execution_event(
+    config: dict[str, Any],
+    trade_execution_id: int,
+    event: dict[str, Any],
+    *,
+    max_events: int = 50,
+) -> dict[str, Any] | None:
+    row = get_trade_execution(config, trade_execution_id)
+    if row is None:
+        return None
+    history_raw = row.get("trade_event_history_json")
+    history: list[dict[str, Any]] = []
+    if history_raw:
+        try:
+            parsed = json.loads(str(history_raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = []
+        if isinstance(parsed, list):
+            history = [item for item in parsed if isinstance(item, dict)]
+    history.append(dict(event))
+    if max_events > 0 and len(history) > max_events:
+        history = history[-max_events:]
+    updates = {
+        "trade_event_history_json": json.dumps(history, ensure_ascii=False, default=str),
+        "updated_at": str(event.get("created_at") or event.get("updated_at") or row.get("updated_at") or ""),
+    }
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "trade_executions").update_one({"id": int(trade_execution_id)}, {"$set": updates})
+    return get_trade_execution(config, trade_execution_id)
+
+
+def reclassify_unknown_trade_closures(config: dict[str, Any]) -> int:
+    _ensure_mongo_write_allowed(config)
+    now = datetime.now(timezone.utc).isoformat()
+    result = _mongo_collection(config, "trade_executions").update_many(
+        {
+            "status": "CLOSED",
+            "close_reason": {
+                "$in": [
+                    "exchange_position_no_longer_open",
+                    "duplicate_open_execution_reconciled",
+                ]
+            },
+        },
+        {
+            "$set": {
+                "status": "RECONCILED",
+                "position_slot": None,
+                "updated_at": now,
+            }
+        },
+    )
+    return int(result.modified_count or 0)
+def close_latest_trade_execution_by_status(
+    config: dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+    source_status: str,
+    target_status: str,
+    reason: str | None = None,
+    closed_at: str | None = None,
+) -> dict[str, Any] | None:
+    when = str(closed_at or datetime.now(timezone.utc).isoformat())
+    row = _mongo_find_one(
+        config,
+        "trade_executions",
+        query={"symbol": symbol, "side": side, "status": source_status},
+        sort=[("created_at", -1), ("id", -1)],
+    )
+    if row is None:
+        return None
+    return update_trade_execution(
+        config,
+        int(row["id"]),
+        {
+            "status": target_status,
+            "reject_reason": reason,
+            "closed_at": when,
+            "updated_at": when,
+        },
+    )
+def list_trade_execution_ids(config: dict[str, Any], *, limit: int) -> list[int]:
+    rows = list_trade_execution_rows(config, limit=limit, order="created_desc")
+    return [int(row["id"]) for row in rows if row.get("id") is not None]
+
+
+def get_trading_system_state_row(config: dict[str, Any]) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "trading_system_state", query={"id": 1})
+def upsert_trading_system_state_row(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["id"] = 1
+    _ensure_mongo_write_allowed(config)
+    _mongo_upsert_by_pk(config, "trading_system_state", "id", payload)
+    return payload
+def get_trading_health_state_row(config: dict[str, Any]) -> dict[str, Any] | None:
+    return _mongo_find_one(config, "trading_health_state", query={"id": 1})
+def upsert_trading_health_state_row(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["id"] = 1
+    _ensure_mongo_write_allowed(config)
+    _mongo_upsert_by_pk(config, "trading_health_state", "id", payload)
+    return payload
+def insert_replay_history_row(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    _ensure_mongo_write_allowed(config)
+    payload = dict(row)
+    payload["id"] = _mongo_next_id(config, "replay_history")
+    payload["expires_at"] = _retention_expiry_days(_retention_days(config, "replay_history_keep_days", 30))
+    _mongo_upsert_by_pk(config, "replay_history", "id", payload)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_replay_history(config))
+    return payload
+
+
+def prune_replay_history(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "replay_history_keep_days", 30))
+    cutoff = _iso_cutoff_days(keep_days)
+    _ensure_mongo_write_allowed(config)
+    deleted = int(
+        _mongo_collection(config, "replay_history").delete_many(
+            {
+                "$or": [
+                    {"replay_at": {"$lt": cutoff}},
+                    {
+                        "$and": [
+                            {"replay_at": {"$in": [None, ""]}},
+                            {"created_at": {"$lt": cutoff}},
+                        ]
+                    },
+                ]
+            }
+        ).deleted_count
+        or 0
+    )
+    return {"deleted_old": deleted}
+def list_replay_history_rows(
+    config: dict[str, Any],
+    *,
+    limit: int | None = None,
+    include_trade_execution: bool = False,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit)) if limit is not None else None
+    rows = _mongo_find_many(config, "replay_history", sort=[("replay_at", -1), ("id", -1)], limit=safe_limit)
+    if not include_trade_execution or not rows:
+        return rows
+    execution_ids = [int(row["trade_execution_id"]) for row in rows if row.get("trade_execution_id") is not None]
+    executions = {
+        int(item["id"]): item
+        for item in list_trade_execution_rows(config, ids=execution_ids, limit=None, order="created_desc")
+    }
+    merged: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        execution = executions.get(int(row["trade_execution_id"])) if row.get("trade_execution_id") is not None else None
+        item["trade_status"] = execution.get("status") if execution else None
+        item["trade_pnl"] = execution.get("pnl") if execution else None
+        item["risk_reward"] = execution.get("risk_reward") if execution else None
+        item["gpt_confidence"] = execution.get("gpt_confidence") if execution else None
+        item["trade_created_at"] = execution.get("created_at") if execution else None
+        item["trade_closed_at"] = execution.get("closed_at") if execution else None
+        item["symbol"] = execution.get("symbol") if execution else None
+        item["side"] = execution.get("side") if execution else None
+        merged.append(item)
+    return merged
+
+
+def _is_deprecated_journal_state_key(key: str) -> bool:
+    return str(key) in DEPRECATED_JOURNAL_STATE_KEYS
+
+
+def _encode_journal_state_payload(value: str) -> dict[str, Any]:
+    payload = str(value or "")
+    raw = payload.encode("utf-8")
+    if len(raw) < JOURNAL_STATE_COMPRESSION_THRESHOLD_BYTES:
+        return {"value": payload}
+    compressed = zlib.compress(raw, level=6)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    if len(encoded) >= len(payload):
+        return {"value": payload}
+    return {
+        "value": None,
+        "value_compressed": encoded,
+        "value_encoding": "zlib+base64",
+    }
+
+
+def _decode_journal_state_payload(row: dict[str, Any] | None) -> str | None:
+    if not row:
+        return None
+    compressed = row.get("value_compressed")
+    encoding = str(row.get("value_encoding") or "")
+    if compressed and encoding == "zlib+base64":
+        try:
+            raw = zlib.decompress(base64.b64decode(str(compressed)))
+            return raw.decode("utf-8")
+        except Exception:
+            return None
+    value = row.get("value")
+    return None if value is None else str(value)
+
+
+def delete_journal_state(config: dict[str, Any], key: str) -> None:
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "journal_state").delete_one({"_id": key})
+    _journal_state_cache_invalidate(config, key)
+    return
+def delete_journal_state_prefix(config: dict[str, Any], prefix: str, *, preserve_keys: set[str] | None = None) -> int:
+    _ensure_mongo_write_allowed(config)
+    query: dict[str, Any] = {"key": {"$regex": f"^{re.escape(prefix)}"}}
+    if preserve_keys:
+        query = {
+            "$and": [
+                {"key": {"$regex": f"^{re.escape(prefix)}"}},
+                {"key": {"$nin": sorted(preserve_keys)}},
+            ]
+        }
+    deleted = int(_mongo_collection(config, "journal_state").delete_many(query).deleted_count or 0)
+    _journal_state_cache_invalidate_prefix(config, prefix)
+    return deleted
+def clear_dashboard_snapshot_cache(config: dict[str, Any]) -> None:
+    _ensure_mongo_write_allowed(config)
+    atlas = config.get("database", {}).get("atlas", {}) if isinstance(config.get("database"), dict) else {}
+    if bool(atlas.get("delete_dashboard_snapshots_on_clear", True)):
+        delete_journal_state_prefix(config, DASHBOARD_SNAPSHOT_PREFIX, preserve_keys={DASHBOARD_SNAPSHOT_VERSION_KEY})
+    set_journal_state(config, DASHBOARD_SNAPSHOT_VERSION_KEY, datetime.now(timezone.utc).isoformat())
+
+
+def dashboard_snapshot_cache_version(config: dict[str, Any]) -> str:
+    return str(get_journal_state(config, DASHBOARD_SNAPSHOT_VERSION_KEY) or "0")
+
+
+def purge_deprecated_journal_state(config: dict[str, Any]) -> list[str]:
+    removed: list[str] = []
+    _ensure_mongo_write_allowed(config)
+    for key in sorted(DEPRECATED_JOURNAL_STATE_KEYS):
+        result = _best_effort_retryable_storage_side_effect(
+            config,
+            lambda key=key: _mongo_collection(config, "journal_state").delete_one({"_id": key}),
+        )
+        if result is None:
+            LOGGER.warning("Skipping deprecated journal_state purge for key '%s' due to transient Mongo issue.", key)
+            continue
+        if int(result.deleted_count or 0) > 0:
+            removed.append(key)
+    return removed
+def get_journal_state(config: dict[str, Any], key: str) -> str | None:
+    if _is_deprecated_journal_state_key(key):
+        delete_journal_state(config, key)
+        return None
+    cached = _journal_state_cache_get(config, key)
+    if cached is not None:
+        return cached
+    try:
+        row = _mongo_collection(config, "journal_state").find_one(
+            {"_id": key},
+            {"_id": 0, "value": 1, "value_compressed": 1, "value_encoding": 1},
+        )
+    except Exception as exc:
+        stale = _journal_state_cache_get(config, key, allow_stale=True)
+        if stale is not None and _mongo_error_is_retryable(exc):
+            LOGGER.warning("Using stale journal_state cache for key '%s' after transient Mongo issue: %s", key, exc)
+            return stale
+        fallback = _journal_state_fallback_get(config, key)
+        if fallback is not None and _mongo_error_is_retryable(exc):
+            LOGGER.warning("Using local journal_state fallback for key '%s' after transient Mongo issue: %s", key, exc)
+            _journal_state_cache_set(config, key, fallback)
+            return fallback
+        raise
+    payload = _decode_journal_state_payload(row)
+    if payload is None:
+        return None
+    _journal_state_cache_set(config, key, payload)
+    if row and row.get("value") is not None and atlas_runtime_is_primary(config):
+        encoded = _encode_journal_state_payload(payload)
+        if encoded.get("value_compressed"):
+            set_journal_state(config, key, payload)
+    return payload
+def set_journal_state(config: dict[str, Any], key: str, value: str) -> None:
+    if _is_deprecated_journal_state_key(key):
+        delete_journal_state(config, key)
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    _ensure_mongo_write_allowed(config)
+    payload = _encode_journal_state_payload(value)
+    _journal_state_cache_set(config, key, str(value or ""))
+    try:
+        _mongo_collection(config, "journal_state").replace_one(
+            {"_id": key},
+            {
+                "_id": key,
+                "key": key,
+                **payload,
+                "updated_at": now,
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        if not _mongo_error_is_retryable(exc):
+            _journal_state_cache_invalidate(config, key)
+            raise
+        _journal_state_fallback_set(config, key, str(value or ""))
+        LOGGER.warning("Stored journal_state key '%s' in local fallback after transient Mongo issue: %s", key, exc)
+        return
+    _journal_state_fallback_set(config, key, str(value or ""))
+    return
+
+
+def claim_journal_state(config: dict[str, Any], key: str, value: str) -> bool:
+    """Create a journal-state key exactly once and report whether this caller won."""
+    if _is_deprecated_journal_state_key(key):
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    _ensure_mongo_write_allowed(config)
+    payload = _encode_journal_state_payload(value)
+    result = _mongo_collection(config, "journal_state").update_one(
+        {"_id": key},
+        {
+            "$setOnInsert": {
+                "_id": key,
+                "key": key,
+                **payload,
+                "updated_at": now,
+            }
+        },
+        upsert=True,
+    )
+    claimed = result.upserted_id is not None
+    if claimed:
+        _journal_state_cache_set(config, key, str(value or ""))
+    else:
+        _journal_state_cache_invalidate(config, key)
+    return claimed
+
+
+def acquire_journal_lease(
+    config: dict[str, Any],
+    key: str,
+    owner: str,
+    *,
+    ttl_seconds: int = 300,
+) -> bool:
+    """Acquire or take over an expired Mongo-backed lease."""
+    from pymongo import ReturnDocument
+    from pymongo.errors import DuplicateKeyError
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    expires_at = (now + timedelta(seconds=max(30, int(ttl_seconds or 300)))).isoformat()
+    _ensure_mongo_write_allowed(config)
+    try:
+        row = _mongo_collection(config, "journal_state").find_one_and_update(
+            {
+                "_id": key,
+                "$or": [
+                    {"lease_expires_at": {"$lte": now_iso}},
+                    {"lease_expires_at": {"$exists": False}},
+                ],
+            },
+            {
+                "$setOnInsert": {"_id": key, "key": key},
+                "$set": {
+                    "value": owner,
+                    "lease_owner": owner,
+                    "lease_expires_at": expires_at,
+                    "updated_at": now_iso,
+                },
+                "$unset": {"value_compressed": "", "value_encoding": ""},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        _journal_state_cache_invalidate(config, key)
+        return False
+    acquired = bool(row and str(row.get("lease_owner") or "") == owner)
+    _journal_state_cache_invalidate(config, key)
+    return acquired
+
+
+def release_journal_lease(config: dict[str, Any], key: str, owner: str) -> bool:
+    """Release a lease only when it is still owned by this caller."""
+    _ensure_mongo_write_allowed(config)
+    result = _mongo_collection(config, "journal_state").delete_one(
+        {"_id": key, "lease_owner": owner}
+    )
+    _journal_state_cache_invalidate(config, key)
+    return bool(result.deleted_count)
+
+
+def next_global_counter(config: dict[str, Any], name: str) -> int:
+    key = f"counter:{name}"
+    _ensure_mongo_write_allowed(config)
+    from pymongo import ReturnDocument
+
+    now = datetime.now(timezone.utc).isoformat()
+    row = _mongo_collection(config, "journal_state").find_one_and_update(
+        {"key": key},
+        [
+            {
+                "$set": {
+                    "key": key,
+                    "counter_value": {"$add": [{"$ifNull": ["$counter_value", 0]}, 1]},
+                    "updated_at": now,
+                }
+            },
+            {"$set": {"value": {"$toString": "$counter_value"}}},
+        ],
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((row or {}).get("counter_value") or 1)
+def next_daily_counter(config: dict[str, Any], name: str, date_key: str) -> int:
+    key = f"counter:{name}:{date_key}"
+    _ensure_mongo_write_allowed(config)
+    from pymongo import ReturnDocument
+
+    now = datetime.now(timezone.utc).isoformat()
+    row = _mongo_collection(config, "journal_state").find_one_and_update(
+        {"key": key},
+        [
+            {
+                "$set": {
+                    "key": key,
+                    "counter_value": {"$add": [{"$ifNull": ["$counter_value", 0]}, 1]},
+                    "updated_at": now,
+                }
+            },
+            {"$set": {"value": {"$toString": "$counter_value"}}},
+        ],
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((row or {}).get("counter_value") or 1)
+def _round_float(value: Any, digits: int = 6) -> Any:
+    if isinstance(value, bool):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    return round(number, digits)
+
+
+def _trim_list(items: Any, limit: int) -> list[Any]:
+    return list(items[:limit]) if isinstance(items, list) else []
+
+
+def _compact_market_indicator(indicator: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(indicator, dict):
+        return {}
+    keep_keys = {
+        "timeframe",
+        "last",
+        "trend",
+        "rsi",
+        "atr_pct",
+        "volume_ratio",
+        "spread_pct",
+        "ema_gap_pct",
+        "price_vs_ema_fast_pct",
+        "price_vs_ema_slow_pct",
+        "support",
+        "resistance",
+        "support_distance_pct",
+        "resistance_distance_pct",
+        "range_position",
+        "signal_summary",
+        "direction",
+        "trend_context",
+        "strongest_pattern",
+        "bullish_score",
+        "bearish_score",
+    }
+    compact: dict[str, Any] = {}
+    for key in keep_keys:
+        value = indicator.get(key)
+        if value not in (None, "", [], {}):
+            compact[key] = _round_float(value)
+    patterns = indicator.get("candlestick_patterns")
+    if isinstance(patterns, dict):
+        compact["candlestick_patterns"] = {
+            "direction": patterns.get("direction"),
+            "trend_context": patterns.get("trend_context"),
+            "strongest_pattern": patterns.get("strongest_pattern"),
+            "signal_summary": patterns.get("signal_summary"),
+            "patterns": _trim_list(patterns.get("patterns"), 3),
+            "bullish_score": _round_float(patterns.get("bullish_score"), 3),
+            "bearish_score": _round_float(patterns.get("bearish_score"), 3),
+        }
+        compact["candlestick_patterns"] = {
+            key: value for key, value in compact["candlestick_patterns"].items()
+            if value not in (None, "", [], {})
+        }
+    higher_timeframes = indicator.get("higher_timeframes")
+    if isinstance(higher_timeframes, dict):
+        compact["higher_timeframes"] = {
+            str(frame): _compact_market_indicator(data)
+            for frame, data in higher_timeframes.items()
+            if isinstance(data, dict) and str(frame).lower() in {"5m", "15m", "1h", "4h"}
+        }
+        if not compact["higher_timeframes"]:
+            compact.pop("higher_timeframes", None)
+    market_pattern = indicator.get("market_pattern")
+    if isinstance(market_pattern, dict):
+        compact["market_pattern"] = {
+            key: _round_float(market_pattern.get(key))
+            for key in (
+                "snapshot_id",
+                "timeframe",
+                "trend_regime",
+                "structure_state",
+                "trend_strength",
+                "bos_detected",
+                "bos_direction",
+                "choch_detected",
+                "choch_direction",
+                "confluence_bias",
+                "confluence_score",
+                "data_quality_score",
+                "candlestick_count",
+                "chart_pattern_count",
+                "smart_money_count",
+                "support_zone_count",
+                "resistance_zone_count",
+                "candlestick_patterns",
+                "chart_patterns",
+                "smart_money_events",
+                "nearest_support",
+                "nearest_resistance",
+            )
+            if market_pattern.get(key) not in (None, "", [], {})
+        }
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _compact_market_scan_payload(candidate: TradeCandidate, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": candidate.symbol,
+        "base": candidate.base,
+        "side": candidate.side,
+        "confidence": _round_float(candidate.confidence, 3),
+        "win_probability_pct": _round_float(candidate.win_probability_pct, 3),
+        "risk_reward": _round_float(candidate.risk_reward, 3),
+        "entry": _round_float(candidate.entry),
+        "stop_loss": _round_float(candidate.stop_loss),
+        "take_profit": _round_float(candidate.take_profit),
+        "order_usdt": _round_float(candidate.order_usdt, 4),
+        "quantity": _round_float(candidate.quantity, 8),
+        "spread_pct": _round_float(candidate.spread_pct, 5),
+        "news_score": _round_float(candidate.news_score, 4),
+        "news_count": candidate.news_count,
+        "target_mode": candidate.target_mode,
+        "take_profit_pct": _round_float(candidate.take_profit_pct, 3),
+        "stop_loss_pct": _round_float(candidate.stop_loss_pct, 3),
+        "price_take_profit_pct": _round_float(candidate.price_take_profit_pct, 4),
+        "price_stop_loss_pct": _round_float(candidate.price_stop_loss_pct, 4),
+        "setup_quality": candidate.setup_quality,
+        "market_regime": candidate.market_regime,
+        "regime_confidence": _round_float(candidate.regime_confidence, 3),
+        "scan_source": candidate.scan_source,
+        "indicator_summary": _compact_market_indicator(candidate.indicator_summary),
+        "reasons": _trim_list(payload.get("reasons"), 4),
+        "warnings": _trim_list(payload.get("warnings"), 3),
+    }
+
+
+def _compact_frame_payload(candidate: TradeCandidate, frame_name: str, frame_indicator: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": candidate.symbol,
+        "side": candidate.side,
+        "timeframe": str(frame_name),
+        "confidence": _round_float(candidate.confidence, 3),
+        "win_probability_pct": _round_float(candidate.win_probability_pct, 3),
+        "risk_reward": _round_float(candidate.risk_reward, 3),
+        "frame_summary": _compact_market_indicator(frame_indicator),
+    }
+
+
+def _json_limited(payload: dict[str, Any], max_bytes: int) -> str:
+    text = json.dumps(
+        {key: value for key, value in payload.items() if value not in (None, "", [], {})},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max(256, max_bytes):
+        return text
+    trimmed = dict(payload)
+    for key in ("reasons", "warnings"):
+        if isinstance(trimmed.get(key), list):
+            trimmed[key] = trimmed[key][:1]
+    for key in ("indicator_summary", "frame_summary"):
+        if isinstance(trimmed.get(key), dict):
+            compact = dict(trimmed[key])
+            compact.pop("higher_timeframes", None)
+            compact.pop("candlestick_patterns", None)
+            trimmed[key] = compact
+    text = json.dumps(
+        {key: value for key, value in trimmed.items() if value not in (None, "", [], {})},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(text.encode("utf-8")) <= max(256, max_bytes):
+        return text
+    return json.dumps(
+        {
+            "symbol": payload.get("symbol"),
+            "side": payload.get("side"),
+            "timeframe": payload.get("timeframe"),
+            "confidence": payload.get("confidence"),
+            "win_probability_pct": payload.get("win_probability_pct"),
+            "risk_reward": payload.get("risk_reward"),
+            "entry": payload.get("entry"),
+            "stop_loss": payload.get("stop_loss"),
+            "take_profit": payload.get("take_profit"),
+            "truncated": True,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def save_decision(config: dict[str, Any], decision: Decision) -> int:
+    payload = to_jsonable(decision)
+    selected = decision.selected
+    row_id = _insert_decision_payload(config, decision, payload, selected)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_decision_history(config))
+    return row_id
+
+
+def _insert_decision_payload(
+    config: dict[str, Any],
+    decision: Decision,
+    payload: dict[str, Any],
+    selected: TradeCandidate | None,
+) -> int:
+    _ensure_mongo_write_allowed(config)
+    row_id = _mongo_next_id(config, "decisions")
+    _mongo_upsert_by_pk(
+        config,
+        "decisions",
+        "id",
+        {
+            "id": row_id,
+            "created_at": payload["created_at"],
+            "action": decision.action,
+            "selected_symbol": selected.symbol if selected else None,
+            "selected_side": selected.side if selected else None,
+            "selected_win_probability_pct": selected.win_probability_pct if selected else None,
+            "payload_json": json.dumps(payload, ensure_ascii=False),
+        },
+    )
+    return row_id
+def prune_decision_history(
+    config: dict[str, Any],
+    *,
+    keep_hours: int | None = None,
+    max_rows: int | None = None,
+) -> dict[str, int]:
+    history_config = config.get("decision_history", {})
+    keep_hours = int(keep_hours or history_config.get("keep_hours", 24) or 24)
+    max_rows = int(max_rows or history_config.get("max_rows", 120) or 120)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, keep_hours))).isoformat()
+    deleted_old = 0
+    deleted_over_limit = 0
+    _ensure_mongo_write_allowed(config)
+    rows = _mongo_find_many(
+        config,
+        "decisions",
+        sort=[("created_at", -1), ("id", -1)],
+        projection={"id": 1, "created_at": 1},
+    )
+    latest_id = rows[0]["id"] if rows else None
+    stale_ids = [row["id"] for row in rows if row.get("created_at", "") < cutoff and row.get("id") != latest_id]
+    if stale_ids:
+        deleted_old = int(_mongo_collection(config, "decisions").delete_many({"id": {"$in": stale_ids}}).deleted_count or 0)
+    rows = _mongo_find_many(
+        config,
+        "decisions",
+        sort=[("created_at", -1), ("id", -1)],
+        projection={"id": 1, "created_at": 1},
+    )
+    overflow_ids = [row["id"] for row in rows[max(1, max_rows) :]]
+    if overflow_ids:
+        deleted_over_limit = int(
+            _mongo_collection(config, "decisions").delete_many({"id": {"$in": overflow_ids}}).deleted_count or 0
+        )
+    return {"deleted_old": deleted_old, "deleted_over_limit": deleted_over_limit}
+def save_market_scan_observations(
+    config: dict[str, Any],
+    candidates: list[TradeCandidate],
+    *,
+    source: str,
+    limit: int = 100,
+) -> int:
+    if not candidates:
+        return 0
+    memory_config = config.get("market_scan_memory", {})
+    max_json_bytes = int(memory_config.get("max_json_bytes", DEFAULT_MARKET_SCAN_MAX_JSON_BYTES) or DEFAULT_MARKET_SCAN_MAX_JSON_BYTES)
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[tuple[Any, ...]] = []
+    for candidate in candidates[: max(1, int(limit or 100))]:
+        payload = to_jsonable(candidate)
+        indicator = _compact_market_indicator(to_jsonable(candidate.indicator_summary or {}))
+        compact_payload = _compact_market_scan_payload(candidate, payload if isinstance(payload, dict) else {})
+        score = float(candidate.win_probability_pct or candidate.confidence or 0)
+        timeframe = str(indicator.get("timeframe") or config.get("strategy", {}).get("timeframe") or "")
+        rows.append(
+            (
+                now,
+                source,
+                candidate.symbol,
+                candidate.side,
+                timeframe,
+                candidate.confidence,
+                candidate.win_probability_pct,
+                candidate.risk_reward,
+                score,
+                _json_limited(indicator, max_json_bytes),
+                _json_limited(compact_payload, max_json_bytes),
+            )
+        )
+        higher_timeframes = payload.get("higher_timeframes") if isinstance(payload, dict) else {}
+        if isinstance(higher_timeframes, dict):
+            for frame_name, frame_payload in higher_timeframes.items():
+                if not isinstance(frame_payload, dict):
+                    continue
+                frame_indicator = _compact_market_indicator(dict(frame_payload))
+                frame_indicator.setdefault("timeframe", str(frame_name))
+                frame_payload_json = _compact_frame_payload(candidate, str(frame_name), frame_indicator)
+                frame_score = float(
+                    frame_indicator.get("bullish_score")
+                    or frame_indicator.get("bearish_score")
+                    or (frame_indicator.get("candlestick_patterns") or {}).get("bullish_score")
+                    or (frame_indicator.get("candlestick_patterns") or {}).get("bearish_score")
+                    or candidate.confidence
+                    or 0
+                )
+                rows.append(
+                    (
+                        now,
+                        source,
+                        candidate.symbol,
+                        candidate.side,
+                        str(frame_name),
+                        candidate.confidence,
+                        candidate.win_probability_pct,
+                        candidate.risk_reward,
+                        frame_score,
+                        _json_limited(frame_indicator, max_json_bytes),
+                        _json_limited(frame_payload_json, max_json_bytes),
+                    )
+                )
+    _update_local_market_scan_cache(config, rows)
+    _insert_market_scan_rows(config, rows)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_market_scan_observations(config))
+    return len(rows)
+
+
+def _insert_market_scan_rows(config: dict[str, Any], rows: list[tuple[Any, ...]]) -> None:
+    _ensure_mongo_write_allowed(config)
+    ids = _mongo_reserve_ids(config, "market_scan_observations", len(rows))
+    expires_at = _retention_expiry_hours(float(config.get("market_scan_memory", {}).get("keep_hours", 24) or 24))
+    documents = [
+        {
+            "_id": row_id,
+            "id": row_id,
+            "created_at": row[0],
+            "source": row[1],
+            "symbol": row[2],
+            "side": row[3],
+            "timeframe": row[4],
+            "confidence": row[5],
+            "win_probability_pct": row[6],
+            "risk_reward": row[7],
+            "score": row[8],
+            "indicator_json": row[9],
+            "payload_json": row[10],
+            "expires_at": expires_at,
+        }
+        for row_id, row in zip(ids, rows)
+    ]
+    if documents:
+        _mongo_collection(config, "market_scan_observations").insert_many(documents, ordered=False)
+    return
+def prune_market_scan_observations(
+    config: dict[str, Any],
+    *,
+    keep_hours: int | None = None,
+    max_rows_per_symbol_timeframe: int | None = None,
+) -> dict[str, int]:
+    memory_config = config.get("market_scan_memory", {})
+    keep_hours = int(keep_hours or memory_config.get("keep_hours", 72) or 72)
+    max_rows = int(
+        max_rows_per_symbol_timeframe
+        or memory_config.get("max_rows_per_symbol_timeframe", 200)
+        or 200
+    )
+    overflow_batch_limit = max(1, int(memory_config.get("prune_overflow_batch_limit", 500) or 500))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, keep_hours))).isoformat()
+    deleted_old = 0
+    deleted_over_limit = 0
+    _ensure_mongo_write_allowed(config)
+    collection = _mongo_collection(config, "market_scan_observations")
+    has_old_row = _mongo_call_with_retry(
+        config,
+        lambda: collection.find_one(
+            {"created_at": {"$lt": cutoff}},
+            {"_id": 0, "id": 1},
+            sort=[("created_at", 1), ("id", 1)],
+        ),
+    )
+    if has_old_row:
+        deleted_old = int(collection.delete_many({"created_at": {"$lt": cutoff}}).deleted_count or 0)
+
+    def _group_counts() -> list[dict[str, Any]]:
+        return list(
+            collection.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": {"symbol": "$symbol", "timeframe": "$timeframe"},
+                            "count": {"$sum": 1},
+                        }
+                    },
+                    {"$match": {"count": {"$gt": max(1, max_rows)}}},
+                    {"$sort": {"_id.symbol": 1, "_id.timeframe": 1}},
+                ]
+            )
+        )
+
+    groups = _mongo_call_with_retry(config, _group_counts)
+    overflow_ids: list[int] = []
+    remaining = overflow_batch_limit
+    for group in groups:
+        if remaining <= 0:
+            break
+        group_key = group.get("_id") if isinstance(group.get("_id"), dict) else {}
+        symbol = str(group_key.get("symbol") or "")
+        timeframe = str(group_key.get("timeframe") or "")
+        if not symbol or not timeframe:
+            continue
+
+        def _overflow_rows(symbol: str = symbol, timeframe: str = timeframe, remaining: int = remaining) -> list[dict[str, Any]]:
+            cursor = (
+                collection.find(
+                    {"symbol": symbol, "timeframe": timeframe},
+                    {"_id": 0, "id": 1},
+                )
+                .sort([("created_at", -1), ("id", -1)])
+                .skip(max(1, max_rows))
+                .limit(remaining)
+            )
+            return [dict(row) for row in cursor]
+
+        rows = _mongo_call_with_retry(config, _overflow_rows)
+        for row in rows:
+            if row.get("id") is not None:
+                overflow_ids.append(int(row["id"]))
+        remaining = max(0, overflow_batch_limit - len(overflow_ids))
+    if overflow_ids:
+        deleted_over_limit = int(collection.delete_many({"id": {"$in": overflow_ids}}).deleted_count or 0)
+    return {
+        "deleted_old": deleted_old,
+        "deleted_over_limit": deleted_over_limit,
+    }
+def compact_market_scan_observations(config: dict[str, Any], *, batch_limit: int = 200) -> dict[str, int]:
+    memory_config = config.get("market_scan_memory", {})
+    max_json_bytes = int(memory_config.get("max_json_bytes", DEFAULT_MARKET_SCAN_MAX_JSON_BYTES) or DEFAULT_MARKET_SCAN_MAX_JSON_BYTES)
+    checked = 0
+    compacted = 0
+    _ensure_mongo_write_allowed(config)
+    rows = _mongo_find_many(config, "market_scan_observations", sort=[("id", -1)], limit=max(1, int(batch_limit or 5000)))
+    for row in rows:
+        checked += 1
+        try:
+            indicator = json.loads(str(row.get("indicator_json") or "{}"))
+        except json.JSONDecodeError:
+            indicator = {}
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        compact_indicator_json = _json_limited(_compact_market_indicator(indicator), max_json_bytes)
+        compact_payload_json = _json_limited(payload if isinstance(payload, dict) else {}, max_json_bytes)
+        if compact_indicator_json != str(row.get("indicator_json") or "") or compact_payload_json != str(
+            row.get("payload_json") or ""
+        ):
+            _mongo_collection(config, "market_scan_observations").update_one(
+                {"id": row["id"]},
+                {"$set": {"indicator_json": compact_indicator_json, "payload_json": compact_payload_json}},
+            )
+            compacted += 1
+    return {"checked": checked, "compacted": compacted}
+def storage_stats(config: dict[str, Any]) -> dict[str, Any]:
+    tables = [
+        "decisions",
+        "paper_trades",
+        "pending_orders",
+        "internal_pending_orders",
+        "journal_state",
+        "trade_memory",
+        "market_guard_observations",
+        "market_scan_observations",
+        "prompt_metrics",
+        "prompt_versions",
+        "strategy_versions",
+        "ai_model_versions",
+        "ai_experiments",
+        "ai_trade_decisions",
+        "trade_executions",
+        "trading_system_state",
+        "trading_health_state",
+        "trade_candidates",
+        "market_regime_history",
+        "replay_history",
+        "capital_snapshots",
+        "capital_reserve_states",
+        "position_size_calculations",
+        "trading_config_versions",
+        "configuration_impact_reports",
+    ]
+
+    def _collection_row_count(table: str) -> int:
+        collection = _mongo_collection(config, table)
+        try:
+            return int(collection.estimated_document_count())
+        except Exception:
+            return int(collection.count_documents({}))
+
+    def _collection_payload_bytes(table: str) -> int:
+        collection = _mongo_collection(config, table)
+        try:
+            rows = list(
+                collection.aggregate(
+                    [
+                        {
+                            "$project": {
+                                "payload_size": {
+                                    "$strLenBytes": {
+                                        "$ifNull": ["$payload_json", ""],
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "total_bytes": {"$sum": "$payload_size"},
+                            }
+                        },
+                    ]
+                )
+            )
+            return int((rows[0] if rows else {}).get("total_bytes") or 0)
+        except Exception:
+            total = 0
+            for row in collection.find({}, {"payload_json": 1}):
+                total += len(str(row.get("payload_json") or "").encode("utf-8"))
+            return total
+
+    row_counts: dict[str, int] = {}
+    payload_bytes: dict[str, int] = {}
+    collection_databases: dict[str, str] = {}
+    for table in tables:
+        row_counts[table] = _collection_row_count(table)
+        payload_bytes[table] = _collection_payload_bytes(table)
+        collection_databases[table] = atlas_collection_database_name(config, table)
+    try:
+        timeframe_rows = _mongo_collection(config, "market_scan_observations").aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$timeframe",
+                        "rows": {"$sum": 1},
+                        "symbols": {"$addToSet": "$symbol"},
+                        "latest_at": {"$max": "$created_at"},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    except Exception:
+        timeframe_rows = []
+    market_scan_by_timeframe = [
+        {
+            "timeframe": row.get("_id"),
+            "rows": int(row.get("rows") or 0),
+            "symbols": len(row.get("symbols") or []),
+            "latest_at": row.get("latest_at"),
+        }
+        for row in timeframe_rows
+    ]
+    return {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "db_path": f"atlas:{atlas_database(config).name}",
+        "db_paths": {
+            "runtime": f"atlas:{atlas_database(config).name}",
+            "ai": f"atlas:{atlas_collection_database_name(config, 'ai_trade_decisions')}",
+        },
+        "collection_databases": collection_databases,
+        "backend": "atlas",
+        "files": {},
+        "disk": {},
+        "row_counts": row_counts,
+        "payload_bytes": payload_bytes,
+        "market_scan_by_timeframe": market_scan_by_timeframe,
+        "retention": {
+            "market_scan_memory": config.get("market_scan_memory", {}),
+            "decision_history": config.get("decision_history", {}),
+            "market_guard": {"memory_keep_hours": config.get("market_guard", {}).get("memory_keep_hours", 6)},
+            "pending_orders": config.get("pending_orders", {}),
+            "journal_state_retention": _journal_state_retention(config),
+            "storage_retention": _storage_retention(config),
+        },
+    }
+
+def storage_stats_lightweight(config: dict[str, Any], *, error: Exception | None = None) -> dict[str, Any]:
+    """Return cheap storage metadata without collection-wide scans."""
+    runtime_database = atlas_database_name(config, role="runtime")
+    ai_database = atlas_collection_database_name(config, "ai_trade_decisions")
+    return {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "db_path": f"atlas:{runtime_database}",
+        "db_paths": {
+            "runtime": f"atlas:{runtime_database}",
+            "ai": f"atlas:{ai_database}",
+        },
+        "backend": "atlas",
+        "lightweight": True,
+        "degraded": error is not None,
+        "error": str(error) if error is not None else None,
+        "row_counts": {},
+        "payload_bytes": {},
+        "market_scan_by_timeframe": [],
+        "retention": {
+            "market_scan_memory": config.get("market_scan_memory", {}),
+            "decision_history": config.get("decision_history", {}),
+            "market_guard": {"memory_keep_hours": config.get("market_guard", {}).get("memory_keep_hours", 6)},
+            "pending_orders": config.get("pending_orders", {}),
+            "journal_state_retention": _journal_state_retention(config),
+            "storage_retention": _storage_retention(config),
+        },
+    }
+
+def safe_storage_stats(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return storage_stats(config)
+    except Exception as exc:
+        if not _mongo_error_is_retryable(exc):
+            raise
+        LOGGER.warning("Storage stats degraded; returning lightweight stats after Mongo timeout: %s", exc)
+        return storage_stats_lightweight(config, error=exc)
+def run_storage_maintenance(
+    config: dict[str, Any],
+    *,
+    vacuum: bool = False,
+    emergency: bool = False,
+    include_stats: bool = True,
+) -> dict[str, Any]:
+    memory_config = config.get("market_scan_memory", {})
+    decision_config = config.get("decision_history", {})
+    errors: list[str] = []
+    if emergency:
+        try:
+            prune_result = prune_market_scan_observations(
+                config,
+                keep_hours=int(memory_config.get("emergency_keep_hours", 24) or 24),
+                max_rows_per_symbol_timeframe=int(memory_config.get("emergency_max_rows_per_symbol_timeframe", 50) or 50),
+            )
+        except Exception as exc:
+            if not _mongo_error_is_retryable(exc):
+                raise
+            prune_result = {"deleted_old": 0, "deleted_over_limit": 0}
+            errors.append(f"market_scan_prune: {exc}")
+        try:
+            decision_prune_result = prune_decision_history(
+                config,
+                keep_hours=int(decision_config.get("emergency_keep_hours", 6) or 6),
+                max_rows=int(decision_config.get("emergency_max_rows", 30) or 30),
+            )
+        except Exception as exc:
+            if not _mongo_error_is_retryable(exc):
+                raise
+            decision_prune_result = {"deleted_old": 0, "deleted_over_limit": 0}
+            errors.append(f"decision_prune: {exc}")
+    else:
+        try:
+            prune_result = prune_market_scan_observations(config)
+        except Exception as exc:
+            if not _mongo_error_is_retryable(exc):
+                raise
+            prune_result = {"deleted_old": 0, "deleted_over_limit": 0}
+            errors.append(f"market_scan_prune: {exc}")
+        try:
+            decision_prune_result = prune_decision_history(config)
+        except Exception as exc:
+            if not _mongo_error_is_retryable(exc):
+                raise
+            decision_prune_result = {"deleted_old": 0, "deleted_over_limit": 0}
+            errors.append(f"decision_prune: {exc}")
+    extra_prune: dict[str, Any] = {}
+    compact_result = {"checked": 0, "compacted": 0}
+    checkpoint: list[Any] = []
+    optimized = False
+    vacuumed = False
+    _ensure_mongo_write_allowed(config)
+    try:
+        extra_prune = {
+            "pending_orders": prune_pending_orders(config),
+            "internal_pending_orders": prune_internal_pending_orders(config),
+            "trade_candidates": prune_trade_candidates(config),
+            "ai_trade_decisions": prune_ai_trade_decisions(config),
+            "market_regime_history": prune_market_regime_history(config),
+            "trade_executions": prune_trade_executions(config),
+            "prompt_versions": prune_prompt_versions(config),
+            "strategy_versions": prune_strategy_versions(config),
+            "ai_experiments": prune_ai_experiments(config),
+            "replay_history": prune_replay_history(config),
+            "paper_trades": prune_paper_trades(config),
+            "journal_state": prune_journal_state(config),
+        }
+    except Exception as exc:
+        errors.append(f"extra_prune: {exc}")
+    try:
+        compact_result = compact_market_scan_observations(
+            config,
+            batch_limit=int(memory_config.get("compact_batch_limit", 5000) or 5000),
+        )
+    except Exception as exc:
+        errors.append(f"compact_market_scan: {exc}")
+    return {
+        "ok": not errors,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "prune": prune_result,
+        "decision_prune": decision_prune_result,
+        "extra_prune": extra_prune,
+        "compact": compact_result,
+        "emergency": emergency,
+        "checkpoint": checkpoint,
+        "optimized": True,
+        "vacuumed": False,
+        "errors": errors,
+        "stats": safe_storage_stats(config) if include_stats else None,
+    }
+def recent_market_scan_memory(
+    config: dict[str, Any],
+    *,
+    symbols: list[str] | None = None,
+    timeframes: list[str] | None = None,
+    lookback_hours: int = 12,
+    per_symbol_timeframe_limit: int = 3,
+    total_limit: int = 1000,
+    include_details: bool = True,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    query: dict[str, Any] = {
+        "created_at": {
+            "$gte": (datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))).isoformat()
+        }
+    }
+    symbol_list = [str(item) for item in (symbols or []) if str(item)]
+    timeframe_list = [str(item) for item in (timeframes or []) if str(item)]
+    if symbol_list:
+        query["symbol"] = {"$in": symbol_list}
+    if timeframe_list:
+        query["timeframe"] = {"$in": timeframe_list}
+    try:
+        rows = _mongo_find_many(
+            config,
+            "market_scan_observations",
+            query=query,
+            sort=[("created_at", -1), ("id", -1)],
+            limit=max(10, int(total_limit)),
+            projection=None if include_details else {
+                "created_at": 1,
+                "source": 1,
+                "side": 1,
+                "symbol": 1,
+                "timeframe": 1,
+                "confidence": 1,
+                "win_probability_pct": 1,
+                "risk_reward": 1,
+                "score": 1,
+            },
+        )
+        normalized_rows = [
+            {
+                "created_at": item.get("created_at"),
+                "source": item.get("source"),
+                "side": item.get("side"),
+                "symbol": item.get("symbol"),
+                "timeframe": item.get("timeframe"),
+                "confidence": item.get("confidence"),
+                "win_probability_pct": item.get("win_probability_pct"),
+                "risk_reward": item.get("risk_reward"),
+                "score": item.get("score"),
+                "indicator": _json_object_or_empty(item.get("indicator_json")),
+                "payload": _json_object_or_empty(item.get("payload_json")),
+            }
+            for item in rows
+        ]
+    except Exception as exc:
+        if not _mongo_error_is_retryable(exc):
+            raise
+        normalized_rows = _load_local_market_scan_cache_rows(config)
+        cutoff = query["created_at"]["$gte"]
+        normalized_rows = [
+            item
+            for item in normalized_rows
+            if str(item.get("created_at") or "") >= cutoff
+            and (not symbol_list or str(item.get("symbol") or "") in symbol_list)
+            and (not timeframe_list or str(item.get("timeframe") or "") in timeframe_list)
+        ]
+    return _group_recent_market_scan_rows(
+        normalized_rows,
+        per_symbol_timeframe_limit=per_symbol_timeframe_limit,
+    )
+def latest_decision_payload(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        row = _mongo_find_one(config, "decisions", sort=[("id", -1)])
+        if not row:
+            return None
+        return json.loads(str(row["payload_json"]))
+    except Exception as exc:
+        if not _mongo_error_is_retryable(exc):
+            raise
+        report_path = project_path(config, config.get("report_path", "reports/latest_decision.json"))
+        if not report_path.exists():
+            return None
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+def list_paper_trades(config: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:
+    return _mongo_find_many(config, "paper_trades", sort=[("id", -1)], limit=limit)
+def active_paper_trades(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return _mongo_find_many(config, "paper_trades", query={"status": "OPEN"}, sort=[("id", 1)])
+def list_pending_orders(config: dict[str, Any], status: str = "OPEN", limit: int = 100) -> list[dict[str, Any]]:
+    migrate_legacy_pending_orders(config)
+    normalized_status = str(status or "OPEN").upper()
+    safe_limit = max(1, int(limit))
+    if normalized_status in {"OPEN", "ACTIVE"}:
+        internal_rows = _mongo_find_many(
+            config,
+            PENDING_INTERNAL_COLLECTION,
+            query={"status": {"$in": list(INTERNAL_PENDING_STATUSES + LEGACY_INTERNAL_PENDING_STATUSES)}},
+            sort=[("updated_at", -1), ("created_at", -1), ("id", -1)],
+            limit=safe_limit,
+        )
+        okx_rows = _mongo_find_many(
+            config,
+            PENDING_OKX_COLLECTION,
+            query={"status": {"$in": list(OKX_PENDING_STATUSES)}},
+            sort=[("updated_at", -1), ("created_at", -1), ("id", -1)],
+            limit=safe_limit,
+        )
+        return _merge_pending_rows(internal_rows, okx_rows, limit=safe_limit)
+    if normalized_status in INTERNAL_PENDING_STATUSES:
+        return _mongo_find_many(
+            config,
+            PENDING_INTERNAL_COLLECTION,
+            query={"status": normalized_status},
+            sort=[("updated_at", -1), ("created_at", -1), ("id", -1)],
+            limit=safe_limit,
+        )
+    okx_rows = _mongo_find_many(
+        config,
+        PENDING_OKX_COLLECTION,
+        query={"status": normalized_status},
+        sort=[("updated_at", -1), ("created_at", -1), ("id", -1)],
+        limit=safe_limit,
+    )
+    if okx_rows:
+        return okx_rows
+    return _mongo_find_many(
+        config,
+        PENDING_INTERNAL_COLLECTION,
+        query={"status": normalized_status},
+        sort=[("updated_at", -1), ("created_at", -1), ("id", -1)],
+        limit=safe_limit,
+    )
+def open_pending_symbols(config: dict[str, Any]) -> set[str]:
+    return {str(order["symbol"]) for order in list_pending_orders(config, status="OPEN")}
+
+
+def _pending_expiry(now: datetime, *, max_age_days: float = 3, max_age_hours: float | None = None) -> datetime:
+    if max_age_hours is not None:
+        return now + timedelta(hours=max(0.1, float(max_age_hours)))
+    return now + timedelta(days=max(0.1, float(max_age_days)))
+
+
+def prune_pending_orders(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    migrate_legacy_pending_orders(config)
+    keep_days = float(keep_days or _retention_days(config, "pending_orders_keep_days", 5))
+    cutoff = _iso_cutoff_days(keep_days)
+    _ensure_mongo_write_allowed(config)
+    deleted = int(_mongo_collection(config, PENDING_OKX_COLLECTION).delete_many({"created_at": {"$lt": cutoff}}).deleted_count or 0)
+    return {"deleted_old": deleted}
+
+
+def prune_internal_pending_orders(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    migrate_legacy_pending_orders(config)
+    keep_days = float(
+        keep_days
+        or _storage_retention(config).get(
+            "internal_pending_orders_keep_days",
+            _storage_retention(config).get("pending_orders_keep_days", 5),
+        )
+        or 5
+    )
+    cutoff = _iso_cutoff_days(keep_days)
+    _ensure_mongo_write_allowed(config)
+    deleted = int(_mongo_collection(config, PENDING_INTERNAL_COLLECTION).delete_many({"created_at": {"$lt": cutoff}}).deleted_count or 0)
+    return {"deleted_old": deleted}
+
+
+def save_pending_order(
+    config: dict[str, Any],
+    candidate: TradeCandidate,
+    exchange_order_id: str | None,
+    *,
+    status: str | None = None,
+    max_age_days: float = 3,
+    max_age_hours: float | None = None,
+    journal_id: int | None = None,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    migrate_legacy_pending_orders(config)
+    payload = to_jsonable(candidate)
+    normalized_status = str(status or ("LC_OKX" if exchange_order_id else "OPEN")).upper()
+    _ensure_mongo_write_allowed(config)
+    target_table = _pending_collection_for_status(normalized_status, exchange_order_id)
+    order_id = _next_pending_order_id(config)
+    row = {
+        "id": order_id,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "expires_at": _pending_expiry(now, max_age_days=max_age_days, max_age_hours=max_age_hours).isoformat(),
+        "status": normalized_status,
+        "symbol": candidate.symbol,
+        "base": candidate.base,
+        "side": candidate.side,
+        "exchange_order_id": exchange_order_id,
+        "entry": candidate.entry,
+        "stop_loss": candidate.stop_loss,
+        "take_profit": candidate.take_profit,
+        "quantity": candidate.quantity,
+        "order_usdt": candidate.order_usdt,
+        "confidence": candidate.confidence,
+        "win_probability_pct": candidate.win_probability_pct,
+        "risk_reward": candidate.risk_reward,
+        "payload_json": json.dumps(payload, ensure_ascii=False),
+        "journal_id": journal_id,
+        "close_reason": None,
+    }
+    _mongo_upsert_by_pk(config, target_table, "id", row)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_pending_orders(config))
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_internal_pending_orders(config))
+    return row
+def refresh_pending_order(
+    config: dict[str, Any],
+    order_id: int,
+    candidate: TradeCandidate,
+    *,
+    status: str | None = None,
+    max_age_days: float = 3,
+    max_age_hours: float | None = None,
+) -> None:
+    now = datetime.now(timezone.utc)
+    payload = to_jsonable(candidate)
+    migrate_legacy_pending_orders(config)
+    _ensure_mongo_write_allowed(config)
+    current_table, existing = _find_pending_record(config, order_id)
+    if existing is None:
+        return
+    updates = {
+        "updated_at": now.isoformat(),
+        "expires_at": _pending_expiry(now, max_age_days=max_age_days, max_age_hours=max_age_hours).isoformat(),
+        "entry": candidate.entry,
+        "stop_loss": candidate.stop_loss,
+        "take_profit": candidate.take_profit,
+        "quantity": candidate.quantity,
+        "order_usdt": candidate.order_usdt,
+        "confidence": candidate.confidence,
+        "win_probability_pct": candidate.win_probability_pct,
+        "risk_reward": candidate.risk_reward,
+        "payload_json": json.dumps(payload, ensure_ascii=False),
+    }
+    normalized_status = str(status or existing.get("status") or "").upper()
+    if normalized_status:
+        updates["status"] = normalized_status
+    target_table = _pending_collection_for_status(
+        normalized_status or str(existing.get("status") or ""),
+        str(existing.get("exchange_order_id") or ""),
+    )
+    if current_table == target_table:
+        _mongo_collection(config, current_table).update_one({"id": order_id}, {"$set": updates})
+        return
+    merged = dict(existing)
+    merged.update(updates)
+    _mongo_upsert_by_pk(config, target_table, "id", merged)
+    _mongo_collection(config, current_table).delete_one({"id": order_id})
+    return
+def set_pending_order_exchange_order(
+    config: dict[str, Any],
+    order_id: int,
+    candidate: TradeCandidate,
+    exchange_order_id: str,
+    *,
+    max_age_days: float = 1.5,
+) -> None:
+    now = datetime.now(timezone.utc)
+    payload = to_jsonable(candidate)
+    migrate_legacy_pending_orders(config)
+    _ensure_mongo_write_allowed(config)
+    current_table, existing = _find_pending_record(config, order_id)
+    if existing is None:
+        return
+    merged = dict(existing)
+    merged.update(
+        {
+            "updated_at": now.isoformat(),
+            "expires_at": _pending_expiry(now, max_age_days=max_age_days).isoformat(),
+            "status": "LC_OKX",
+            "exchange_order_id": exchange_order_id,
+            "entry": candidate.entry,
+            "stop_loss": candidate.stop_loss,
+            "take_profit": candidate.take_profit,
+            "quantity": candidate.quantity,
+            "order_usdt": candidate.order_usdt,
+            "confidence": candidate.confidence,
+            "win_probability_pct": candidate.win_probability_pct,
+            "risk_reward": candidate.risk_reward,
+            "payload_json": json.dumps(payload, ensure_ascii=False),
+        }
+    )
+    _mongo_upsert_by_pk(config, PENDING_OKX_COLLECTION, "id", merged)
+    if current_table != PENDING_OKX_COLLECTION:
+        _mongo_collection(config, current_table).delete_one({"id": order_id})
+    return
+def close_pending_order(config: dict[str, Any], order_id: int, status: str, reason: str) -> None:
+    normalized_status = str(status or "").upper()
+    now = datetime.now(timezone.utc).isoformat()
+    migrate_legacy_pending_orders(config)
+    _ensure_mongo_write_allowed(config)
+    current_table, existing = _find_pending_record(config, order_id)
+    if existing is None:
+        return
+    if normalized_status in {"CANCELED", "FILLED", "CLOSED"}:
+        _mongo_collection(config, current_table).delete_one({"id": order_id})
+        return
+    target_table = _pending_collection_for_status(normalized_status, str(existing.get("exchange_order_id") or ""))
+    updates = {"status": normalized_status, "updated_at": now, "close_reason": reason}
+    if current_table == target_table:
+        _mongo_collection(config, current_table).update_one({"id": order_id}, {"$set": updates})
+        return
+    merged = dict(existing)
+    merged.update(updates)
+    _mongo_upsert_by_pk(config, target_table, "id", merged)
+    _mongo_collection(config, current_table).delete_one({"id": order_id})
+    return
+def count_pending_orders(config: dict[str, Any], status: str = "OPEN") -> int:
+    migrate_legacy_pending_orders(config)
+    normalized_status = str(status or "OPEN").upper()
+    if normalized_status in {"OPEN", "ACTIVE"}:
+        internal_count = int(
+            _mongo_collection(config, PENDING_INTERNAL_COLLECTION).count_documents(
+                {"status": {"$in": list(INTERNAL_PENDING_STATUSES + LEGACY_INTERNAL_PENDING_STATUSES)}}
+            )
+        )
+        okx_count = int(
+            _mongo_collection(config, PENDING_OKX_COLLECTION).count_documents(
+                {"status": {"$in": list(OKX_PENDING_STATUSES)}}
+            )
+        )
+        return internal_count + okx_count
+    if normalized_status in INTERNAL_PENDING_STATUSES:
+        return int(_mongo_collection(config, PENDING_INTERNAL_COLLECTION).count_documents({"status": normalized_status}))
+    okx_count = int(_mongo_collection(config, PENDING_OKX_COLLECTION).count_documents({"status": normalized_status}))
+    if okx_count:
+        return okx_count
+    return int(_mongo_collection(config, PENDING_INTERNAL_COLLECTION).count_documents({"status": normalized_status}))
+def save_market_guard_observation(config: dict[str, Any], observation: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    created_at = str(observation.get("created_at") or now)
+    observed_at = str(observation.get("observed_at") or created_at)
+    symbol = str(observation.get("symbol") or "")
+    if not symbol:
+        return
+    reasons = observation.get("reasons") or []
+    _ensure_mongo_write_allowed(config)
+    existing = _mongo_find_one(
+        config,
+        "market_guard_observations",
+        query={"symbol": symbol, "observed_at": observed_at},
+        sort=[("id", -1)],
+    )
+    keep_hours = float(config.get("market_guard", {}).get("memory_keep_hours", 24) or 24)
+    row_id = int(existing["id"]) if existing else _mongo_next_id(config, "market_guard_observations")
+    _mongo_upsert_by_pk(
+        config,
+        "market_guard_observations",
+        "id",
+        {
+            "id": row_id,
+            "created_at": created_at,
+            "observed_at": observed_at,
+            "symbol": symbol,
+            "last": observation.get("last"),
+            "move_pct": observation.get("move_pct"),
+            "candle_range_pct": observation.get("candle_range_pct"),
+            "wick_pct": observation.get("wick_pct"),
+            "wick_body_ratio": observation.get("wick_body_ratio"),
+            "volume_ratio": observation.get("volume_ratio"),
+            "severity": str(observation.get("severity") or "normal"),
+            "alert_reasons_json": json.dumps(reasons, ensure_ascii=False),
+            "expires_at": _retention_expiry_hours(keep_hours),
+        },
+    )
+    _best_effort_retryable_storage_side_effect(
+        config,
+        lambda: prune_market_guard_observations(config, keep_hours=max(1, int(keep_hours))),
+    )
+    return
+def list_market_guard_observations(
+    config: dict[str, Any],
+    *,
+    symbol: str | None = None,
+    limit: int = 200,
+    since: datetime | None = None,
+) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if symbol:
+        query["symbol"] = symbol
+    if since:
+        query["observed_at"] = {"$gte": since.isoformat()}
+    rows = _mongo_find_many(config, "market_guard_observations", query=query, sort=[("observed_at", -1), ("id", -1)], limit=limit)
+    result: list[dict[str, Any]] = []
+    for item in rows:
+        try:
+            item["reasons"] = json.loads(str(item.get("alert_reasons_json") or "[]"))
+        except json.JSONDecodeError:
+            item["reasons"] = []
+        result.append(item)
+    return result
+def prune_market_guard_observations(config: dict[str, Any], *, keep_hours: int = 6) -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, keep_hours))).isoformat()
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "market_guard_observations").delete_many({"observed_at": {"$lt": cutoff}})
+    return
+def save_trade_memory(config: dict[str, Any], record: dict[str, Any], *, limit: int = 100) -> bool:
+    key = str(record.get("key") or "")
+    symbol = str(record.get("symbol") or "")
+    if not key or not symbol:
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+    pnl_usdt = record.get("pnl_usdt")
+    outcome = "win" if float(pnl_usdt or 0) > 0 else "loss" if float(pnl_usdt or 0) < 0 else "flat"
+    _ensure_mongo_write_allowed(config)
+    existing = _mongo_find_one(config, "trade_memory", query={"key": key})
+    if existing:
+        return False
+    _mongo_upsert_by_pk(
+        config,
+        "trade_memory",
+        "key",
+        {
+            "key": key,
+            "created_at": now,
+            "updated_at": now,
+            "symbol": symbol,
+            "side": record.get("side"),
+            "opened_at": record.get("opened_at"),
+            "closed_at": record.get("closed_at"),
+            "pnl_usdt": pnl_usdt,
+            "pnl_pct": record.get("pnl_pct"),
+            "outcome": outcome,
+            "source": str(record.get("source") or "okx"),
+            "payload_json": json.dumps(record.get("payload") or record, ensure_ascii=False),
+        },
+    )
+    rows = _mongo_find_many(config, "trade_memory", sort=[("closed_at", -1), ("updated_at", -1)], limit=None)
+    overflow_keys = [row["key"] for row in rows[max(1, limit) :]]
+    if overflow_keys:
+        _mongo_collection(config, "trade_memory").delete_many({"key": {"$in": overflow_keys}})
+    return True
+def list_trade_memory(config: dict[str, Any], limit: int = 100) -> list[dict[str, Any]]:
+    return _mongo_find_many(config, "trade_memory", sort=[("closed_at", -1), ("updated_at", -1)], limit=limit)
+def open_paper_trade(config: dict[str, Any], candidate: TradeCandidate) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    leverage = float(config.get("exchange", {}).get("leverage", 1) or 1)
+    payload = to_jsonable(candidate)
+    _ensure_mongo_write_allowed(config)
+    trade_id = _mongo_next_id(config, "paper_trades")
+    row = {
+        "id": trade_id,
+        "created_at": now,
+        "updated_at": now,
+        "status": "OPEN",
+        "symbol": candidate.symbol,
+        "base": candidate.base,
+        "side": candidate.side,
+        "entry": candidate.entry,
+        "stop_loss": candidate.stop_loss,
+        "take_profit": candidate.take_profit,
+        "quantity": candidate.quantity,
+        "order_usdt": candidate.order_usdt,
+        "confidence": candidate.confidence,
+        "win_probability_pct": candidate.win_probability_pct,
+        "risk_reward": candidate.risk_reward,
+        "leverage": leverage,
+        "close_price": None,
+        "close_reason": None,
+        "pnl_pct": None,
+        "payload_json": json.dumps(payload, ensure_ascii=False),
+        "expires_at": None,
+    }
+    _mongo_upsert_by_pk(config, "paper_trades", "id", row)
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_paper_trades(config))
+    return row
+def close_paper_trade(config: dict[str, Any], trade_id: int, close_price: float, reason: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    active = [trade for trade in active_paper_trades(config) if int(trade["id"]) == trade_id]
+    if not active:
+        raise ValueError(f"Paper trade {trade_id} is not open")
+    trade = active[0]
+    entry = float(trade["entry"])
+    leverage = float(trade["leverage"] or 1)
+    if trade["side"] == "long":
+        pnl_pct = ((close_price - entry) / entry) * 100 * leverage
+    else:
+        pnl_pct = ((entry - close_price) / entry) * 100 * leverage
+    _ensure_mongo_write_allowed(config)
+    _mongo_collection(config, "paper_trades").update_one(
+        {"id": trade_id},
+        {
+            "$set": {
+                "status": "CLOSED",
+                "updated_at": now,
+                "close_price": close_price,
+                "close_reason": reason,
+                "pnl_pct": round(pnl_pct, 4),
+                "expires_at": _retention_expiry_days(_retention_days(config, "paper_trades_keep_days", 30)),
+            }
+        },
+    )
+    _best_effort_retryable_storage_side_effect(config, lambda: prune_paper_trades(config))
+    updated = _mongo_find_one(config, "paper_trades", query={"id": trade_id})
+    return updated or {}
+
+
+def prune_paper_trades(config: dict[str, Any], *, keep_days: float | None = None) -> dict[str, int]:
+    keep_days = float(keep_days or _retention_days(config, "paper_trades_keep_days", 30))
+    cutoff = _iso_cutoff_days(keep_days)
+    _ensure_mongo_write_allowed(config)
+    deleted = int(
+        _mongo_collection(config, "paper_trades").delete_many(
+            {
+                "$and": [
+                    {"status": {"$ne": "OPEN"}},
+                    {
+                        "$or": [
+                            {"updated_at": {"$lt": cutoff}},
+                            {"created_at": {"$lt": cutoff}},
+                        ]
+                    },
+                ]
+            }
+        ).deleted_count
+        or 0
+    )
+    return {"deleted_old": deleted}
