@@ -18,7 +18,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div><p class="eyebrow">OKX read-only / multi-agent desk</p><h1 class="title">AI Agent Desk</h1></div>
     <div class="toolbar">
       <span class="pill" id="p-mode">mode ?</span><span class="pill" id="p-health">worker ?</span><span class="pill" id="p-sync">okx ?</span><span class="pill" id="p-rev">rev ?</span>
-      <select id="probe-symbol"><option>BTC-USDT</option><option>ETH-USDT</option></select><button id="probe">Run AI round</button><button id="refresh">Refresh</button>
+      <select id="probe-symbol"><option>BTC-USDT</option><option>ETH-USDT</option><option>SOL-USDT</option><option>BNB-USDT</option><option>XRP-USDT</option></select><button id="probe">Run AI round</button><button id="refresh">Refresh</button>
     </div>
   </header>
 

@@ -12,7 +12,7 @@ import numpy as np
 
 from app.config import Settings, TradingMode
 from app.execution.paper import PaperBroker
-from app.execution.live import LiveFuturesExecutor
+from app.execution.live import LiveFuturesExecutor, get_price_decimals
 from app.features.indicators import compute_features
 from app.market_data.okx import OKXClient
 from app.market_data.orderbook import estimated_slippage
@@ -366,7 +366,7 @@ class PaperWorker:
                 if not entry_px or not mark_px or mark_px <= 0:
                     continue
 
-                decimals = 1 if "BTC" in symbol else 2
+                decimals = get_price_decimals(symbol)
 
                 tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
                 tp2_pct = getattr(self.settings, "tp2_pct", 0.010)
@@ -753,7 +753,7 @@ class PaperWorker:
         if action == "buy" and entry and stop and entry > stop and capital_cap:
             risk_amount = (equity or 0.0) * self.settings.risk_per_trade_pct
             if is_small_account and capital_cap and capital_cap >= getattr(self.settings, "target_margin_usdt", 3.5):
-                target_notional = getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 25)
+                target_notional = getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 35)
                 quantity = target_notional / entry
                 notional = target_notional
             else:
@@ -765,7 +765,7 @@ class PaperWorker:
         elif action == "sell" and entry and stop and stop > entry and capital_cap:
             risk_amount = (equity or 0.0) * self.settings.risk_per_trade_pct
             if is_small_account and capital_cap and capital_cap >= getattr(self.settings, "target_margin_usdt", 3.5):
-                target_notional = getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 25)
+                target_notional = getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 35)
                 quantity = target_notional / entry
                 notional = target_notional
             else:
@@ -791,8 +791,8 @@ class PaperWorker:
             "max_position_pct": effective_max_pos_pct,
             "risk_per_trade_pct": self.settings.risk_per_trade_pct,
             "target_margin_usdt": getattr(self.settings, "target_margin_usdt", 3.5),
-            "target_leverage": getattr(self.settings, "target_leverage", 25),
-            "target_notional_usdt": getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 25),
+            "target_leverage": getattr(self.settings, "target_leverage", 35),
+            "target_notional_usdt": getattr(self.settings, "target_margin_usdt", 3.5) * getattr(self.settings, "target_leverage", 35),
             "slippage_pct": buy_slippage,
             "execution_enabled": (getattr(self.settings, "enable_paper_execution", False) if getattr(self.settings, "trading_mode", None) == TradingMode.paper else (getattr(self.settings, "enable_live_trading", False) and getattr(self.settings, "live_execution_enabled", False))),
             "order_type": "market",
@@ -1122,7 +1122,7 @@ class PaperWorker:
                             if str(result.get("sCode")) == "0":
                                 plan = live_res.get("order_body") or {}
                                 entry_px = proposal_data.get("entry_price") or snapshot.last
-                                decimals = 1 if "BTC" in symbol else 2
+                                decimals = get_price_decimals(symbol)
                                 pos_side = plan.get("posSide", "long")
                                 tp1_pct = getattr(self.settings, "tp1_pct", 0.006)
                                 tp2_pct = getattr(self.settings, "tp2_pct", 0.010)

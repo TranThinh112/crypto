@@ -5,7 +5,13 @@ from app.market_data.okx import OKXClient
 
 def test_okx_restricts_symbol_and_spot_order_mode():
     client=OKXClient()
-    with pytest.raises(ValueError): client.validate_symbol("SOL-USDT")
+    with pytest.raises(ValueError): client.validate_symbol("DOGE-USDT")
+    client.validate_symbol("SOL-USDT")
+    client.validate_symbol("BNB-USDT")
+    client.validate_symbol("XRP-USDT")
+    client.validate_swap_symbol("SOL-USDT-SWAP")
+    client.validate_swap_symbol("BNB-USDT-SWAP")
+    client.validate_swap_symbol("XRP-USDT-SWAP")
     with pytest.raises(ValueError): __import__("asyncio").run(client.create_order({"instId":"BTC-USDT","tdMode":"cross"}))
 
 def test_okx_private_ws_login_and_redaction():

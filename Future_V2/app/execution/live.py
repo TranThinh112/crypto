@@ -6,7 +6,28 @@ from app.config import TradingMode
 from app.execution.guards import assert_execution_mode
 
 CONFIRMATION = "I_UNDERSTAND_LIVE_TRADING_RISK"
-SWAP_BY_SYMBOL = {"BTC-USDT": "BTC-USDT-SWAP", "ETH-USDT": "ETH-USDT-SWAP"}
+SWAP_BY_SYMBOL = {
+    "BTC-USDT": "BTC-USDT-SWAP",
+    "ETH-USDT": "ETH-USDT-SWAP",
+    "SOL-USDT": "SOL-USDT-SWAP",
+    "BNB-USDT": "BNB-USDT-SWAP",
+    "XRP-USDT": "XRP-USDT-SWAP",
+}
+CT_VAL_BY_SWAP = {
+    "BTC-USDT-SWAP": 0.01,
+    "ETH-USDT-SWAP": 0.1,
+    "SOL-USDT-SWAP": 1.0,
+    "BNB-USDT-SWAP": 0.01,
+    "XRP-USDT-SWAP": 100.0,
+}
+
+
+def get_price_decimals(symbol: str) -> int:
+    if "XRP" in symbol:
+        return 4
+    if "BTC" in symbol or "BNB" in symbol:
+        return 1
+    return 2
 
 
 class LiveFuturesExecutor:
@@ -46,11 +67,15 @@ class LiveFuturesExecutor:
             import logging
             logging.getLogger("crypto_agent.execution").warning("set_swap_leverage_non_fatal: %s", exc)
         entry_price = float(proposal.get("entry_price", 0.0))
-        ct_val = 0.01 if "BTC" in swap_symbol else 0.1
+        ct_val = CT_VAL_BY_SWAP.get(swap_symbol, 0.01)
         notional_per_ct = max(entry_price * ct_val, 1e-6)
         raw_contracts = plan["target_notional_usdt"] / notional_per_ct
-        contracts = max(0.01, round(raw_contracts, 2))
-        sz_str = f"{contracts:.2f}".rstrip("0").rstrip(".")
+        if "BNB" in swap_symbol:
+            contracts = max(1, round(raw_contracts))
+            sz_str = str(int(contracts))
+        else:
+            contracts = max(0.01, round(raw_contracts, 2))
+            sz_str = f"{contracts:.2f}".rstrip("0").rstrip(".")
         order_body = {
             "instId": swap_symbol,
             "tdMode": plan["tdMode"],
@@ -61,7 +86,7 @@ class LiveFuturesExecutor:
             "clOrdId": plan["clOrdId"],
         }
         algo = {}
-        decimals = 1 if "BTC" in swap_symbol else 2
+        decimals = get_price_decimals(swap_symbol)
         if plan.get("stop_loss"):
             algo["slTriggerPx"] = str(round(float(plan["stop_loss"]), decimals))
             algo["slOrdPx"] = "-1"

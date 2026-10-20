@@ -22,9 +22,9 @@ class OKXClient:
     def redacted_headers(self, headers):
         return {key: (REDACTED if key.lower() in {"ok-access-key","ok-access-passphrase","ok-access-sign","authorization"} else value) for key, value in headers.items()}
     def validate_symbol(self, symbol):
-        if symbol not in ("BTC-USDT", "ETH-USDT"): raise ValueError("unsupported_spot_symbol")
+        if symbol not in ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT"): raise ValueError("unsupported_spot_symbol")
     def validate_swap_symbol(self, symbol):
-        if symbol not in ("BTC-USDT-SWAP", "ETH-USDT-SWAP"): raise ValueError("unsupported_swap_symbol")
+        if symbol not in ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "BNB-USDT-SWAP", "XRP-USDT-SWAP"): raise ValueError("unsupported_swap_symbol")
     async def request(self, method, path, *, params=None, body=None, private=False, retries=3):
         body_text=json.dumps(body,separators=(",",":")) if body else ""; last=None
         query = urlencode(params, doseq=True) if params else ""

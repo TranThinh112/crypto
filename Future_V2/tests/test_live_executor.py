@@ -74,3 +74,35 @@ def test_live_executor_submits_swap_order_when_not_dry_run():
     assert client.leverage_set == ("BTC-USDT-SWAP", 20, "isolated")
     assert client.order_created["instId"] == "BTC-USDT-SWAP"
     assert client.order_created["clOrdId"].startswith("bot")
+
+
+def test_live_executor_contract_sizes_and_decimals():
+    class MockOKXClient:
+        def __init__(self):
+            self.orders = []
+        async def set_swap_leverage(self, symbol, leverage, margin_mode, pos_side=None):
+            pass
+        async def create_swap_order(self, body):
+            self.orders.append(body)
+            return {"code": "0", "data": [{"ordId": "123", "sCode": "0"}]}
+
+    client = MockOKXClient()
+    executor = LiveFuturesExecutor(client, settings(live_dry_run=False, target_margin_usdt=3.5, target_leverage=20))
+
+    # SOL: entry $180, ctVal 1.0, notional $70 -> 70 / 180 = 0.3888 -> 0.39 contracts, decimals = 2
+    asyncio.run(executor.submit({"symbol": "SOL-USDT", "entry_price": 180.0, "stop_loss": 178.2, "take_profit": 183.6}, {"approved": True, "action": "buy"}))
+    assert client.orders[-1]["instId"] == "SOL-USDT-SWAP"
+    assert client.orders[-1]["sz"] == "0.39"
+    assert client.orders[-1]["attachAlgoOrds"][0]["slTriggerPx"] == "178.2"
+
+    # BNB: entry $600, ctVal 0.01, notional $70 -> notional_per_ct = 6 -> 70 / 6 = 11.66 -> round to 12 integer contracts, decimals = 1
+    asyncio.run(executor.submit({"symbol": "BNB-USDT", "entry_price": 600.0, "stop_loss": 594.0, "take_profit": 612.0}, {"approved": True, "action": "buy"}))
+    assert client.orders[-1]["instId"] == "BNB-USDT-SWAP"
+    assert client.orders[-1]["sz"] == "12"
+    assert client.orders[-1]["attachAlgoOrds"][0]["slTriggerPx"] == "594.0"
+
+    # XRP: entry $0.60, ctVal 100, notional $70 -> notional_per_ct = 60 -> 70 / 60 = 1.166 -> 1.17 contracts, decimals = 4
+    asyncio.run(executor.submit({"symbol": "XRP-USDT", "entry_price": 0.60, "stop_loss": 0.5940, "take_profit": 0.6120}, {"approved": True, "action": "buy"}))
+    assert client.orders[-1]["instId"] == "XRP-USDT-SWAP"
+    assert client.orders[-1]["sz"] == "1.17"
+    assert client.orders[-1]["attachAlgoOrds"][0]["slTriggerPx"] == "0.594"

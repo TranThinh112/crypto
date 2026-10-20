@@ -76,6 +76,12 @@ class NewsService:
             query_terms.update({"bitcoin", "btc"})
         elif symbol == "ETH-USDT":
             query_terms.update({"ethereum", "ether", "eth"})
+        elif symbol == "SOL-USDT":
+            query_terms.update({"solana", "sol"})
+        elif symbol == "BNB-USDT":
+            query_terms.update({"binance", "bnb"})
+        elif symbol == "XRP-USDT":
+            query_terms.update({"ripple", "xrp"})
         items = []
         for entry in root.findall(".//item"):
             title = re.sub(r"\s+", " ", unescape(entry.findtext("title", ""))).strip()

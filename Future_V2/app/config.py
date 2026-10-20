@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./crypto.db"; redis_url: str = "redis://localhost:6379/0"
     max_position_pct: float = Field(.10, ge=0, le=1); position_size_headroom: float = Field(.95, gt=0, le=1)
     target_margin_usdt: float = Field(3.5, gt=0)
-    target_leverage: int = Field(25, ge=1, le=100)
+    target_leverage: int = Field(35, ge=1, le=100)
     strategy_bar: str = "15m"
     strategy_htf_bar: str = "1H"
     strategy_min_stop_pct: float = Field(.010, gt=0, le=1)
@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     live_max_leverage: int = Field(50, ge=1, le=100)
     live_trailing_stop_enabled: bool = True
     breakeven_offset_pct: float = Field(0.0015, ge=0.0, le=0.01)
-    allowed_symbols: tuple[str, ...] = ("BTC-USDT", "ETH-USDT")
+    allowed_symbols: tuple[str, ...] = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT")
     discord_webhook_url: str = ""
     otel_service_name: str = "crypto-agent"
     otel_exporter_otlp_endpoint: str = ""
@@ -104,8 +104,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def guard_live(self):
-        if any(symbol not in ("BTC-USDT", "ETH-USDT") for symbol in self.allowed_symbols):
-            raise ValueError("only BTC-USDT and ETH-USDT spot symbols are supported")
+        supported_symbols = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT")
+        if any(symbol not in supported_symbols for symbol in self.allowed_symbols):
+            raise ValueError(f"only {', '.join(supported_symbols)} spot symbols are supported")
         if self.trading_mode == TradingMode.live and not self.enable_live_trading:
             raise ValueError("live mode requires ENABLE_LIVE_TRADING=true")
         if self.trading_mode == TradingMode.live and self.okx_read_only:
