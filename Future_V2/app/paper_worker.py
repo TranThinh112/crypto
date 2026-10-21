@@ -64,6 +64,49 @@ class PaperWorker:
         self.exchange_sync_attempts = 0
         self.exchange_sync_step = ""
         self.live_trade_plans: dict[str, dict] = {}
+        self.recent_losses_cache: list[dict] = []
+        self.last_losses_sync_at: float = 0.0
+
+
+    async def _get_recent_losses_memory(self, max_items: int = 5, lookback_hours: int = 48) -> list[dict]:
+        """Fetch real recent stop-loss and losing trades from OKX fills history."""
+        now = time.time()
+        cache = getattr(self, "recent_losses_cache", [])
+        last_sync = getattr(self, "last_losses_sync_at", 0.0)
+        if cache and (now - last_sync) < 60:
+            return cache[:max_items]
+
+        client = getattr(self, "client", None)
+        api_key = getattr(client, "api_key", "") if client else ""
+        if not getattr(self.settings, "okx_account_sync", False) or not api_key:
+            return cache[:max_items]
+
+        cutoff_ms = int((now - lookback_hours * 3600) * 1000)
+        losses = []
+        for symbol in self.settings.allowed_symbols:
+            swap_sym = symbol if "-SWAP" in symbol else f"{symbol}-SWAP"
+            try:
+                history = await self.client.fills_history(swap_sym, limit=10)
+                for fill in (history.get("data") or []):
+                    pnl = self._finite(fill.get("fillPnl")) or 0.0
+                    fill_time = int(fill.get("fillTime") or 0)
+                    if pnl < -0.01 and fill_time >= cutoff_ms:
+                        fee = self._finite(fill.get("fee")) or 0.0
+                        losses.append({
+                            "symbol": symbol,
+                            "swap_symbol": swap_sym,
+                            "side": fill.get("posSide") or fill.get("side"),
+                            "exit_price": self._finite(fill.get("fillPx")),
+                            "net_loss_usdt": round(pnl + fee, 4),
+                            "timestamp_ms": fill_time,
+                            "loss_age_minutes": round((now * 1000 - fill_time) / 60000, 1),
+                        })
+            except Exception as exc:
+                log.debug("losses_memory_sync_failed", extra={"symbol": symbol, "error": str(exc)})
+        losses.sort(key=lambda x: x["timestamp_ms"], reverse=True)
+        self.recent_losses_cache = losses
+        self.last_losses_sync_at = now
+        return self.recent_losses_cache[:max_items]
 
     def _account_equity(self) -> tuple[float | None, str]:
         """Funded equity when the read-only exchange sync is live, else the paper ledger."""
@@ -808,7 +851,9 @@ class PaperWorker:
                 features[key] = clean
         regime = self._regime_context(values)
         structure = self._structure_context(candles, snapshot, values)
+        losses_memory = getattr(self, "recent_losses_cache", [])[:5]
         return {
+            "recent_mistakes_memory": losses_memory,
             "symbol": symbol,
             "market": {
                 "last": snapshot.last,
@@ -853,6 +898,17 @@ class PaperWorker:
         if proposal.get("action") == "hold":
             return str(proposal.get("reason") or "deterministic_hold")
         symbol = proposal.get("symbol")
+        action = proposal.get("action")
+        # Self-learning: Check if same symbol and side suffered a recent loss within 30 minutes
+        recent_losses = getattr(self, "recent_losses_cache", [])
+        for loss in recent_losses:
+            loss_sym = loss.get("symbol")
+            loss_side = loss.get("side")
+            loss_age = loss.get("loss_age_minutes", 999)
+            if loss_sym == symbol and loss_age < 30:
+                is_same_side = (action == "buy" and loss_side in ("long", "buy")) or (action == "sell" and loss_side in ("short", "sell"))
+                if is_same_side:
+                    return "recent_loss_cooldown_same_side"
         positions = portfolio.get("positions", {})
         if symbol and any(symbol == p or p.startswith(symbol) or symbol.startswith(p) for p in positions):
             return "position_already_exists"
@@ -919,6 +975,7 @@ class PaperWorker:
         slippage = orderbook.get("estimated_buy_slippage_pct")
         risk = self._risk_context(portfolio["equity"], symbol, spread, slippage)
         news = await self._fetch_news(symbol)
+        await self._get_recent_losses_memory()
         proposal = self._proposal_context(snapshot, decision, portfolio, slippage, symbol=symbol)
         agent_snapshot = self._agent_snapshot(
             symbol, snapshot, values, row, orderbook, spread, portfolio, risk, news, proposal, candles, htf_trend=htf_trend
