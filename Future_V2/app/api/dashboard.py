@@ -97,8 +97,12 @@ function renderLastRound(r, prices){
     "<div class=\"fact\"><b>Reasons</b><span>"+esc((c.reason_codes&&c.reason_codes.length)?c.reason_codes.join(", "):(c.approved?"Approved":(veto>0?"Vetoed by "+vetoAgents.join(", "):((buys===8||sells===8)?"Score "+n(c.score,3)+" < 0.580":"Score "+n(c.score,3)+" / No consensus"))))+"</span></div>"+
     "</div></div></div>";
   let warn = "";
+  const slMatch = (c.reason_codes||[]).find(x => x && (x.includes("SL_") || x.includes("sl_") || x.includes("similar_to")));
   if(c.approved){
     warn = "<div class=\"warn ok-warn\" style=\"background:#d6ead5;border-color:#19733a;color:#13221e\"><b>APPROVED FOR LIVE TRADE!</b> Score <b>"+n(c.score,3)+"</b> ≥ 0.580 threshold with 8/8 consensus. Live order sent to OKX.</div>";
+  } else if(slMatch){
+    const cid = (slMatch.match(/SL_\d+/i) || [slMatch])[0].toUpperCase();
+    warn = "<div class=\"warn\" style=\"border-left-color:#b23a2b;background:#ffe6e6\"><b>🚫 TỰ HỌC TỪ CHỐI (VETO "+esc(cid)+").</b> Tín hiệu vào lệnh trùng mô hình dính SL trước đó (<b>"+esc(cid)+"</b>). AI chặn vào lệnh để bảo vệ vốn.</div>";
   } else if(veto > 0){
     warn = "<div class=\"warn\"><b>NOT APPROVED (Vetoed).</b> Vetoed by <b>"+veto+" agent(s)</b>: "+esc(vetoAgents.join(", "))+". Need 0 veto and score ≥ 0.580 to enter.</div>";
   } else if(buys === 8 || sells === 8){
@@ -133,9 +137,10 @@ function renderConsensus(rows){
     const sells=votes.filter(v=>v.action==="sell").length;
     let explanation = "";
     const reasons = r.reason_codes || [];
-    const slMatch = reasons.find(x => x.includes("SL_") || x.includes("sl_"));
+    const slMatch = reasons.find(x => x && (x.includes("SL_") || x.includes("sl_") || x.includes("similar_to")));
     if(slMatch){
-      explanation = "VETO / Blocked: Pattern matches prior " + slMatch.toUpperCase();
+      const cid = (slMatch.match(/SL_\d+/i) || [slMatch])[0].toUpperCase();
+      explanation = "🚫 VETO: Trùng mô hình " + cid;
     } else if(reasons.includes("position_already_exists")){
       explanation = "Position already open (" + (r.symbol||"") + ")";
     } else if(reasons.includes("proposal_required_margin_exceeds_available_cash")){
