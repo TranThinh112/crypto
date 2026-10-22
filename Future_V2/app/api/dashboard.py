@@ -132,7 +132,10 @@ function renderConsensus(rows){
     const sells=votes.filter(v=>v.action==="sell").length;
     let explanation = "";
     const reasons = r.reason_codes || [];
-    if(reasons.includes("position_already_exists")){
+    const slMatch = reasons.find(x => x.includes("SL_") || x.includes("sl_"));
+    if(slMatch){
+      explanation = "VETO / Blocked: Pattern matches prior " + slMatch.toUpperCase();
+    } else if(reasons.includes("position_already_exists")){
       explanation = "Position already open (" + (r.symbol||"") + ")";
     } else if(reasons.includes("proposal_required_margin_exceeds_available_cash")){
       explanation = "Insufficient cash for required margin (5u)";

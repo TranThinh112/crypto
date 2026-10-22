@@ -69,7 +69,7 @@ class PaperWorker:
 
 
     async def _get_recent_losses_memory(self, max_items: int = 5, lookback_hours: int = 48) -> list[dict]:
-        """Fetch real recent stop-loss and losing trades from OKX fills history."""
+        """Fetch real recent stop-loss and losing trades from OKX fills history and index with SL_01, SL_02..."""
         now = time.time()
         cache = getattr(self, "recent_losses_cache", [])
         last_sync = getattr(self, "last_losses_sync_at", 0.0)
@@ -104,6 +104,10 @@ class PaperWorker:
             except Exception as exc:
                 log.debug("losses_memory_sync_failed", extra={"symbol": symbol, "error": str(exc)})
         losses.sort(key=lambda x: x["timestamp_ms"], reverse=True)
+        # Assign distinct case IDs: SL_01, SL_02, SL_03...
+        for idx, item in enumerate(losses, start=1):
+            item["case_id"] = f"SL_{idx:02d}"
+            item["rule"] = f"Avoid entering {item['side']} on {item['symbol']} while price remains near {item['exit_price']} without structural reversal confirmation"
         self.recent_losses_cache = losses
         self.last_losses_sync_at = now
         return self.recent_losses_cache[:max_items]
@@ -905,10 +909,11 @@ class PaperWorker:
             loss_sym = loss.get("symbol")
             loss_side = loss.get("side")
             loss_age = loss.get("loss_age_minutes", 999)
+            cid = loss.get("case_id", "SL_01")
             if loss_sym == symbol and loss_age < 30:
                 is_same_side = (action == "buy" and loss_side in ("long", "buy")) or (action == "sell" and loss_side in ("short", "sell"))
                 if is_same_side:
-                    return "recent_loss_cooldown_same_side"
+                    return f"cooldown_similar_{cid}"
         positions = portfolio.get("positions", {})
         if symbol and any(symbol == p or p.startswith(symbol) or symbol.startswith(p) for p in positions):
             return "position_already_exists"
