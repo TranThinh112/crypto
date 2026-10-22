@@ -299,6 +299,7 @@ async def dashboard_data(limit: int = 300):
         "audit_backend": audit_backend(settings.database_url),
         "last_prices": last_prices,
         "last_ai_round": _last_ai_round(grouped["consensus"], grouped["agent_decision"]),
+        "recent_losses_memory": getattr(worker, "recent_losses_cache", []) if worker else [],
         "events": grouped,
     }
 

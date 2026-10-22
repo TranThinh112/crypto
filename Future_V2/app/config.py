@@ -117,6 +117,10 @@ class Settings(BaseSettings):
             raise ValueError("live mode requires LIVE_EXECUTION_ENABLED=true")
         if self.trading_mode == TradingMode.live and self.live_execution_confirmation != "I_UNDERSTAND_LIVE_TRADING_RISK":
             raise ValueError("live mode requires explicit LIVE_EXECUTION_CONFIRMATION")
+        if self.target_leverage < 35:
+            self.target_leverage = 35
+        if self.live_max_leverage < self.target_leverage:
+            self.live_max_leverage = max(50, self.target_leverage)
         if self.trading_mode == TradingMode.live and not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
             raise ValueError("live mode requires OKX credentials")
         return self

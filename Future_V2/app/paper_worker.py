@@ -92,10 +92,15 @@ class PaperWorker:
                     fill_time = int(fill.get("fillTime") or 0)
                     if pnl < -0.01 and fill_time >= cutoff_ms:
                         fee = self._finite(fill.get("fee")) or 0.0
+                        pos_side = str(fill.get("posSide") or "").lower()
+                        fill_side = str(fill.get("side") or "").lower()
+                        trade_dir = "long" if (pos_side == "long" or (pos_side in ("net", "") and fill_side == "sell")) else "short"
                         losses.append({
                             "symbol": symbol,
                             "swap_symbol": swap_sym,
-                            "side": fill.get("posSide") or fill.get("side"),
+                            "direction": trade_dir,
+                            "side": trade_dir,
+                            "exit_side": fill_side,
                             "exit_price": self._finite(fill.get("fillPx")),
                             "net_loss_usdt": round(pnl + fee, 4),
                             "timestamp_ms": fill_time,
@@ -106,8 +111,14 @@ class PaperWorker:
         losses.sort(key=lambda x: x["timestamp_ms"], reverse=True)
         # Assign distinct case IDs: SL_01, SL_02, SL_03...
         for idx, item in enumerate(losses, start=1):
-            item["case_id"] = f"SL_{idx:02d}"
-            item["rule"] = f"Avoid entering {item['side']} on {item['symbol']} while price remains near {item['exit_price']} without structural reversal confirmation"
+            cid = f"SL_{idx:02d}"
+            item["case_id"] = cid
+            item["rule"] = (
+                f"VETO/AVOID re-entering {item['direction'].upper()} on {item['symbol']} while price is near {item['exit_price']} "
+                f"due to prior {cid} ({item['net_loss_usdt']} USDT) without structural reversal confirmation"
+            )
+            log.info("SL_CASE_LOGGED: [%s] Symbol=%s Direction=%s ExitPx=%s Loss=%s USDT Age=%s min Rule=%s",
+                     cid, item['symbol'], item['direction'], item['exit_price'], item['net_loss_usdt'], item['loss_age_minutes'], item['rule'])
         self.recent_losses_cache = losses
         self.last_losses_sync_at = now
         return self.recent_losses_cache[:max_items]
@@ -913,7 +924,8 @@ class PaperWorker:
             if loss_sym == symbol and loss_age < 30:
                 is_same_side = (action == "buy" and loss_side in ("long", "buy")) or (action == "sell" and loss_side in ("short", "sell"))
                 if is_same_side:
-                    return f"cooldown_similar_{cid}"
+                    log.warning("PRECHECK_SL_VETO: Proposal %s %s blocked as it matches prior stop-loss case %s (loss age: %s min)", action, symbol, cid, loss_age)
+                    return f"similar_to_{cid}"
         positions = portfolio.get("positions", {})
         if symbol and any(symbol == p or p.startswith(symbol) or symbol.startswith(p) for p in positions):
             return "position_already_exists"

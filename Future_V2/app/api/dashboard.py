@@ -28,6 +28,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <section class="stack">
       <article class="card"><div class="section-title"><h2>Last AI Round</h2><span class="mono muted" id="round-id">-</span></div><div id="last-round"></div></article>
       <article class="card"><div class="section-title"><h2>Agent Votes</h2><span class="muted" id="vote-summary">-</span></div><div id="agent-votes"></div></article>
+      <article class="card"><div class="section-title"><h2>Stop-Loss Learning Memory (SL_01, SL_02...)</h2><span class="muted" id="sl-summary">Self-learning database</span></div><div id="sl-memory"></div></article>
       <details class="card"><summary><b>More logs</b> · consensus, agent decisions, market scans</summary><div class="details"><h2>Consensus</h2><div id="consensus"></div><h2 style="margin-top:18px">Agent Decisions</h2><div id="decisions"></div><h2 style="margin-top:18px">Market Scans</h2><div id="ticks"></div></div></details>
     </section>
     <aside class="stack">
@@ -155,6 +156,11 @@ function renderConsensus(rows){
     return "<tr><td>"+when(r.ts)+"</td><td>"+esc(r.symbol)+"</td><td>"+tag(setupAction)+"</td><td>"+tag(r.action)+"</td><td class=\"num\"><b>"+n(r.score,3)+"</b> / 0.580</td><td>"+(r.approved?"<span class=\"tag buy\">YES</span>":"<span class=\"tag bad\">NO</span>")+"</td><td>"+esc(explanation)+"</td></tr>";
   }).join("")+"</tbody></table></div>":"<div class=\"empty\">No consensus rows.</div>";
 }
+function renderLossesMemory(rows){
+  rows=rows||[];
+  $("sl-summary").textContent=rows.length?(rows.length+" cases indexed"):"No recent losses";
+  $("sl-memory").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>Case ID</th><th>Symbol</th><th>Side</th><th class=\"num\">Exit Px</th><th class=\"num\">Loss (USDT)</th><th class=\"num\">Age</th><th>Learned Avoidance Rule</th></tr></thead><tbody>"+rows.map(r=>"<tr><td><b class=\"tag bad\">"+esc(r.case_id||"SL")+"</b></td><td>"+esc(r.symbol)+"</td><td>"+tag(r.direction||r.side)+"</td><td class=\"num\">"+n(r.exit_price)+"</td><td class=\"num pnl-neg\">"+usd(r.net_loss_usdt)+"</td><td class=\"num\">"+n(r.loss_age_minutes,0)+"m ago</td><td style=\"font-size:11px;color:var(--muted);white-space:normal;\">"+esc(r.rule||"")+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No recent stop-loss cases within 48h. Bot trading clean.</div>";
+}
 function renderDecisions(rows){ rows=rows||[]; $("decisions").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Agent</th><th>Symbol</th><th>Action</th><th>Quality</th><th>Veto</th><th class=\"num\">Entry</th><th class=\"num\">Cost</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.agent_name)+"</td><td>"+esc(r.symbol)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.data_quality)+"</td><td>"+(r.veto?"yes":"no")+"</td><td class=\"num\">"+n(r.entry_price)+"</td><td class=\"num\">"+usd(r.estimated_cost_usd)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No decisions.</div>"; }
 function renderTicks(rows){ rows=rows||[]; $("ticks").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Symbol</th><th class=\"num\">Price</th><th>Action</th><th>Reason</th><th class=\"num\">RSI</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.symbol)+"</td><td class=\"num\">"+n(r.price)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.reason)+"</td><td class=\"num\">"+n(r.rsi,1)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No market scans.</div>"; }
 async function load(){
@@ -163,7 +169,7 @@ async function load(){
     const rt=d.runtime||{}, caps=rt.capabilities||{}, okx=rt.okx_account||{}, backend=d.audit_backend||{};
     $("p-mode").textContent="mode "+((rt.runtime||{}).mode||"?"); $("p-health").textContent=d.health.paper_worker?"worker healthy":"worker degraded"; $("p-health").className="pill "+(d.health.paper_worker?"ok":"bad");
     $("p-sync").textContent=okx.synced?"OKX synced":"OKX not synced"; $("p-sync").className="pill "+(okx.synced?"ok":"bad"); $("p-rev").textContent="rev "+String(rt.code_revision||"unknown").slice(0,8);
-    renderKpis(d); renderPortfolio(d.portfolio); renderLastRound(d.last_ai_round,d.last_prices||{}); renderAgentVotes(d.last_ai_round,d.last_prices||{}); renderAgentCost(d.summary.agents); renderConsensus(d.events.consensus); renderDecisions(d.events.agent_decision); renderTicks(d.events.paper_tick);
+    renderKpis(d); renderPortfolio(d.portfolio); renderLastRound(d.last_ai_round,d.last_prices||{}); renderAgentVotes(d.last_ai_round,d.last_prices||{}); renderAgentCost(d.summary.agents); renderLossesMemory(d.recent_losses_memory); renderConsensus(d.events.consensus); renderDecisions(d.events.agent_decision); renderTicks(d.events.paper_tick);
     $("db-info").textContent="db "+(backend.kind||"?")+" · live="+caps.live_trading+" · paper_exec="+caps.paper_execution+" · read_only="+caps.okx_read_only; $("updated").textContent="updated "+new Date().toLocaleTimeString()+" · last tick "+(d.health.last_tick_at?when(d.health.last_tick_at):"never");
   }catch(error){ $("updated").textContent="dashboard error: "+error; $("last-round").innerHTML="<div class=\"warn\"><b>Dashboard error.</b> "+esc(String(error))+"</div>"; }
 }
