@@ -320,6 +320,17 @@ class PaperWorker:
                         p_data["stop_loss"] = p_plan.get("current_sl") or p_plan.get("stop_loss")
                         p_data["take_profit"] = p_plan.get("current_tp") or p_plan.get("take_profit")
                         p_data["trailing_stage"] = p_plan.get("trailing_stage", 0)
+                        p_data["initial_sl"] = p_plan.get("stop_loss")
+                        p_data["initial_tp"] = p_plan.get("take_profit")
+                        p_data["tp_ladder"] = {
+                            "tp1": p_plan.get("tp1"),
+                            "tp2": p_plan.get("tp2"),
+                            "tp3": p_plan.get("tp3"),
+                            "tp4": p_plan.get("tp4"),
+                            "tp5": p_plan.get("tp5"),
+                            "tp6": p_plan.get("tp6"),
+                            "tp7": p_plan.get("tp7"),
+                        }
                 self.exchange_portfolio = {
                     "cash": cash or 0.0,
                     "available_cash": cash or 0.0,
