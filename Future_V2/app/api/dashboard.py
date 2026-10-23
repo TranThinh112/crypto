@@ -19,7 +19,14 @@ DASHBOARD_HTML = r"""<!doctype html>
 .ladder-badge.done{background:#cfe8cf;color:#13221e}
 .ladder-badge.active{background:#ffecb3;color:#805b00;outline:2px solid #805b00}
 .ladder-badge.next{background:#fff3cd;color:#856404;font-weight:bold}
-.ladder-badge.waiting{background:#eee8d9;color:var(--muted)}.pos-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.pos h3{margin:0;font-size:16px}.pos-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.mini{font-size:12px;color:var(--muted)}.mini b{display:block;color:var(--ink);font-size:14px;margin-top:2px}.pnl-pos{color:#19733a}.pnl-neg{color:#b23a2b}.table-wrap{overflow:auto;border-radius:12px;border:1px solid #17382e33}table{width:100%;border-collapse:collapse;font-size:13px;background:#fffdf7}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #17382e22;white-space:nowrap}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);background:#f4eddd;position:sticky;top:0}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.warn{border-left:5px solid var(--accent);background:#ffe6d6;padding:10px 12px;border-radius:10px;margin-top:10px}.details{margin-top:10px}details{font-size:12px;color:var(--muted)}summary{cursor:pointer}pre{white-space:pre-wrap;max-height:280px;overflow:auto;background:#fff;border:1px solid #17382e33;border-radius:10px;padding:10px}.section-title{display:flex;align-items:center;justify-content:space-between;gap:12px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.empty{color:var(--muted);padding:12px}.footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px}
+.ladder-badge.waiting{background:#eee8d9;color:var(--muted)}
+.pagination-bar{display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:4px 6px;font-size:12px;color:var(--muted);flex-wrap:wrap;gap:8px}
+.pagination-btns{display:flex;gap:6px;align-items:center}
+.pag-btn{padding:4px 10px;font-size:11px;font-weight:700;border:1.5px solid var(--line);border-radius:6px;background:#fffaf0;cursor:pointer;color:var(--ink)}
+.pag-btn:hover:not(:disabled){background:#fff}
+.pag-btn:disabled{opacity:0.4;cursor:not-allowed}
+.sl-table td{padding:6px 8px;font-size:12px}
+.sl-table th{padding:6px 8px;font-size:11px}.pos-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.pos h3{margin:0;font-size:16px}.pos-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.mini{font-size:12px;color:var(--muted)}.mini b{display:block;color:var(--ink);font-size:14px;margin-top:2px}.pnl-pos{color:#19733a}.pnl-neg{color:#b23a2b}.table-wrap{overflow:auto;border-radius:12px;border:1px solid #17382e33}table{width:100%;border-collapse:collapse;font-size:13px;background:#fffdf7}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #17382e22;white-space:nowrap}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);background:#f4eddd;position:sticky;top:0}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.warn{border-left:5px solid var(--accent);background:#ffe6d6;padding:10px 12px;border-radius:10px;margin-top:10px}.details{margin-top:10px}details{font-size:12px;color:var(--muted)}summary{cursor:pointer}pre{white-space:pre-wrap;max-height:280px;overflow:auto;background:#fff;border:1px solid #17382e33;border-radius:10px;padding:10px}.section-title{display:flex;align-items:center;justify-content:space-between;gap:12px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.empty{color:var(--muted);padding:12px}.footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px}
 @media(max-width:1200px){.layout,.hero,.subgrid{grid-template-columns:1fr}.kpis,.facts,.portfolio-head{grid-template-columns:repeat(2,1fr)}.agent-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:680px){main{padding:14px}.top{display:block}.toolbar{justify-content:flex-start;margin-top:14px}.kpis,.facts,.portfolio-head,.pos-grid,.agent-grid{grid-template-columns:1fr}.card{padding:12px}}
 </style>
 </head>
@@ -39,7 +46,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <section class="stack">
       <article class="card"><div class="section-title"><h2>Last AI Round</h2><span class="mono muted" id="round-id">-</span></div><div id="last-round"></div></article>
       <article class="card"><div class="section-title"><h2>Agent Votes</h2><span class="muted" id="vote-summary">-</span></div><div id="agent-votes"></div></article>
-      <article class="card"><div class="section-title"><h2>Stop-Loss Learning Memory (SL_01, SL_02...)</h2><span class="muted" id="sl-summary">Self-learning database</span></div><div id="sl-memory"></div></article>
+      <article class="card"><div class="section-title"><h2>Bộ nhớ Tự học Cắt lỗ (SL_01, SL_02...)</h2><span class="muted" id="sl-summary">Cơ sở dữ liệu tự học</span></div><div id="sl-memory"></div></article>
       <details class="card"><summary><b>More logs</b> · consensus, agent decisions, market scans</summary><div class="details"><h2>Consensus</h2><div id="consensus"></div><h2 style="margin-top:18px">Agent Decisions</h2><div id="decisions"></div><h2 style="margin-top:18px">Market Scans</h2><div id="ticks"></div></div></details>
     </section>
     <aside class="stack">
@@ -354,10 +361,86 @@ function renderConsensus(rows){
     return "<tr><td>"+when(r.ts)+"</td><td>"+esc(r.symbol)+"</td><td>"+tag(setupAction)+"</td><td>"+tag(r.action)+"</td><td class=\"num\"><b>"+n(r.score,3)+"</b> / 0.580</td><td>"+(r.approved?"<span class=\"tag buy\">YES</span>":"<span class=\"tag bad\">NO</span>")+"</td><td>"+esc(explanation)+"</td></tr>";
   }).join("")+"</tbody></table></div>":"<div class=\"empty\">No consensus rows.</div>";
 }
+let slCurrentPage = 1;
+const SL_PAGE_SIZE = 10;
+window.allLossesRows = [];
+
+function changeSlPage(delta){
+  const maxPage = Math.max(1, Math.ceil((window.allLossesRows || []).length / SL_PAGE_SIZE));
+  slCurrentPage = Math.max(1, Math.min(maxPage, slCurrentPage + delta));
+  displaySlTable();
+}
+
+function formatAgeVi(mins){
+  mins = Number(mins || 0);
+  if(mins < 60) return Math.round(mins) + " phút trước";
+  const hours = mins / 60;
+  if(hours < 24) return hours.toFixed(1) + " giờ trước";
+  const days = hours / 24;
+  return days.toFixed(1) + " ngày trước";
+}
+
+function translateSlRule(r){
+  const cid = esc(r.case_id || "SL");
+  const sym = esc(r.symbol || "");
+  const dir = String(r.direction || r.side || "").toUpperCase() === "SHORT" ? "BÁN KHỐNG (SHORT)" : "MUA (LONG)";
+  const px = n(r.exit_price);
+  const loss = usd(r.net_loss_usdt);
+  return "🚫 <b>TỪ CHỐI/VETO</b> vào lại lệnh <b>" + dir + "</b> trên cặp <b>" + sym + "</b> khi giá gần vùng <b>" + px + "</b> do bài học dính " + cid + " (" + loss + ") khi chưa có xác nhận phá vỡ cấu trúc đảo chiều.";
+}
+
+function displaySlTable(){
+  const rows = window.allLossesRows || [];
+  if(!rows.length){
+    $("sl-summary").textContent = "Không có lệnh cắt lỗ";
+    $("sl-memory").innerHTML = "<div class=\"empty\">Chưa ghi nhận lệnh dính Stop-Loss nào. Bot vận hành an toàn.</div>";
+    return;
+  }
+  const totalCases = rows.length;
+  const maxPage = Math.max(1, Math.ceil(totalCases / SL_PAGE_SIZE));
+  if(slCurrentPage > maxPage) slCurrentPage = maxPage;
+  const start = (slCurrentPage - 1) * SL_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + SL_PAGE_SIZE);
+
+  $("sl-summary").textContent = totalCases + " bài học (" + slCurrentPage + "/" + maxPage + ")";
+
+  const tableHtml = "<div class=\"table-wrap\"><table class=\"sl-table\"><thead><tr>" +
+    "<th style=\"width:70px\">Mã SL</th>" +
+    "<th style=\"width:90px\">Cặp</th>" +
+    "<th style=\"width:75px\">Vị thế</th>" +
+    "<th class=\"num\" style=\"width:85px\">Giá dính SL</th>" +
+    "<th class=\"num\" style=\"width:85px\">Số tiền lỗ</th>" +
+    "<th class=\"num\" style=\"width:95px\">Thời gian</th>" +
+    "<th>Quy tắc Tự học Tránh lặp lại Lỗi</th>" +
+    "</tr></thead><tbody>" +
+    pageRows.map(r => {
+      const isShort = String(r.direction || r.side || "").toLowerCase().includes("short");
+      const sideBadge = isShort ? "<span class=\"tag sell\">SHORT</span>" : "<span class=\"tag buy\">LONG</span>";
+      return "<tr>" +
+        "<td><b class=\"tag bad\" style=\"font-size:10px;padding:1px 6px\">" + esc(r.case_id || "SL") + "</b></td>" +
+        "<td><b>" + esc(r.symbol) + "</b></td>" +
+        "<td>" + sideBadge + "</td>" +
+        "<td class=\"num\"><b>" + n(r.exit_price) + "</b></td>" +
+        "<td class=\"num pnl-neg\"><b>" + usd(r.net_loss_usdt) + "</b></td>" +
+        "<td class=\"num muted\">" + formatAgeVi(r.loss_age_minutes) + "</td>" +
+        "<td style=\"font-size:11px;color:var(--ink);white-space:normal;line-height:1.35\">" + translateSlRule(r) + "</td>" +
+        "</tr>";
+    }).join("") +
+    "</tbody></table></div>" +
+    "<div class=\"pagination-bar\">" +
+    "<span>Hiển thị " + (start + 1) + " - " + Math.min(start + SL_PAGE_SIZE, totalCases) + " trong tổng số <b>" + totalCases + "</b> bài học</span>" +
+    "<div class=\"pagination-btns\">" +
+    "<button class=\"pag-btn\" onclick=\"changeSlPage(-1)\" " + (slCurrentPage <= 1 ? "disabled" : "") + ">‹ Trang trước</button>" +
+    "<span>Trang <b>" + slCurrentPage + "</b> / " + maxPage + "</span>" +
+    "<button class=\"pag-btn\" onclick=\"changeSlPage(1)\" " + (slCurrentPage >= maxPage ? "disabled" : "") + ">Trang sau ›</button>" +
+    "</div></div>";
+
+  $("sl-memory").innerHTML = tableHtml;
+}
+
 function renderLossesMemory(rows){
-  rows=rows||[];
-  $("sl-summary").textContent=rows.length?(rows.length+" cases indexed"):"No recent losses";
-  $("sl-memory").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>Case ID</th><th>Symbol</th><th>Side</th><th class=\"num\">Exit Px</th><th class=\"num\">Loss (USDT)</th><th class=\"num\">Age</th><th>Learned Avoidance Rule</th></tr></thead><tbody>"+rows.map(r=>"<tr><td><b class=\"tag bad\">"+esc(r.case_id||"SL")+"</b></td><td>"+esc(r.symbol)+"</td><td>"+tag(r.direction||r.side)+"</td><td class=\"num\">"+n(r.exit_price)+"</td><td class=\"num pnl-neg\">"+usd(r.net_loss_usdt)+"</td><td class=\"num\">"+n(r.loss_age_minutes,0)+"m ago</td><td style=\"font-size:11px;color:var(--muted);white-space:normal;\">"+esc(r.rule||"")+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No stop-loss cases recorded. Bot trading clean.</div>";
+  window.allLossesRows = rows || [];
+  displaySlTable();
 }
 function renderDecisions(rows){ rows=rows||[]; $("decisions").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Agent</th><th>Symbol</th><th>Action</th><th>Quality</th><th>Veto</th><th class=\"num\">Entry</th><th class=\"num\">Cost</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.agent_name)+"</td><td>"+esc(r.symbol)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.data_quality)+"</td><td>"+(r.veto?"yes":"no")+"</td><td class=\"num\">"+n(r.entry_price)+"</td><td class=\"num\">"+usd(r.estimated_cost_usd)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No decisions.</div>"; }
 function renderTicks(rows){ rows=rows||[]; $("ticks").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Symbol</th><th class=\"num\">Price</th><th>Action</th><th>Reason</th><th class=\"num\">RSI</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.symbol)+"</td><td class=\"num\">"+n(r.price)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.reason)+"</td><td class=\"num\">"+n(r.rsi,1)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No market scans.</div>"; }
