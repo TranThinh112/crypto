@@ -68,7 +68,7 @@ class PaperWorker:
         self.last_losses_sync_at: float = 0.0
 
 
-    async def _get_recent_losses_memory(self, max_items: int = 5, lookback_hours: int = 48) -> list[dict]:
+    async def _get_recent_losses_memory(self, max_items: int = 20, lookback_hours: int = 87600) -> list[dict]:
         """Fetch real recent stop-loss and losing trades from OKX fills history and index with SL_01, SL_02..."""
         now = time.time()
         cache = getattr(self, "recent_losses_cache", [])
@@ -86,7 +86,7 @@ class PaperWorker:
         for symbol in self.settings.allowed_symbols:
             swap_sym = symbol if "-SWAP" in symbol else f"{symbol}-SWAP"
             try:
-                history = await self.client.fills_history(swap_sym, limit=10)
+                history = await self.client.fills_history(swap_sym, limit=100)
                 for fill in (history.get("data") or []):
                     pnl = self._finite(fill.get("fillPnl")) or 0.0
                     fill_time = int(fill.get("fillTime") or 0)
