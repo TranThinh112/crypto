@@ -262,10 +262,10 @@ function renderPortfolio(p){
   window.currentPositions=positions;
   const head="<div class=\"portfolio-head\">"+
     kpi("Equity", usd(p.equity), "account value")+kpi("Cash", usd(p.available_cash ?? p.cash), "available")+
-    kpi("Floating PnL", "<span class=\""+clsPnl(p.unrealized_pnl)+"">"+usd(p.unrealized_pnl)+"</span>", "unrealized")+
+    kpi("Floating PnL", "<span class=\""+clsPnl(p.unrealized_pnl)+"\">"+usd(p.unrealized_pnl)+"</span>", "unrealized")+
     kpi("Margin used", usd(p.margin_used), "read from OKX")+"</div>";
-  const rows=positions.length ? positions.map((x,idx)=>"<div class=\"pos\" onclick=\"openPosModal("+idx+")\" title=\"Nhấp để xem chi tiết lộ trình dời TP/SL\"><div class=\"pos-head\"><h3>"+esc(x.symbol)+"</h3><div style=\"display:flex;gap:6px;align-items:center\">"+tag(x.side)+"<span class=\"tag ok\" style=\"font-size:10px;cursor:pointer\">🔍 Nấc TP/SL</span></div></div><div class="pos-grid">"+
-    "<div class=\"mini\">Qty<b>"+n(x.quantity,6)+"</b></div><div class=\"mini\">Entry<b>"+n(x.entry_price,6)+"</b></div><div class=\"mini\">Mark<b>"+n(x.mark_price,6)+"</b></div><div class=\"mini\">PnL<b class=\""+clsPnl(x.unrealized_pnl)+"">"+usd(x.unrealized_pnl)+"</b></div>"+
+  const rows=positions.length ? positions.map((x,idx)=>"<div class=\"pos\" onclick=\"openPosModal("+idx+")\" title=\"Nhấp để xem chi tiết lộ trình dời TP/SL\"><div class=\"pos-head\"><h3>"+esc(x.symbol)+"</h3><div style=\"display:flex;gap:6px;align-items:center\">"+tag(x.side)+"<span class=\"tag ok\" style=\"font-size:10px;cursor:pointer\">🔍 Nấc TP/SL</span></div></div><div class=\"pos-grid\">"+
+    "<div class=\"mini\">Qty<b>"+n(x.quantity,6)+"</b></div><div class=\"mini\">Entry<b>"+n(x.entry_price,6)+"</b></div><div class=\"mini\">Mark<b>"+n(x.mark_price,6)+"</b></div><div class=\"mini\">PnL<b class=\""+clsPnl(x.unrealized_pnl)+"\">"+usd(x.unrealized_pnl)+"</b></div>"+
     "<div class=\"mini\">Margin<b>"+usd(x.margin)+"</b></div><div class=\"mini\">Lev<b>"+n(x.leverage,0)+"x</b></div><div class=\"mini\">SL<b>"+(x.stop_loss ? n(x.stop_loss, 2) : "-")+"</b></div><div class=\"mini\">TP<b>"+(x.take_profit ? n(x.take_profit, 2) : "-")+"</b></div>"+
     "<div class=\"mini\">Stage<b>"+(x.trailing_stage >= 2 ? ("Locked TP" + (x.trailing_stage - 1)) : (x.trailing_stage === 1 ? "Breakeven" : "Initial"))+"</b></div><div class=\"mini\">Opened<b>"+esc(x.opened_at||"-")+"</b></div>"+
     "</div><div class=\"pos-hint\">🔍 Nhấp vào để xem chi tiết các nấc dời TP/SL & Lãi/Lỗ tương ứng</div></div>").join("") : "<div class=\"empty\">No open positions.</div>";
