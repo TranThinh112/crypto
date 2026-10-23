@@ -108,18 +108,22 @@ class PaperWorker:
                         })
             except Exception as exc:
                 log.debug("losses_memory_sync_failed", extra={"symbol": symbol, "error": str(exc)})
-        losses.sort(key=lambda x: x["timestamp_ms"], reverse=True)
-        # Assign distinct case IDs: SL_01, SL_02, SL_03...
+        # Sort chronological (oldest to newest) to assign permanent ascending case IDs: SL_01, SL_02...
+        losses.sort(key=lambda x: x["timestamp_ms"])
         for idx, item in enumerate(losses, start=1):
             cid = f"SL_{idx:02d}"
             item["case_id"] = cid
+            item["case_index"] = idx
             item["rule"] = (
                 f"VETO/AVOID re-entering {item['direction'].upper()} on {item['symbol']} while price is near {item['exit_price']} "
                 f"due to prior {cid} ({item['net_loss_usdt']} USDT) without structural reversal confirmation"
             )
             log.info("SL_CASE_LOGGED: [%s] Symbol=%s Direction=%s ExitPx=%s Loss=%s USDT Age=%s min Rule=%s",
                      cid, item['symbol'], item['direction'], item['exit_price'], item['net_loss_usdt'], item['loss_age_minutes'], item['rule'])
-        self.recent_losses_cache = losses
+        
+        # Now sort reverse (newest first) for UI & AI display, keeping the permanent case_id intact
+        losses_display = sorted(losses, key=lambda x: x["timestamp_ms"], reverse=True)
+        self.recent_losses_cache = losses_display
         self.last_losses_sync_at = now
         return self.recent_losses_cache[:max_items]
 
