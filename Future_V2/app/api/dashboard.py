@@ -36,7 +36,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div><p class="eyebrow">OKX read-only / multi-agent desk</p><h1 class="title">AI Agent Desk</h1></div>
     <div class="toolbar">
       <span class="pill" id="p-mode">mode ?</span><span class="pill" id="p-health">worker ?</span><span class="pill" id="p-sync">okx ?</span><span class="pill" id="p-rev">rev ?</span>
-      <select id="probe-symbol"><option>BTC-USDT</option><option>ETH-USDT</option><option>SOL-USDT</option><option>BNB-USDT</option><option>XRP-USDT</option></select><button id="probe">Run AI round</button><button id="refresh">Refresh</button>
+      <select id="probe-symbol"><option>BTC-USDT</option><option>ETH-USDT</option><option>SOL-USDT</option><option>BNB-USDT</option><option>XRP-USDT</option><option>DOGE-USDT</option><option>ADA-USDT</option><option>TRX-USDT</option><option>AVAX-USDT</option><option>LINK-USDT</option><option>XAU-USDT</option></select><button id="probe">Run AI round</button><button id="refresh">Refresh</button>
     </div>
   </header>
 
@@ -107,7 +107,7 @@ function openPosModal(idx){
   const lever = Number(x.leverage || 35);
   const margin = Number(x.margin || 3.5);
   const notional = Number(x.position_value || (margin * lever));
-  const decimals = (x.symbol && x.symbol.includes("BTC")) ? 1 : ((x.symbol && x.symbol.includes("XRP")) ? 4 : 2);
+  const decimals = (x.symbol && (x.symbol.includes("DOGE") || x.symbol.includes("TRX"))) ? 5 : ((x.symbol && (x.symbol.includes("XRP") || x.symbol.includes("ADA"))) ? 4 : ((x.symbol && (x.symbol.includes("AVAX") || x.symbol.includes("LINK"))) ? 3 : ((x.symbol && (x.symbol.includes("BTC") || x.symbol.includes("BNB") || x.symbol.includes("XAU"))) ? 1 : 2)));
   const curStage = Number(x.trailing_stage || 0);
   const curSL = Number(x.stop_loss || 0);
   const curTP = Number(x.take_profit || 0);
@@ -386,7 +386,13 @@ function translateSlRule(r){
   const dir = String(r.direction || r.side || "").toUpperCase() === "SHORT" ? "BÁN KHỐNG (SHORT)" : "MUA (LONG)";
   const px = n(r.exit_price);
   const loss = usd(r.net_loss_usdt);
-  return "🚫 <b>TỪ CHỐI/VETO</b> vào lại lệnh <b>" + dir + "</b> trên cặp <b>" + sym + "</b> khi giá gần vùng <b>" + px + "</b> do bài học dính " + cid + " (" + loss + ") khi chưa có xác nhận phá vỡ cấu trúc đảo chiều.";
+  let indNote = "";
+  if(r.rsi !== null && r.rsi !== undefined){
+    const rsiVal = Number(r.rsi);
+    const rsiTag = rsiVal >= 70 ? " (Quá mua ⚠️)" : (rsiVal <= 30 ? " (Quá bán ⚠️)" : "");
+    indNote = " kèm RSI=" + n(r.rsi, 1) + rsiTag;
+  }
+  return "🚫 <b>TỪ CHỐI/VETO</b> vào lại lệnh <b>" + dir + "</b> (áp dụng toàn bộ vị thế khi " + (dir.includes("SHORT") ? "RSI quá mua" : "RSI quá bán") + ") hoặc gần vùng <b>" + px + " (" + sym + ")</b> do bài học dính " + cid + " (" + loss + ")" + indNote + ".";
 }
 
 function displaySlTable(){
@@ -405,22 +411,32 @@ function displaySlTable(){
   $("sl-summary").textContent = totalCases + " bài học (" + slCurrentPage + "/" + maxPage + ")";
 
   const tableHtml = "<div class=\"table-wrap\"><table class=\"sl-table\"><thead><tr>" +
-    "<th style=\"width:70px\">Mã SL</th>" +
-    "<th style=\"width:90px\">Cặp</th>" +
-    "<th style=\"width:75px\">Vị thế</th>" +
-    "<th class=\"num\" style=\"width:85px\">Giá dính SL</th>" +
-    "<th class=\"num\" style=\"width:85px\">Số tiền lỗ</th>" +
-    "<th class=\"num\" style=\"width:95px\">Thời gian</th>" +
-    "<th>Quy tắc Tự học Tránh lặp lại Lỗi</th>" +
+    "<th style=\"width:65px\">Mã SL</th>" +
+    "<th style=\"width:85px\">Cặp</th>" +
+    "<th style=\"width:70px\">Vị thế</th>" +
+    "<th class=\"num\" style=\"width:80px\">Giá SL</th>" +
+    "<th style=\"width:130px\">Chỉ số kỹ thuật khi SL</th>" +
+    "<th class=\"num\" style=\"width:80px\">Số tiền lỗ</th>" +
+    "<th class=\"num\" style=\"width:85px\">Thời gian</th>" +
+    "<th>Quy tắc Tự học Toàn bộ Vị thế (Cross-Asset)</th>" +
     "</tr></thead><tbody>" +
     pageRows.map(r => {
       const isShort = String(r.direction || r.side || "").toLowerCase().includes("short");
       const sideBadge = isShort ? "<span class=\"tag sell\">SHORT</span>" : "<span class=\"tag buy\">LONG</span>";
+      let indHtml = "<span class=\"muted\">Đang phân tích</span>";
+      if(r.rsi !== null && r.rsi !== undefined){
+        const rsiVal = Number(r.rsi);
+        const rsiClass = rsiVal >= 70 ? "pnl-neg" : (rsiVal <= 30 ? "pnl-pos" : "");
+        const emaText = r.ema20 ? (" · EMA: " + n(r.ema20)) : "";
+        const volText = (r.volume_z !== null && r.volume_z !== undefined) ? (" · Vol: " + (r.volume_z >= 0 ? "+" : "") + n(r.volume_z, 1) + "σ") : "";
+        indHtml = "<span class=\"" + rsiClass + "\" style=\"font-weight:700\">RSI: " + n(r.rsi, 1) + "</span><br><span style=\"font-size:10px;color:var(--muted)\">" + (emaText + volText).replace(/^ · /, "") + "</span>";
+      }
       return "<tr>" +
         "<td><b class=\"tag bad\" style=\"font-size:10px;padding:1px 6px\">" + esc(r.case_id || "SL") + "</b></td>" +
         "<td><b>" + esc(r.symbol) + "</b></td>" +
         "<td>" + sideBadge + "</td>" +
         "<td class=\"num\"><b>" + n(r.exit_price) + "</b></td>" +
+        "<td>" + indHtml + "</td>" +
         "<td class=\"num pnl-neg\"><b>" + usd(r.net_loss_usdt) + "</b></td>" +
         "<td class=\"num muted\">" + formatAgeVi(r.loss_age_minutes) + "</td>" +
         "<td style=\"font-size:11px;color:var(--ink);white-space:normal;line-height:1.35\">" + translateSlRule(r) + "</td>" +

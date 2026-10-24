@@ -82,6 +82,18 @@ class NewsService:
             query_terms.update({"binance", "bnb"})
         elif symbol == "XRP-USDT":
             query_terms.update({"ripple", "xrp"})
+        elif symbol == "DOGE-USDT":
+            query_terms.update({"dogecoin", "doge"})
+        elif symbol == "ADA-USDT":
+            query_terms.update({"cardano", "ada"})
+        elif symbol == "TRX-USDT":
+            query_terms.update({"tron", "trx", "justin sun"})
+        elif symbol == "AVAX-USDT":
+            query_terms.update({"avalanche", "avax"})
+        elif symbol == "LINK-USDT":
+            query_terms.update({"chainlink", "link"})
+        elif symbol == "XAU-USDT":
+            query_terms.update({"gold", "xau", "bullion", "precious metal"})
         items = []
         for entry in root.findall(".//item"):
             title = re.sub(r"\s+", " ", unescape(entry.findtext("title", ""))).strip()

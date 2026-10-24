@@ -12,6 +12,12 @@ SWAP_BY_SYMBOL = {
     "SOL-USDT": "SOL-USDT-SWAP",
     "BNB-USDT": "BNB-USDT-SWAP",
     "XRP-USDT": "XRP-USDT-SWAP",
+    "DOGE-USDT": "DOGE-USDT-SWAP",
+    "ADA-USDT": "ADA-USDT-SWAP",
+    "TRX-USDT": "TRX-USDT-SWAP",
+    "AVAX-USDT": "AVAX-USDT-SWAP",
+    "LINK-USDT": "LINK-USDT-SWAP",
+    "XAU-USDT": "XAU-USDT-SWAP",
 }
 CT_VAL_BY_SWAP = {
     "BTC-USDT-SWAP": 0.01,
@@ -19,13 +25,23 @@ CT_VAL_BY_SWAP = {
     "SOL-USDT-SWAP": 1.0,
     "BNB-USDT-SWAP": 0.01,
     "XRP-USDT-SWAP": 100.0,
+    "DOGE-USDT-SWAP": 1000.0,
+    "ADA-USDT-SWAP": 100.0,
+    "TRX-USDT-SWAP": 1000.0,
+    "AVAX-USDT-SWAP": 1.0,
+    "LINK-USDT-SWAP": 1.0,
+    "XAU-USDT-SWAP": 0.001,
 }
 
 
 def get_price_decimals(symbol: str) -> int:
-    if "XRP" in symbol:
+    if "DOGE" in symbol or "TRX" in symbol:
+        return 5
+    if "XRP" in symbol or "ADA" in symbol:
         return 4
-    if "BTC" in symbol or "BNB" in symbol:
+    if "AVAX" in symbol or "LINK" in symbol:
+        return 3
+    if "BTC" in symbol or "BNB" in symbol or "XAU" in symbol:
         return 1
     return 2
 

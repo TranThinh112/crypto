@@ -65,11 +65,50 @@ class PaperWorker:
         self.exchange_sync_step = ""
         self.live_trade_plans: dict[str, dict] = {}
         self.recent_losses_cache: list[dict] = []
+        self.sl_indicators_cache: dict[tuple, dict] = {}
         self.last_losses_sync_at: float = 0.0
 
 
+    async def _fetch_loss_indicators(self, symbol: str, fill_time_ms: int) -> dict:
+        base_sym = symbol.replace('-SWAP', '')
+        cache_key = (base_sym, fill_time_ms // 60000)
+        cache = getattr(self, 'sl_indicators_cache', {})
+        if cache_key in cache:
+            return cache[cache_key]
+        client = getattr(self, 'client', None)
+        if not client:
+            return {'rsi': None, 'ema20': None, 'volume_z': None}
+        try:
+            res = await client.request(
+                'GET',
+                '/api/v5/market/history-candles',
+                params={'instId': base_sym, 'bar': '1m', 'after': str(fill_time_ms + 60000), 'limit': '30'},
+            )
+            data = res.get('data', [])
+            if len(data) >= 15:
+                import pandas as pd
+                from app.features.indicators import compute_features
+                df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'volCcy', 'volCcyQuote', 'confirm'])
+                df = df.iloc[::-1].reset_index(drop=True)
+                df['volume'] = df['vol'].astype(float)
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = df[col].astype(float)
+                feat = compute_features(df)
+                row = feat.iloc[-1]
+                rsi_val = round(float(row['rsi']), 1) if pd.notna(row['rsi']) else None
+                ema_val = round(float(row['ema20']), 2) if pd.notna(row['ema20']) else None
+                vol_val = round(float(row['volume_z']), 2) if pd.notna(row['volume_z']) else None
+                res_dict = {'rsi': rsi_val, 'ema20': ema_val, 'volume_z': vol_val}
+                cache[cache_key] = res_dict
+                return res_dict
+        except Exception as exc:
+            log.debug('fetch_loss_indicators_failed', extra={'symbol': base_sym, 'error': str(exc)})
+        fallback = {'rsi': None, 'ema20': None, 'volume_z': None}
+        cache[cache_key] = fallback
+        return fallback
+
     async def _get_recent_losses_memory(self, max_items: int = 20, lookback_hours: int = 87600) -> list[dict]:
-        """Fetch real recent stop-loss and losing trades from OKX fills history and index with SL_01, SL_02..."""
+        """Fetch real recent stop-loss and losing trades from OKX fills history, enrich with RSI/EMA/Volume, and index with SL_01, SL_02..."""
         now = time.time()
         cache = getattr(self, "recent_losses_cache", [])
         last_sync = getattr(self, "last_losses_sync_at", 0.0)
@@ -108,18 +147,32 @@ class PaperWorker:
                         })
             except Exception as exc:
                 log.debug("losses_memory_sync_failed", extra={"symbol": symbol, "error": str(exc)})
+
+        # Enrich losing trades with technical indicators (RSI, EMA20, Volume_Z)
+        if losses:
+            sem = asyncio.Semaphore(8)
+            async def _enrich(item):
+                async with sem:
+                    ind = await self._fetch_loss_indicators(item["symbol"], item["timestamp_ms"])
+                    item["rsi"] = ind.get("rsi")
+                    item["ema20"] = ind.get("ema20")
+                    item["volume_z"] = ind.get("volume_z")
+            await asyncio.gather(*[_enrich(item) for item in losses])
+
         # Sort chronological (oldest to newest) to assign permanent ascending case IDs: SL_01, SL_02...
         losses.sort(key=lambda x: x["timestamp_ms"])
         for idx, item in enumerate(losses, start=1):
             cid = f"SL_{idx:02d}"
             item["case_id"] = cid
             item["case_index"] = idx
+            rsi_str = f"RSI={item['rsi']} " if item.get('rsi') is not None else ""
+            vol_str = f"VolZ={item['volume_z']} " if item.get('volume_z') is not None else ""
             item["rule"] = (
                 f"VETO/AVOID re-entering {item['direction'].upper()} on {item['symbol']} while price is near {item['exit_price']} "
-                f"due to prior {cid} ({item['net_loss_usdt']} USDT) without structural reversal confirmation"
+                f"({rsi_str}{vol_str}loss: {item['net_loss_usdt']} USDT) due to prior {cid} without structural reversal confirmation"
             )
-            log.info("SL_CASE_LOGGED: [%s] Symbol=%s Direction=%s ExitPx=%s Loss=%s USDT Age=%s min Rule=%s",
-                     cid, item['symbol'], item['direction'], item['exit_price'], item['net_loss_usdt'], item['loss_age_minutes'], item['rule'])
+            log.info("SL_CASE_LOGGED: [%s] Symbol=%s Direction=%s ExitPx=%s RSI=%s EMA20=%s VolZ=%s Loss=%s USDT Age=%s min Rule=%s",
+                     cid, item['symbol'], item['direction'], item['exit_price'], item.get('rsi'), item.get('ema20'), item.get('volume_z'), item['net_loss_usdt'], item['loss_age_minutes'], item['rule'])
         
         # Now sort reverse (newest first) for UI & AI display, keeping the permanent case_id intact
         losses_display = sorted(losses, key=lambda x: x["timestamp_ms"], reverse=True)
@@ -922,15 +975,17 @@ class PaperWorker:
         }
 
 
-    def _ai_precheck_reason(self, proposal: dict, portfolio: dict, orderbook: dict, risk: dict) -> str:
+    def _ai_precheck_reason(self, proposal: dict, portfolio: dict, orderbook: dict, risk: dict, values: dict | None = None) -> str:
         if not getattr(self.settings, "ai_precheck_enabled", True):
             return ""
         if proposal.get("action") == "hold":
             return str(proposal.get("reason") or "deterministic_hold")
         symbol = proposal.get("symbol")
         action = proposal.get("action")
-        # Self-learning: Check if same symbol and side suffered a recent loss within 30 minutes
         recent_losses = getattr(self, "recent_losses_cache", [])
+        cur_rsi = self._finite((values or {}).get("rsi"))
+
+        # 1. Exact symbol + direction cooldown within 30 minutes
         for loss in recent_losses:
             loss_sym = loss.get("symbol")
             loss_side = loss.get("side")
@@ -941,6 +996,27 @@ class PaperWorker:
                 if is_same_side:
                     log.warning("PRECHECK_SL_VETO: Proposal %s %s blocked as it matches prior stop-loss case %s (loss age: %s min)", action, symbol, cid, loss_age)
                     return f"similar_to_{cid}"
+
+        # 2. Universal Cross-Asset Technical Pattern VETO (RSI traps learned from all historical SL cases)
+        if cur_rsi is not None and recent_losses:
+            if action == "sell":
+                # Check if entering SHORT when market is strongly overbought (learned from SL cases like SL_27 RSI >= 75)
+                overbought_sl = [l for l in recent_losses if l.get("direction") == "short" and l.get("rsi") is not None and l.get("rsi") >= 75.0]
+                if cur_rsi >= 72.0 and overbought_sl:
+                    ref_cid = overbought_sl[0].get("case_id", "SL_27")
+                    ref_rsi = overbought_sl[0].get("rsi")
+                    log.warning("PRECHECK_CROSS_ASSET_VETO: SHORT %s blocked at RSI=%.1f due to cross-asset overbought trap learned from %s (RSI=%.1f)",
+                                symbol, cur_rsi, ref_cid, ref_rsi or 75.0)
+                    return f"cross_asset_overbought_trap_{ref_cid}"
+            elif action == "buy":
+                # Check if entering LONG when market is in free-fall / oversold knife (learned from SL cases with RSI <= 25)
+                oversold_sl = [l for l in recent_losses if l.get("direction") == "long" and l.get("rsi") is not None and l.get("rsi") <= 25.0]
+                if cur_rsi <= 28.0 and oversold_sl:
+                    ref_cid = oversold_sl[0].get("case_id", "SL_25")
+                    ref_rsi = oversold_sl[0].get("rsi")
+                    log.warning("PRECHECK_CROSS_ASSET_VETO: LONG %s blocked at RSI=%.1f due to cross-asset falling knife learned from %s (RSI=%.1f)",
+                                symbol, cur_rsi, ref_cid, ref_rsi or 25.0)
+                    return f"cross_asset_falling_knife_{ref_cid}"
         positions = portfolio.get("positions", {})
         if symbol and any(symbol == p or p.startswith(symbol) or symbol.startswith(p) for p in positions):
             return "position_already_exists"
@@ -1012,7 +1088,7 @@ class PaperWorker:
         agent_snapshot = self._agent_snapshot(
             symbol, snapshot, values, row, orderbook, spread, portfolio, risk, news, proposal, candles, htf_trend=htf_trend
         )
-        precheck_reason = self._ai_precheck_reason(proposal, portfolio, orderbook, risk)
+        precheck_reason = self._ai_precheck_reason(proposal, portfolio, orderbook, risk, values=values)
         if precheck_reason:
             self.last_ai_advisory_at[symbol] = time.time()
             return await self._persist_precheck_consensus(round_id, symbol, decision, agent_snapshot, precheck_reason)

@@ -5,7 +5,7 @@ from app.market_data.okx import OKXClient
 
 def test_okx_restricts_symbol_and_spot_order_mode():
     client=OKXClient()
-    with pytest.raises(ValueError): client.validate_symbol("DOGE-USDT")
+    with pytest.raises(ValueError): client.validate_symbol("SHIB-USDT")
     client.validate_symbol("SOL-USDT")
     client.validate_symbol("BNB-USDT")
     client.validate_symbol("XRP-USDT")

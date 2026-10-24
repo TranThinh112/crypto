@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     live_max_leverage: int = Field(50, ge=1, le=100)
     live_trailing_stop_enabled: bool = True
     breakeven_offset_pct: float = Field(0.0015, ge=0.0, le=0.01)
-    allowed_symbols: tuple[str, ...] = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT")
+    allowed_symbols: tuple[str, ...] = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT", "TRX-USDT", "AVAX-USDT", "LINK-USDT", "XAU-USDT")
     discord_webhook_url: str = ""
     otel_service_name: str = "crypto-agent"
     otel_exporter_otlp_endpoint: str = ""
@@ -104,7 +104,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def guard_live(self):
-        supported_symbols = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT")
+        supported_symbols = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT", "TRX-USDT", "AVAX-USDT", "LINK-USDT", "XAU-USDT")
         if any(symbol not in supported_symbols for symbol in self.allowed_symbols):
             raise ValueError(f"only {', '.join(supported_symbols)} spot symbols are supported")
         if self.trading_mode == TradingMode.live and not self.enable_live_trading:
