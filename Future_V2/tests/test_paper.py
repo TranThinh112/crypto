@@ -184,9 +184,9 @@ def test_ai_precheck_allows_funded_buy():
 def test_strategy_generates_sell_signal():
     from app.strategy import signal
     features = {
-        "close": 100.0,
-        "ema20": 105.0,
-        "ema50": 110.0,
+        "close": 99.0,
+        "ema20": 100.0,
+        "ema50": 102.0,
         "rsi": 40.0,
         "macd": -1.5,
         "macd_signal": -0.5,
@@ -195,8 +195,8 @@ def test_strategy_generates_sell_signal():
     sig = signal(features, 0.0001, 0.001)
     assert sig["action"] == "sell"
     assert sig["reason"] == "trend_momentum_short"
-    assert sig["stop_loss"] == 104.0
-    assert sig["take_profit"] == 94.0
+    assert sig["stop_loss"] == 103.0
+    assert sig["take_profit"] == 93.0
 
 
 def test_proposal_context_sizes_sell_correctly():

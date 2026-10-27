@@ -80,7 +80,8 @@ def signal(
 
     # Guard: Over-extension filter (prevent chasing when price is too far from EMA20)
     ema20_dist_pct = abs(close - ema20) / ema20 if ema20 > 0 else 0.0
-    over_extended = ema20_dist_pct > 0.050
+    over_extended_buy = ema20_dist_pct > 0.035
+    over_extended_short = ema20_dist_pct > 0.018  # Strict 1.8% limit to prevent shorting after large drop
 
     # Guard: Bollinger Bands extreme filter
     bb_upper = float(latest.get("bb_upper", 0.0) or 0.0)
@@ -91,7 +92,7 @@ def signal(
     if close > ema20 > ema50 and 52 <= rsi <= 68 and macd > macd_signal:
         if htf_trend == "bearish":
             return {"action": "hold", "reason": "htf_trend_conflict_bearish", "htf_trend": "bearish"}
-        if over_extended:
+        if over_extended_buy:
             return {"action": "hold", "reason": "over_extended_above_ema20", "htf_trend": htf_trend or "aligned"}
         if bb_overbought:
             return {"action": "hold", "reason": "bollinger_upper_overbought", "htf_trend": htf_trend or "aligned"}
@@ -112,10 +113,11 @@ def signal(
             },
             "htf_trend": htf_trend or "aligned",
         }
-    if close < ema20 < ema50 and 32 <= rsi <= 48 and macd < macd_signal:
+        # Guard: Shorting requires healthy momentum, rejecting near-oversold/exhaustion (RSI < 36)
+    if close < ema20 < ema50 and 36 <= rsi <= 48 and macd < macd_signal:
         if htf_trend == "bullish":
             return {"action": "hold", "reason": "htf_trend_conflict_bullish", "htf_trend": "bullish"}
-        if over_extended:
+        if over_extended_short:
             return {"action": "hold", "reason": "over_extended_below_ema20", "htf_trend": htf_trend or "aligned"}
         if bb_oversold:
             return {"action": "hold", "reason": "bollinger_lower_oversold", "htf_trend": htf_trend or "aligned"}
