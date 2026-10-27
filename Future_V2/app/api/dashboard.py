@@ -297,7 +297,7 @@ function renderLastRound(r, prices){
     "<div class=\"fact\"><b>Reasons</b><span>"+esc((c.reason_codes&&c.reason_codes.length)?c.reason_codes.join(", "):(c.approved?"Approved":(veto>0?"Vetoed by "+vetoAgents.join(", "):((buys===8||sells===8)?"Score "+n(c.score,3)+" < 0.580":"Score "+n(c.score,3)+" / No consensus"))))+"</span></div>"+
     "</div></div></div>";
   let warn = "";
-  const slMatch = (c.reason_codes||[]).find(x => x && (x.includes("SL_") || x.includes("sl_") || x.includes("similar_to")));
+  const slMatch = (c.reason_codes||[]).find(x => x && (/SL_\d+/i.test(x) || x.includes("similar_to_") || x.includes("cross_asset_")));
   if(c.approved){
     warn = "<div class=\"warn ok-warn\" style=\"background:#d6ead5;border-color:#19733a;color:#13221e\"><b>APPROVED FOR LIVE TRADE!</b> Score <b>"+n(c.score,3)+"</b> ≥ 0.580 threshold with 8/8 consensus. Live order sent to OKX.</div>";
   } else if(slMatch){
@@ -337,7 +337,7 @@ function renderConsensus(rows){
     const sells=votes.filter(v=>v.action==="sell").length;
     let explanation = "";
     const reasons = r.reason_codes || [];
-    const slMatch = reasons.find(x => x && (x.includes("SL_") || x.includes("sl_") || x.includes("similar_to")));
+    const slMatch = reasons.find(x => x && (/SL_\d+/i.test(x) || x.includes("similar_to_") || x.includes("cross_asset_")));
     if(slMatch){
       const cid = (slMatch.match(/SL_\d+/i) || [slMatch])[0].toUpperCase();
       explanation = "🚫 VETO: Trùng mô hình " + cid;
