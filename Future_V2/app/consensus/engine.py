@@ -13,7 +13,7 @@ WEIGHT_DOMAINS={
     "MARIN": ("critic", .10),
 }
 WEIGHTS={agent: weight for agent, (_, weight) in WEIGHT_DOMAINS.items()}
-def aggregate(votes: list[AgentDecision], symbol: str, threshold: float = 0.580) -> Consensus:
+def aggregate(votes: list[AgentDecision], symbol: str, threshold: float = 0.650) -> Consensus:
     if len(votes) != 8 or any(v.data_quality != "good" or v.veto for v in votes):
         reasons = ["invalid_or_veto"]
         for v in votes:

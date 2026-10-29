@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     otel_service_name: str = "crypto-agent"
     otel_exporter_otlp_endpoint: str = ""
-    consensus_score_threshold: float = Field(0.580, ge=0.0, le=1.0)
+    consensus_score_threshold: float = Field(0.650, ge=0.0, le=1.0)
     enable_ai_advisory: bool = False
     ai_advisory_cooldown_seconds: int = Field(1800, ge=0)
     ai_advisory_on_hold: bool = False

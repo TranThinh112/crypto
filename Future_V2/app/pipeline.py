@@ -115,5 +115,5 @@ async def analyze(snapshot, agents, on_agent_decision=None, *, early_stop=True,
                         skipped_agents=skipped,
                     ))
             break
-    threshold = snapshot.get("threshold", 0.580) if isinstance(snapshot, dict) else 0.580
+    threshold = snapshot.get("threshold", 0.650) if isinstance(snapshot, dict) else 0.650
     return aggregate(votes, snapshot["symbol"], threshold=threshold)

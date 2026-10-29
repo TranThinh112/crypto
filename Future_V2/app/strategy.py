@@ -30,7 +30,7 @@ def signal(
     macd = float(latest["macd"])
     macd_signal = float(latest["macd_signal"])
     atr = float(latest["atr"])
-    stop_distance = max(2 * atr, close * min_stop_pct)
+    stop_distance = max(1.5 * atr, close * min_stop_pct)
     target_distance = stop_distance * risk_reward
     ladder = {
         "tp1_pct": tp1_pct,
