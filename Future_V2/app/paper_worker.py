@@ -206,11 +206,9 @@ class PaperWorker:
             return False, "ai_advisory_disabled"
         if decision.get("action") == "hold" and not self.settings.ai_advisory_on_hold:
             return False, "deterministic_hold"
-        last = self.last_ai_advisory_at.get(symbol, 0)
-        cooldown = self.settings.ai_advisory_cooldown_seconds
-        if decision.get("action") in ("buy", "sell"):
-            cooldown = max(300, cooldown // 2)
-        if now - last < cooldown:
+        last = self.last_ai_advisory_at.get(symbol)
+        cooldown = getattr(self.settings, "ai_advisory_cooldown_seconds", 1800)
+        if last is not None and now - last < cooldown:
             return False, "ai_advisory_cooldown"
         return True, "ai_advisory_allowed"
 
