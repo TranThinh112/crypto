@@ -47,7 +47,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       <article class="card"><div class="section-title"><h2>Last AI Round</h2><span class="mono muted" id="round-id">-</span></div><div id="last-round"></div></article>
       <article class="card"><div class="section-title"><h2>Agent Votes</h2><span class="muted" id="vote-summary">-</span></div><div id="agent-votes"></div></article>
       <article class="card"><div class="section-title"><h2>Bộ nhớ Tự học Cắt lỗ (SL_01, SL_02...)</h2><span class="muted" id="sl-summary">Cơ sở dữ liệu tự học</span></div><div id="sl-memory"></div></article>
-      <article class="card"><div class="section-title"><h2>Lịch sử Vị thế đã đóng (Match 1:1 OKX)</h2><span class="muted" id="pos-history-summary">Dữ liệu thực tế sàn OKX</span></div><div id="closed-positions-history"></div></article>
       <details class="card"><summary><b>More logs</b> · consensus, agent decisions, market scans</summary><div class="details"><h2>Consensus</h2><div id="consensus"></div><h2 style="margin-top:18px">Agent Decisions</h2><div id="decisions"></div><h2 style="margin-top:18px">Market Scans</h2><div id="ticks"></div></div></details>
     </section>
     <aside class="stack">
