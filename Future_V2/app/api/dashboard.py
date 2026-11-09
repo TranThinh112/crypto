@@ -53,6 +53,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <aside class="stack">
       <article class="card"><h2>Real OKX Portfolio</h2><div id="portfolio"></div></article>
       <article class="card"><h2>AI Cost By Agent</h2><div id="agent-cost"></div></article>
+      <article class="card"><div class="section-title"><h2>Lịch sử Vị thế đã đóng (Match 1:1 OKX)</h2><span class="muted" id="pos-history-summary">Dữ liệu thực tế sàn OKX</span></div><div id="closed-positions-history"></div></article>
     </aside>
   </div>
   <div class="footer"><span id="updated">loading...</span><span id="db-info">db ?</span></div>
@@ -473,7 +474,7 @@ function displaySlTable(){
 
 
 let posHistoryCurrentPage = 1;
-const POS_HISTORY_PAGE_SIZE = 10;
+const POS_HISTORY_PAGE_SIZE = 5;
 window.allClosedPositions = [];
 
 function changePosHistoryPage(delta){
