@@ -47,6 +47,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <article class="card"><div class="section-title"><h2>Last AI Round</h2><span class="mono muted" id="round-id">-</span></div><div id="last-round"></div></article>
       <article class="card"><div class="section-title"><h2>Agent Votes</h2><span class="muted" id="vote-summary">-</span></div><div id="agent-votes"></div></article>
       <article class="card"><div class="section-title"><h2>Bộ nhớ Tự học Cắt lỗ (SL_01, SL_02...)</h2><span class="muted" id="sl-summary">Cơ sở dữ liệu tự học</span></div><div id="sl-memory"></div></article>
+      <article class="card"><div class="section-title"><h2>Lịch sử Vị thế đã đóng (Match 1:1 OKX)</h2><span class="muted" id="pos-history-summary">Dữ liệu thực tế sàn OKX</span></div><div id="closed-positions-history"></div></article>
       <details class="card"><summary><b>More logs</b> · consensus, agent decisions, market scans</summary><div class="details"><h2>Consensus</h2><div id="consensus"></div><h2 style="margin-top:18px">Agent Decisions</h2><div id="decisions"></div><h2 style="margin-top:18px">Market Scans</h2><div id="ticks"></div></div></details>
     </section>
     <aside class="stack">
@@ -470,6 +471,85 @@ function displaySlTable(){
   $("sl-memory").innerHTML = tableHtml;
 }
 
+
+let posHistoryCurrentPage = 1;
+const POS_HISTORY_PAGE_SIZE = 10;
+window.allClosedPositions = [];
+
+function changePosHistoryPage(delta){
+  const maxPage = Math.max(1, Math.ceil((window.allClosedPositions || []).length / POS_HISTORY_PAGE_SIZE));
+  posHistoryCurrentPage = Math.max(1, Math.min(maxPage, posHistoryCurrentPage + delta));
+  displayPosHistoryTable();
+}
+
+function displayPosHistoryTable(){
+  const rows = window.allClosedPositions || [];
+  if(!rows.length){
+    $("pos-history-summary").textContent = "Không có vị thế đã đóng";
+    $("closed-positions-history").innerHTML = "<div class=\"empty\">Chưa có vị thế nào được đóng trên OKX.</div>";
+    return;
+  }
+  const total = rows.length;
+  const maxPage = Math.max(1, Math.ceil(total / POS_HISTORY_PAGE_SIZE));
+  if(posHistoryCurrentPage > maxPage) posHistoryCurrentPage = maxPage;
+  const start = (posHistoryCurrentPage - 1) * POS_HISTORY_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + POS_HISTORY_PAGE_SIZE);
+
+  $("pos-history-summary").textContent = total + " vị thế (" + posHistoryCurrentPage + "/" + maxPage + ")";
+
+  const tableHtml = "<div class=\"table-wrap\"><table class=\"sl-table\"><thead><tr>" +
+    "<th style=\"width:95px\">Tên Coin</th>" +
+    "<th style=\"width:75px\">Vị thế</th>" +
+    "<th class=\"num\" style=\"width:90px\">Giá Vào</th>" +
+    "<th class=\"num\" style=\"width:90px\">Giá Đóng</th>" +
+    "<th class=\"num\" style=\"width:80px\">Margin (Ký quỹ)</th>" +
+    "<th class=\"num\" style=\"width:105px\">PnL Lãi / Lỗ</th>" +
+    "<th class=\"num\" style=\"width:85px\">PnL %</th>" +
+    "<th style=\"width:130px\">Thời gian Mở</th>" +
+    "<th style=\"width:130px\">Thời gian Đóng</th>" +
+    "</tr></thead><tbody>" +
+    pageRows.map(r => {
+      const isShort = String(r.direction || "").toLowerCase().includes("short");
+      const sideBadge = isShort ? "<span class=\"tag sell\">SHORT</span>" : "<span class=\"tag buy\">LONG</span>";
+      const pnlVal = Number(r.pnl || 0);
+      const isWin = pnlVal >= 0;
+      const pnlClass = isWin ? "pnl-pos" : "pnl-neg";
+      const pnlSign = isWin ? "+" : "";
+      const pnlRatio = Number(r.pnl_ratio_pct || 0);
+      const ratioSign = pnlRatio >= 0 ? "+" : "";
+      
+      const openTime = r.c_time ? when(r.c_time / 1000) : (r.open_time_str || "-");
+      const closeTime = r.u_time ? when(r.u_time / 1000) : (r.close_time_str || "-");
+
+      return "<tr>" +
+        "<td><b>" + esc(r.symbol || r.inst_id) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">" + esc(r.inst_id) + "</span></td>" +
+        "<td>" + sideBadge + "<br><span style=\"font-size:10px;color:var(--muted)\">" + (r.leverage || 35) + "x</span></td>" +
+        "<td class=\"num\"><b>" + n(r.open_avg_px) + "</b></td>" +
+        "<td class=\"num\"><b>" + n(r.close_avg_px) + "</b></td>" +
+        "<td class=\"num\"><b>" + usd(r.margin) + "</b></td>" +
+        "<td class=\"num " + pnlClass + "\"><b>" + pnlSign + usd(r.pnl) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">Net: " + (r.realized_pnl >= 0 ? "+" : "") + usd(r.realized_pnl) + "</span></td>" +
+        "<td class=\"num " + pnlClass + "\"><b>" + ratioSign + pnlRatio.toFixed(2) + "%</b></td>" +
+        "<td style=\"font-size:11px;color:var(--ink)\">" + openTime + "</td>" +
+        "<td style=\"font-size:11px;color:var(--ink)\">" + closeTime + "</td>" +
+        "</tr>";
+    }).join("") +
+    "</tbody></table></div>" +
+    "<div class=\"pagination-bar\">" +
+    "<span>Hiển thị " + (start + 1) + " - " + Math.min(start + POS_HISTORY_PAGE_SIZE, total) + " trong tổng số <b>" + total + "</b> vị thế</span>" +
+    "<div class=\"pagination-btns\">" +
+    "<button class=\"pag-btn\" onclick=\"changePosHistoryPage(-1)\" " + (posHistoryCurrentPage <= 1 ? "disabled" : "") + ">‹ Trang trước</button>" +
+    "<span>Trang <b>" + posHistoryCurrentPage + "</b> / " + maxPage + "</span>" +
+    "<button class=\"pag-btn\" onclick=\"changePosHistoryPage(1)\" " + (posHistoryCurrentPage >= maxPage ? "disabled" : "") + ">Trang sau ›</button>" +
+    "</div></div>";
+
+  $("closed-positions-history").innerHTML = tableHtml;
+}
+
+function renderClosedPositionsHistory(rows){
+  window.allClosedPositions = rows || [];
+  displayPosHistoryTable();
+}
+
 function renderLossesMemory(rows){
   window.allLossesRows = rows || [];
   displaySlTable();
@@ -482,7 +562,7 @@ async function load(){
     const rt=d.runtime||{}, caps=rt.capabilities||{}, okx=rt.okx_account||{}, backend=d.audit_backend||{};
     $("p-mode").textContent="mode "+((rt.runtime||{}).mode||"?"); $("p-health").textContent=d.health.paper_worker?"worker healthy":"worker degraded"; $("p-health").className="pill "+(d.health.paper_worker?"ok":"bad");
     $("p-sync").textContent=okx.synced?"OKX synced":"OKX not synced"; $("p-sync").className="pill "+(okx.synced?"ok":"bad"); $("p-rev").textContent="rev "+String(rt.code_revision||"unknown").slice(0,8);
-    renderKpis(d); renderPortfolio(d.portfolio); renderLastRound(d.last_ai_round,d.last_prices||{}); renderAgentVotes(d.last_ai_round,d.last_prices||{}); renderAgentCost(d.summary.agents); renderLossesMemory(d.recent_losses_memory); renderConsensus(d.events.consensus); renderDecisions(d.events.agent_decision); renderTicks(d.events.paper_tick);
+    renderKpis(d); renderPortfolio(d.portfolio); renderLastRound(d.last_ai_round,d.last_prices||{}); renderAgentVotes(d.last_ai_round,d.last_prices||{}); renderAgentCost(d.summary.agents); renderLossesMemory(d.recent_losses_memory); renderClosedPositionsHistory(d.closed_positions_history); renderConsensus(d.events.consensus); renderDecisions(d.events.agent_decision); renderTicks(d.events.paper_tick);
     $("db-info").textContent="db "+(backend.kind||"?")+" · live="+caps.live_trading+" · paper_exec="+caps.paper_execution+" · read_only="+caps.okx_read_only; $("updated").textContent="updated "+new Date().toLocaleTimeString()+" · last tick "+(d.health.last_tick_at?when(d.health.last_tick_at):"never");
   }catch(error){ $("updated").textContent="dashboard error: "+error; $("last-round").innerHTML="<div class=\"warn\"><b>Dashboard error.</b> "+esc(String(error))+"</div>"; }
 }

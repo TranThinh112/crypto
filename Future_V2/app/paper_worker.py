@@ -64,6 +64,9 @@ class PaperWorker:
         self.exchange_sync_attempts = 0
         self.exchange_sync_step = ""
         self.live_trade_plans: dict[str, dict] = {}
+        self.positions_history_cache: list[dict] = []
+        self.last_positions_history_sync_at: float = 0.0
+        self.instruments_ct_val_cache: dict[str, float] = {}
         self.recent_losses_cache: list[dict] = []
         self.sl_indicators_cache: dict[tuple, dict] = {}
         self.last_losses_sync_at: float = 0.0
@@ -106,6 +109,76 @@ class PaperWorker:
         fallback = {'rsi': None, 'ema20': None, 'volume_z': None}
         cache[cache_key] = fallback
         return fallback
+
+    
+    async def _get_positions_history(self, limit: int = 50) -> list[dict]:
+        """Fetch closed positions history from OKX 1:1 match with real exchange data."""
+        now = time.time()
+        cache = getattr(self, "positions_history_cache", [])
+        last_sync = getattr(self, "last_positions_history_sync_at", 0.0)
+        if cache and (now - last_sync) < 15:
+            return cache[:limit]
+
+        client = getattr(self, "client", None)
+        api_key = getattr(client, "api_key", "") if client else ""
+        if not getattr(self.settings, "okx_account_sync", False) or not api_key:
+            return cache[:limit]
+
+        try:
+            # Cache contract values for instruments if not present
+            ct_vals = getattr(self, "instruments_ct_val_cache", {})
+            if not ct_vals:
+                inst_res = await client.request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
+                for item in (inst_res.get("data") or []):
+                    ct_vals[item.get("instId", "")] = self._finite(item.get("ctVal")) or 1.0
+                self.instruments_ct_val_cache = ct_vals
+
+            res = await client.request("GET", "/api/v5/account/positions-history", params={"instType": "SWAP", "limit": str(limit)}, private=True)
+            data = res.get("data") or []
+            closed_positions = []
+            for p in data:
+                inst_id = str(p.get("instId") or "")
+                symbol = inst_id.replace("-SWAP", "")
+                direction = str(p.get("direction") or p.get("posSide") or "long").lower()
+                open_px = self._finite(p.get("openAvgPx")) or 0.0
+                close_px = self._finite(p.get("closeAvgPx")) or 0.0
+                sz = self._finite(p.get("openMaxPos") or p.get("closeTotalPos")) or 0.0
+                lever = self._finite(p.get("lever")) or 1.0
+                ct = ct_vals.get(inst_id, 1.0)
+                notional = sz * ct * open_px
+                margin = round(notional / lever if lever else 0.0, 2)
+                pnl = round(self._finite(p.get("pnl")) or 0.0, 4)
+                realized_pnl = round(self._finite(p.get("realizedPnl")) or pnl, 4)
+                pnl_ratio_pct = round((self._finite(p.get("pnlRatio")) or 0.0) * 100, 2)
+                fee = round(self._finite(p.get("fee")) or 0.0, 4)
+                funding_fee = round(self._finite(p.get("fundingFee")) or 0.0, 4)
+                c_time = int(p.get("cTime") or 0)
+                u_time = int(p.get("uTime") or 0)
+
+                closed_positions.append({
+                    "inst_id": inst_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "open_avg_px": open_px,
+                    "close_avg_px": close_px,
+                    "size": sz,
+                    "leverage": lever,
+                    "margin": margin,
+                    "pnl": pnl,
+                    "realized_pnl": realized_pnl,
+                    "pnl_ratio_pct": pnl_ratio_pct,
+                    "fee": fee,
+                    "funding_fee": funding_fee,
+                    "c_time": c_time,
+                    "u_time": u_time,
+                    "pos_id": str(p.get("posId") or ""),
+                })
+            self.positions_history_cache = closed_positions
+            self.last_positions_history_sync_at = now
+            return closed_positions[:limit]
+        except Exception as exc:
+            log.debug("positions_history_fetch_failed", extra={"error": str(exc)})
+            return cache[:limit]
 
     async def _get_recent_losses_memory(self, max_items: int = 20, lookback_hours: int = 87600) -> list[dict]:
         """Fetch real recent stop-loss and losing trades from OKX fills history, enrich with RSI/EMA/Volume, and index with SL_01, SL_02..."""
