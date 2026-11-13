@@ -30,8 +30,30 @@ def signal(
     macd = float(latest["macd"])
     macd_signal = float(latest["macd_signal"])
     atr = float(latest["atr"])
-    stop_distance = max(1.5 * atr, close * min_stop_pct)
-    target_distance = stop_distance * risk_reward
+    # Base stop distance fallback
+    base_stop_distance = max(1.5 * atr, close * min_stop_pct)
+
+    # Dynamic swing structure Stop Loss (0.2% buffer beyond recent swing high/low)
+    # Safeguard bounds: minimum min_stop_pct, maximum 2.0 * ATR (or 2.5% max)
+    max_stop_distance = max(2.0 * atr, close * 0.025)
+
+    if candles is not None and len(candles) >= 5:
+        tail5 = candles.tail(5)
+        recent_high = float(tail5["high"].astype(float).max())
+        recent_low = float(tail5["low"].astype(float).min())
+
+        # For SHORT: place SL just above the swing high + 0.2% buffer
+        short_sl_raw = recent_high * 1.002
+        short_stop_dist = max(short_sl_raw - close, close * min_stop_pct)
+        short_stop_dist = min(short_stop_dist, max_stop_distance)
+
+        # For BUY: place SL just below the swing low - 0.2% buffer
+        buy_sl_raw = recent_low * 0.998
+        buy_stop_dist = max(close - buy_sl_raw, close * min_stop_pct)
+        buy_stop_dist = min(buy_stop_dist, max_stop_distance)
+    else:
+        short_stop_dist = base_stop_distance
+        buy_stop_dist = base_stop_distance
     ladder = {
         "tp1_pct": tp1_pct,
         "tp1_close_pct": tp1_close_pct,
@@ -102,8 +124,8 @@ def signal(
         return {
             "action": "buy",
             "reason": "trend_momentum",
-            "stop_loss": float(close - stop_distance),
-            "take_profit": float(close + target_distance),
+            "stop_loss": float(close - buy_stop_dist),
+            "take_profit": float(close + (buy_stop_dist * risk_reward)),
             "take_profit_ladder": {
                 "tp1": float(close * (1 + tp1_pct)),
                 "tp2": float(close * (1 + tp2_pct)),
@@ -127,8 +149,8 @@ def signal(
         return {
             "action": "sell",
             "reason": "trend_momentum_short",
-            "stop_loss": float(close + stop_distance),
-            "take_profit": float(close - target_distance),
+            "stop_loss": float(close + short_stop_dist),
+            "take_profit": float(close - (short_stop_dist * risk_reward)),
             "take_profit_ladder": {
                 "tp1": float(close * (1 - tp1_pct)),
                 "tp2": float(close * (1 - tp2_pct)),
