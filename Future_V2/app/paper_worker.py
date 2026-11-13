@@ -1071,6 +1071,10 @@ class PaperWorker:
         # 2. Universal Cross-Asset Technical Pattern VETO (RSI traps learned from all historical SL cases)
         if cur_rsi is not None and recent_losses:
             if action == "sell":
+                # Guard against selling the bottom: reject SHORT if RSI is oversold/exhausted (< 38)
+                if cur_rsi < 38.0:
+                    log.warning("PRECHECK_VETO: SHORT %s blocked because RSI=%.1f is near oversold bottom", symbol, cur_rsi)
+                    return "oversold_bottom_sell_risk"
                 # Check if entering SHORT when market is strongly overbought (learned from SL cases like SL_27 RSI >= 75)
                 overbought_sl = [l for l in recent_losses if l.get("direction") == "short" and l.get("rsi") is not None and l.get("rsi") >= 75.0]
                 if cur_rsi >= 72.0 and overbought_sl:
@@ -1080,6 +1084,10 @@ class PaperWorker:
                                 symbol, cur_rsi, ref_cid, ref_rsi or 75.0)
                     return f"cross_asset_overbought_trap_{ref_cid}"
             elif action == "buy":
+                # Guard against buying the top: reject LONG if RSI is overbought/exhausted (> 62)
+                if cur_rsi > 62.0:
+                    log.warning("PRECHECK_VETO: LONG %s blocked because RSI=%.1f is near overbought top", symbol, cur_rsi)
+                    return "overbought_top_buy_risk"
                 # Check if entering LONG when market is in free-fall / oversold knife (learned from SL cases with RSI <= 25)
                 oversold_sl = [l for l in recent_losses if l.get("direction") == "long" and l.get("rsi") is not None and l.get("rsi") <= 25.0]
                 if cur_rsi <= 28.0 and oversold_sl:
