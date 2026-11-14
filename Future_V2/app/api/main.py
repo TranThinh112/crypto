@@ -299,7 +299,7 @@ async def dashboard_data(limit: int = 300):
         "audit_backend": audit_backend(settings.database_url),
         "last_prices": last_prices,
         "last_ai_round": _last_ai_round(grouped["consensus"], grouped["agent_decision"]),
-        "recent_losses_memory": getattr(worker, "recent_losses_cache", []) if worker else [],
+        "recent_losses_memory": (await worker._get_recent_losses_memory()) if worker else [],
         "closed_positions_history": await worker._get_positions_history(50) if worker else [],
         "events": grouped,
     }
