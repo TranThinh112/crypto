@@ -482,6 +482,49 @@ function changePosHistoryPage(delta){
   displayPosHistoryTable();
 }
 
+function getCloseReasonBadge(r){
+  var pnlVal = Number(r.pnl || 0);
+  var isShort = String(r.direction || "").toLowerCase().indexOf("short") !== -1;
+  var openPx = Number(r.open_avg_px || 0);
+  var closePx = Number(r.close_avg_px || 0);
+  if(!openPx || !closePx){
+    return pnlVal >= 0 ? "<span class=\"tag ok\" style=\"font-size:10px\">Chốt lời (TP)</span>" : "<span class=\"tag bad\" style=\"font-size:10px\">Cắt lỗ (SL)</span>";
+  }
+  var gainPct = isShort ? ((openPx - closePx) / openPx) : ((closePx - openPx) / openPx);
+  if(pnlVal < 0){
+    return "<span class=\"tag bad\" style=\"font-size:10px;font-weight:700\">Chạm SL ban đầu</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Cắt lỗ " + (gainPct * 100).toFixed(2) + "%</span>";
+  }
+  if(gainPct >= 0.045){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700\">Đạt TP7 (+5.0%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Chốt đỉnh biên độ</span>";
+  } else if(gainPct >= 0.036){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700\">Đạt TP6 (+4.0%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Chốt lời nấc 6</span>";
+  } else if(gainPct >= 0.027){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700\">Đạt TP5 (+3.0%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Chốt lời nấc 5</span>";
+  } else if(gainPct >= 0.019){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700\">Đạt TP4 (+2.2%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Chốt lời nấc 4</span>";
+  } else if(gainPct >= 0.0125){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700;background:#dcf2e3;color:#136233\">Khóa lãi TP3 (+1.5%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Trailing SL dời</span>";
+  } else if(gainPct >= 0.008){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700;background:#dcf2e3;color:#136233\">Khóa lãi TP2 (+1.0%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Trailing SL dời</span>";
+  } else if(gainPct >= 0.0045){
+    return "<span class=\"tag ok\" style=\"font-size:10px;font-weight:700;background:#dcf2e3;color:#136233\">Khóa lãi TP1 (+0.6%)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">Trailing SL dời</span>";
+  } else {
+    return "<span class=\"tag ok\" style=\"font-size:10px;background:#eef7f0;color:#136233\">Khóa Hòa vốn (BE)</span><br><span style=\"font-size:9.5px;color:var(--ink);opacity:0.75\">SL dời bảo vệ</span>";
+  }
+}
+
+function formatCoinPrice(val, symbol){
+  if(val === null || val === undefined || val === "") return "-";
+  var num = Number(val);
+  var s = String(symbol || "");
+  var d = 2;
+  if(s.indexOf("DOGE") !== -1 || s.indexOf("TRX") !== -1) d = 5;
+  else if(s.indexOf("XRP") !== -1 || s.indexOf("ADA") !== -1) d = 4;
+  else if(s.indexOf("AVAX") !== -1 || s.indexOf("LINK") !== -1) d = 3;
+  else if(s.indexOf("BTC") !== -1 || s.indexOf("BNB") !== -1 || s.indexOf("XAU") !== -1) d = 1;
+  return num.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+
 function displayPosHistoryTable(){
   const rows = window.allClosedPositions || [];
   if(!rows.length){
@@ -505,6 +548,7 @@ function displayPosHistoryTable(){
     "<th class=\"num\" style=\"width:80px\">Margin (Ký quỹ)</th>" +
     "<th class=\"num\" style=\"width:105px\">PnL Lãi / Lỗ</th>" +
     "<th class=\"num\" style=\"width:85px\">PnL %</th>" +
+    "<th style=\"width:135px;text-align:center\">Lý do Đóng (SL / TP)</th>" +
     "<th style=\"width:130px\">Thời gian Mở</th>" +
     "<th style=\"width:130px\">Thời gian Đóng</th>" +
     "</tr></thead><tbody>" +
@@ -521,14 +565,17 @@ function displayPosHistoryTable(){
       const openTime = r.c_time ? when(r.c_time / 1000) : (r.open_time_str || "-");
       const closeTime = r.u_time ? when(r.u_time / 1000) : (r.close_time_str || "-");
 
+      var sym = r.symbol || r.inst_id;
+      var closeBadge = getCloseReasonBadge(r);
       return "<tr>" +
-        "<td><b>" + esc(r.symbol || r.inst_id) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">" + esc(r.inst_id) + "</span></td>" +
+        "<td><b>" + esc(sym) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">" + esc(r.inst_id) + "</span></td>" +
         "<td>" + sideBadge + "<br><span style=\"font-size:10px;color:var(--muted)\">" + (r.leverage || 35) + "x</span></td>" +
-        "<td class=\"num\"><b>" + n(r.open_avg_px) + "</b></td>" +
-        "<td class=\"num\"><b>" + n(r.close_avg_px) + "</b></td>" +
+        "<td class=\"num\"><b>" + formatCoinPrice(r.open_avg_px, sym) + "</b></td>" +
+        "<td class=\"num\"><b>" + formatCoinPrice(r.close_avg_px, sym) + "</b></td>" +
         "<td class=\"num\"><b>" + usd(r.margin) + "</b></td>" +
         "<td class=\"num " + pnlClass + "\"><b>" + pnlSign + usd(r.pnl) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">Net: " + (r.realized_pnl >= 0 ? "+" : "") + usd(r.realized_pnl) + "</span></td>" +
         "<td class=\"num " + pnlClass + "\"><b>" + ratioSign + pnlRatio.toFixed(2) + "%</b></td>" +
+        "<td style=\"text-align:center;line-height:1.25\">" + closeBadge + "</td>" +
         "<td style=\"font-size:11px;color:var(--ink)\">" + openTime + "</td>" +
         "<td style=\"font-size:11px;color:var(--ink)\">" + closeTime + "</td>" +
         "</tr>";
