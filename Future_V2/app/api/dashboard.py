@@ -8,7 +8,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <title>AI Agent Desk</title>
 <style>
 :root{--bg:#eef3e8;--panel:#fffaf0;--panel2:#f7f0df;--ink:#10251f;--muted:#6a7871;--line:#17382e;--good:#cfe8cf;--bad:#f7d5c8;--warn:#ffe0b8;--accent:#ef7545;--shadow:0 10px 30px #17382e18}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#d7ebd5,#f4f0e5 48%,#cddfd4);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px}main{max-width:1480px;margin:0 auto;padding:24px}.mono{font-family:"DM Mono",ui-monospace,SFMono-Regular,Menlo,monospace}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}.title{font-size:clamp(30px,4vw,52px);line-height:.95;letter-spacing:-.06em;font-weight:900;margin:0}.toolbar{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.pill,button,select{border:1.5px solid var(--line);border-radius:999px;background:#fffaf0cc;padding:8px 12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink)}.pill.ok{background:var(--good)}.pill.bad{background:var(--bad)}button{cursor:pointer}button:hover{background:#fff}button:disabled{opacity:.6;cursor:progress}.layout{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{border:2px solid var(--line);background:#fffaf0d9;box-shadow:var(--shadow);padding:16px;border-radius:16px;min-width:0}.card h2{margin:0 0 12px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}.stack{display:grid;gap:16px}.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.kpi{border:1.5px solid #17382e55;background:var(--panel2);border-radius:14px;padding:13px}.kpi .k{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.kpi .v{font-size:25px;font-weight:850;margin:5px 0 2px;letter-spacing:-.04em}.kpi .s{font-size:12px;color:var(--muted);line-height:1.35}.hero{display:grid;grid-template-columns:220px 1fr;gap:14px;align-items:stretch}.verdict{border-radius:16px;border:2px solid var(--line);display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:18px;background:var(--panel2)}.verdict .action{font-size:42px;font-weight:900;letter-spacing:-.06em;text-transform:uppercase}.verdict.buy{background:var(--good)}.verdict.sell,.verdict.bad{background:var(--bad)}.verdict.hold{background:#eee8d9}.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.fact{border:1px solid #17382e33;border-radius:12px;padding:10px;background:#ffffff73;min-width:0;overflow:hidden;word-break:break-word}.fact b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:700}.fact span{display:block;margin-top:4px;font-weight:750;font-size:12px;line-height:1.35;word-break:break-word;white-space:normal}.agent-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.agent{border:1.5px solid #17382e55;border-radius:14px;background:#fffdf7;padding:11px}.agent .name{display:flex;justify-content:space-between;gap:8px;font-weight:850}.agent .meta{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}.agent.veto{outline:3px solid #b23a2b33}.tag{display:inline-flex;align-items:center;border-radius:999px;border:1px solid var(--line);padding:2px 8px;font-size:11px;text-transform:uppercase;font-weight:800}.tag.buy{background:var(--good)}.tag.sell{background:var(--bad)}.tag.hold{background:#e8e2d3}.tag.bad{background:var(--bad)}.tag.ok{background:var(--good)}.portfolio-head{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}.pos{border:1.5px solid #17382e55;border-radius:14px;background:#fffdf7;padding:12px;margin-top:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#d7ebd5,#f4f0e5 48%,#cddfd4);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px}main{max-width:1480px;margin:0 auto;padding:24px}.mono{font-family:"DM Mono",ui-monospace,SFMono-Regular,Menlo,monospace}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}.title{font-size:clamp(30px,4vw,52px);line-height:.95;letter-spacing:-.06em;font-weight:900;margin:0}.toolbar{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.pill,button,select{border:1.5px solid var(--line);border-radius:999px;background:#fffaf0cc;padding:8px 12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink)}.pill.ok{background:var(--good)}.pill.bad{background:var(--bad)}button{cursor:pointer}button:hover{background:#fff}button:disabled{opacity:.6;cursor:progress}.layout{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{border:2px solid var(--line);background:#fffaf0d9;box-shadow:var(--shadow);padding:16px;border-radius:16px;min-width:0}.card-ai-cost{padding:10px 14px}.card-ai-cost h2{margin-bottom:8px}.card h2{margin:0 0 12px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}.stack{display:grid;gap:16px}.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.kpi{border:1.5px solid #17382e55;background:var(--panel2);border-radius:14px;padding:13px}.kpi .k{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.kpi .v{font-size:25px;font-weight:850;margin:5px 0 2px;letter-spacing:-.04em}.kpi .s{font-size:12px;color:var(--muted);line-height:1.35}.hero{display:grid;grid-template-columns:220px 1fr;gap:14px;align-items:stretch}.verdict{border-radius:16px;border:2px solid var(--line);display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:18px;background:var(--panel2)}.verdict .action{font-size:42px;font-weight:900;letter-spacing:-.06em;text-transform:uppercase}.verdict.buy{background:var(--good)}.verdict.sell,.verdict.bad{background:var(--bad)}.verdict.hold{background:#eee8d9}.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.fact{border:1px solid #17382e33;border-radius:12px;padding:10px;background:#ffffff73;min-width:0;overflow:hidden;word-break:break-word}.fact b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:700}.fact span{display:block;margin-top:4px;font-weight:750;font-size:12px;line-height:1.35;word-break:break-word;white-space:normal}.agent-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.agent{border:1.5px solid #17382e55;border-radius:14px;background:#fffdf7;padding:11px}.agent .name{display:flex;justify-content:space-between;gap:8px;font-weight:850}.agent .meta{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}.agent.veto{outline:3px solid #b23a2b33}.tag{display:inline-flex;align-items:center;border-radius:999px;border:1px solid var(--line);padding:2px 8px;font-size:11px;text-transform:uppercase;font-weight:800}.tag.buy{background:var(--good)}.tag.sell{background:var(--bad)}.tag.hold{background:#e8e2d3}.tag.bad{background:var(--bad)}.tag.ok{background:var(--good)}.portfolio-head{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}.pos{border:1.5px solid #17382e55;border-radius:14px;background:#fffdf7;padding:12px;margin-top:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s}
 .pos:hover{transform:translateY(-2px);border-color:var(--line);box-shadow:0 6px 16px rgba(23,56,46,0.15)}
 .pos-hint{font-size:11px;color:var(--accent);font-weight:700;margin-top:8px;display:flex;align-items:center;gap:4px}
 .modal-backdrop{position:fixed;inset:0;background:rgba(16,37,31,0.65);backdrop-filter:blur(4px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px}
@@ -51,7 +51,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
     <aside class="stack">
       <article class="card"><h2>Real OKX Portfolio</h2><div id="portfolio"></div></article>
-      <article class="card"><h2>AI Cost By Agent</h2><div id="agent-cost"></div></article>
+      <article class="card card-ai-cost"><h2>AI Cost By Agent</h2><div id="agent-cost"></div></article>
       <article class="card"><div class="section-title"><h2>Lịch sử Vị thế đã đóng (Match 1:1 OKX)</h2><span class="muted" id="pos-history-summary">Dữ liệu thực tế sàn OKX</span></div><div id="closed-positions-history"></div></article>
     </aside>
   </div>
@@ -379,7 +379,7 @@ function renderConsensus(rows){
   }).join("")+"</tbody></table></div>":"<div class=\"empty\">No consensus rows.</div>";
 }
 let slCurrentPage = 1;
-const SL_PAGE_SIZE = 10;
+const SL_PAGE_SIZE = 5;
 window.allLossesRows = [];
 
 function changeSlPage(delta){
@@ -602,7 +602,46 @@ function renderLossesMemory(rows){
   displaySlTable();
 }
 function renderDecisions(rows){ rows=rows||[]; $("decisions").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Agent</th><th>Symbol</th><th>Action</th><th>Quality</th><th>Veto</th><th class=\"num\">Entry</th><th class=\"num\">Cost</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.agent_name)+"</td><td>"+esc(r.symbol)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.data_quality)+"</td><td>"+(r.veto?"yes":"no")+"</td><td class=\"num\">"+n(r.entry_price)+"</td><td class=\"num\">"+usd(r.estimated_cost_usd)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No decisions.</div>"; }
-function renderTicks(rows){ rows=rows||[]; $("ticks").innerHTML=rows.length?"<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Symbol</th><th class=\"num\">Price</th><th>Action</th><th>Reason</th><th class=\"num\">RSI</th></tr></thead><tbody>"+rows.slice(0,80).map(r=>"<tr><td>"+when(r.ts)+"</td><td>"+esc(r.symbol)+"</td><td class=\"num\">"+n(r.price)+"</td><td>"+tag(r.action)+"</td><td>"+esc(r.reason)+"</td><td class=\"num\">"+n(r.rsi,1)+"</td></tr>").join("")+"</tbody></table></div>":"<div class=\"empty\">No market scans.</div>"; }
+let ticksCurrentPage = 1;
+const TICKS_PAGE_SIZE = 10;
+window.allTicksRows = [];
+
+function changeTicksPage(delta){
+  const maxPage = Math.max(1, Math.ceil((window.allTicksRows || []).length / TICKS_PAGE_SIZE));
+  ticksCurrentPage = Math.max(1, Math.min(maxPage, ticksCurrentPage + delta));
+  displayTicksTable();
+}
+
+function displayTicksTable(){
+  const rows = window.allTicksRows || [];
+  if(!rows.length){
+    $("ticks").innerHTML = "<div class=\"empty\">No market scans.</div>";
+    return;
+  }
+  const total = rows.length;
+  const maxPage = Math.max(1, Math.ceil(total / TICKS_PAGE_SIZE));
+  if(ticksCurrentPage > maxPage) ticksCurrentPage = maxPage;
+  const start = (ticksCurrentPage - 1) * TICKS_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + TICKS_PAGE_SIZE);
+
+  const tableHtml = "<div class=\"table-wrap\"><table><thead><tr><th>When</th><th>Symbol</th><th class=\"num\">Price</th><th>Action</th><th>Reason</th><th class=\"num\">RSI</th></tr></thead><tbody>" +
+    pageRows.map(r => "<tr><td>" + when(r.ts) + "</td><td>" + esc(r.symbol) + "</td><td class=\"num\">" + n(r.price) + "</td><td>" + tag(r.action) + "</td><td>" + esc(r.reason) + "</td><td class=\"num\">" + n(r.rsi,1) + "</td></tr>").join("") +
+    "</tbody></table></div>" +
+    "<div class=\"pagination-bar\">" +
+    "<span>Hiển thị " + (start + 1) + " - " + Math.min(start + TICKS_PAGE_SIZE, total) + " trong tổng số <b>" + total + "</b> lượt quét</span>" +
+    "<div class=\"pagination-btns\">" +
+    "<button class=\"pag-btn\" onclick=\"changeTicksPage(-1)\" " + (ticksCurrentPage <= 1 ? "disabled" : "") + ">‹ Trang trước</button>" +
+    "<span>Trang <b>" + ticksCurrentPage + "</b> / " + maxPage + "</span>" +
+    "<button class=\"pag-btn\" onclick=\"changeTicksPage(1)\" " + (ticksCurrentPage >= maxPage ? "disabled" : "") + ">Trang sau ›</button>" +
+    "</div></div>";
+
+  $("ticks").innerHTML = tableHtml;
+}
+
+function renderTicks(rows){
+  window.allTicksRows = rows || [];
+  displayTicksTable();
+}
 async function load(){
   try{
     const res=await fetch("/api/dashboard?limit=200",{cache:"no-store"}); const d=await res.json(); if(d.error){throw new Error(d.error+" "+(d.detail||""));}
