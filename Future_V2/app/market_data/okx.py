@@ -43,9 +43,18 @@ class OKXClient:
                 last=e
                 if attempt<retries-1: await asyncio.sleep(2**attempt)
         raise last
-    async def ticker(self, symbol): self.validate_symbol(symbol); return await self.request("GET","/api/v5/market/ticker",params={"instId":symbol})
-    async def candles(self, symbol, bar="1m", limit=300): self.validate_symbol(symbol); return await self.request("GET","/api/v5/market/candles",params={"instId":symbol,"bar":bar,"limit":str(limit)})
-    async def order_book(self, symbol, depth=20): self.validate_symbol(symbol); return await self.request("GET","/api/v5/market/books",params={"instId":symbol,"sz":str(depth)})
+    async def ticker(self, symbol):
+        self.validate_symbol(symbol)
+        inst_id = "XAU-USDT-SWAP" if symbol == "XAU-USDT" else symbol
+        return await self.request("GET","/api/v5/market/ticker",params={"instId":inst_id})
+    async def candles(self, symbol, bar="1m", limit=300):
+        self.validate_symbol(symbol)
+        inst_id = "XAU-USDT-SWAP" if symbol == "XAU-USDT" else symbol
+        return await self.request("GET","/api/v5/market/candles",params={"instId":inst_id,"bar":bar,"limit":str(limit)})
+    async def order_book(self, symbol, depth=20):
+        self.validate_symbol(symbol)
+        inst_id = "XAU-USDT-SWAP" if symbol == "XAU-USDT" else symbol
+        return await self.request("GET","/api/v5/market/books",params={"instId":inst_id,"sz":str(depth)})
     async def instruments(self, symbol="SPOT"): return await self.request("GET","/api/v5/public/instruments",params={"instType":symbol})
     async def balances(self): return await self.request("GET","/api/v5/account/balance",private=True)
     async def open_orders(self, symbol=None): return await self.request("GET","/api/v5/trade/orders-pending",params={"instId":symbol} if symbol else None,private=True)
