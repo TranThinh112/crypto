@@ -7,14 +7,14 @@ def signal(
     max_spread_pct: float,
     min_stop_pct: float = 0.010,
     risk_reward: float = 1.5,
-    tp1_pct: float = 0.006,
+    tp1_pct: float = 0.012,
     tp1_close_pct: float = 0.40,
-    tp2_pct: float = 0.010,
+    tp2_pct: float = 0.020,
     tp2_close_pct: float = 0.30,
-    tp3_pct: float = 0.015,
+    tp3_pct: float = 0.030,
     tp3_close_pct: float = 0.30,
-    tp4_pct: float = 0.022,
-    tp5_pct: float = 0.030,
+    tp4_pct: float = 0.040,
+    tp5_pct: float = 0.050,
     htf_trend: str | None = None,
     candles=None,
 ) -> dict:
@@ -30,24 +30,23 @@ def signal(
     macd = float(latest["macd"])
     macd_signal = float(latest["macd_signal"])
     atr = float(latest["atr"])
-    # Base stop distance fallback
+    # Base stop distance fallback (e.g. 1.5 * atr, minimum min_stop_pct)
     base_stop_distance = max(1.5 * atr, close * min_stop_pct)
 
-    # Dynamic swing structure Stop Loss (0.2% buffer beyond recent swing high/low)
-    # Safeguard bounds: minimum min_stop_pct, maximum 2.0 * ATR (or 2.5% max)
-    max_stop_distance = max(2.0 * atr, close * 0.025)
+    # When candles are provided for dynamic swing SL, cap maximum SL at min(2.0 * atr, close * 0.010) to prevent oversized losses
+    max_stop_distance = max(close * min_stop_pct, close * 0.010)
 
     if candles is not None and len(candles) >= 5:
         tail5 = candles.tail(5)
         recent_high = float(tail5["high"].astype(float).max())
         recent_low = float(tail5["low"].astype(float).min())
 
-        # For SHORT: place SL just above the swing high + 0.2% buffer
+        # For SHORT: place SL just above the swing high + 0.2% buffer, bounded by max_stop_distance
         short_sl_raw = recent_high * 1.002
         short_stop_dist = max(short_sl_raw - close, close * min_stop_pct)
         short_stop_dist = min(short_stop_dist, max_stop_distance)
 
-        # For BUY: place SL just below the swing low - 0.2% buffer
+        # For BUY: place SL just below the swing low - 0.2% buffer, bounded by max_stop_distance
         buy_sl_raw = recent_low * 0.998
         buy_stop_dist = max(close - buy_sl_raw, close * min_stop_pct)
         buy_stop_dist = min(buy_stop_dist, max_stop_distance)
@@ -65,18 +64,23 @@ def signal(
         "tp5_pct": tp5_pct,
     }
 
-    # Guard: Detect recent strong bottom bounce to avoid shorting into V-shaped recovery
+    # Guard: Detect recent strong bottom bounce or near-support low to avoid shorting into bottom
     if candles is not None and len(candles) >= 5:
+        tail16 = candles.tail(16)
+        lowest_support = float(tail16["low"].astype(float).min())
+        dist_from_support = (close - lowest_support) / close if close > 0 else 0.0
+
         tail8 = candles.tail(8)
         lowest_tail = float(tail8["low"].astype(float).min())
         bounce_pct = (close - lowest_tail) / lowest_tail if lowest_tail > 0 else 0.0
-        # If price has bounced > 0.8% off the 5-candle low or current candle has a long lower shadow (> 40% of range)
         last_c = candles.iloc[-1]
         c_open, c_high, c_low, c_close = float(last_c["open"]), float(last_c["high"]), float(last_c["low"]), float(last_c["close"])
         c_range = max(c_high - c_low, 1e-6)
         lower_shadow = min(c_open, c_close) - c_low
-        has_strong_hammer = (lower_shadow / c_range) >= 0.40 and c_close > c_open
-        if bounce_pct >= 0.006 or has_strong_hammer:
+        has_strong_hammer = (lower_shadow / c_range) >= 0.35 and c_close > c_open
+        # Block short if bounced >= 0.5%, has strong hammer, or price is within 0.3% of 16-candle support low
+        is_near_support = dist_from_support <= 0.003
+        if bounce_pct >= 0.005 or has_strong_hammer or is_near_support:
             recent_bounce_risk = True
         else:
             recent_bounce_risk = False
@@ -112,7 +116,9 @@ def signal(
     bb_overbought = bb_upper > bb_lower and close >= bb_upper
     bb_oversold = bb_upper > bb_lower and close <= bb_lower
 
-    if close > ema20 > ema50 and 50 <= rsi <= 62 and macd > macd_signal:
+    # BUY condition: Support established trend (close > ema20 > ema50) OR fresh breakout (close > ema20 and macd > macd_signal)
+    is_buy_trend = (close > ema20 > ema50) or (close > ema20 and ema20 >= ema50 * 0.995 and macd > macd_signal and macd > 0)
+    if is_buy_trend and 45 <= rsi <= 66 and macd > macd_signal:
         if htf_trend == "bearish":
             return {"action": "hold", "reason": "htf_trend_conflict_bearish", "htf_trend": "bearish"}
         if over_extended_buy:
@@ -125,7 +131,7 @@ def signal(
             "action": "buy",
             "reason": "trend_momentum",
             "stop_loss": float(close - buy_stop_dist),
-            "take_profit": float(close + (buy_stop_dist * risk_reward)),
+            "take_profit": float(close + max(buy_stop_dist * risk_reward, close * tp1_pct)),
             "take_profit_ladder": {
                 "tp1": float(close * (1 + tp1_pct)),
                 "tp2": float(close * (1 + tp2_pct)),
@@ -136,7 +142,8 @@ def signal(
             },
             "htf_trend": htf_trend or "aligned",
         }
-        # Guard: Shorting requires healthy momentum, rejecting near-oversold/exhaustion (RSI < 36)
+
+    # SHORT condition: Requires clear downward trend with momentum, rejecting near-support/exhaustion
     if close < ema20 < ema50 and 38 <= rsi <= 50 and macd < macd_signal:
         if htf_trend == "bullish":
             return {"action": "hold", "reason": "htf_trend_conflict_bullish", "htf_trend": "bullish"}
@@ -150,7 +157,7 @@ def signal(
             "action": "sell",
             "reason": "trend_momentum_short",
             "stop_loss": float(close + short_stop_dist),
-            "take_profit": float(close - (short_stop_dist * risk_reward)),
+            "take_profit": float(close - max(short_stop_dist * risk_reward, close * tp1_pct)),
             "take_profit_ladder": {
                 "tp1": float(close * (1 - tp1_pct)),
                 "tp2": float(close * (1 - tp2_pct)),

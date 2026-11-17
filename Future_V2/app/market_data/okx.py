@@ -105,6 +105,11 @@ class OKXClient:
         if body.get("posSide") not in ("long", "short"): raise ValueError("swap_order_requires_position_side")
         if self.read_only: raise PermissionError("okx_client_read_only")
         return await self.request("POST", "/api/v5/trade/order", body=body, private=True)
+    async def close_swap_position(self, symbol, pos_side="long", mgn_mode="isolated"):
+        self.validate_swap_symbol(symbol)
+        if self.read_only: raise PermissionError("okx_client_read_only")
+        body = {"instId": symbol, "mgnMode": mgn_mode, "posSide": pos_side}
+        return await self.request("POST", "/api/v5/trade/close-position", body=body, private=True)
     async def cancel_order(self, symbol, order_id):
         if self.read_only: raise PermissionError("okx_client_read_only")
         return await self.request("POST","/api/v5/trade/cancel-order",body={"instId":symbol,"ordId":order_id},private=True)

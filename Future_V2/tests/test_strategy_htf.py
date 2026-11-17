@@ -141,6 +141,6 @@ def test_strategy_scalp_parameters():
     assert sig["action"] == "buy"
     assert sig["stop_loss"] == 80000.0 - 800.0
     assert sig["take_profit"] == 80000.0 + 1200.0
-    assert sig["take_profit_ladder"]["tp1"] == 80000.0 * 1.006
-    assert sig["take_profit_ladder"]["tp2"] == 80000.0 * 1.010
-    assert sig["take_profit_ladder"]["tp3"] == 80000.0 * 1.015
+    assert sig["take_profit_ladder"]["tp1"] == 80000.0 * 1.012
+    assert sig["take_profit_ladder"]["tp2"] == 80000.0 * 1.020
+    assert sig["take_profit_ladder"]["tp3"] == 80000.0 * 1.030
