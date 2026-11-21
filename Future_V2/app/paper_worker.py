@@ -12,7 +12,7 @@ import numpy as np
 
 from app.config import Settings, TradingMode
 from app.execution.paper import PaperBroker
-from app.execution.live import LiveFuturesExecutor, get_price_decimals
+from app.execution.live import LiveFuturesExecutor, SWAP_BY_SYMBOL, get_price_decimals
 from app.features.indicators import compute_features
 from app.market_data.okx import OKXClient
 from app.market_data.orderbook import estimated_slippage
