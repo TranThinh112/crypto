@@ -124,3 +124,4 @@ class Settings(BaseSettings):
         if self.trading_mode == TradingMode.live and not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
             raise ValueError("live mode requires OKX credentials")
         return self
+

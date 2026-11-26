@@ -816,7 +816,9 @@ class PaperWorker:
                 log.warning("manage_live_trailing_stops_error", extra={"symbol": symbol, "error": str(exc)[:200]})
 
     async def _check_early_invalidation(self, symbol: str, snapshot: Snapshot, values: dict, candles) -> None:
-        """Early trend invalidation: cut position early if 15m candle closes opposite to EMA20."""
+        """Close only after confirmed structural invalidation; hard SL remains the primary protection."""
+        if not getattr(self.settings, "early_invalidation_enabled", True):
+            return
         if getattr(self.settings, "trading_mode", None) != TradingMode.live or getattr(self.settings, "live_dry_run", False):
             return
         if not self.exchange_portfolio or not self.exchange_portfolio.get("positions"):
@@ -826,37 +828,46 @@ class PaperWorker:
         if not pos or not pos.get("quantity"):
             return
         pos_side = pos.get("side") or "long"
-        ema20 = float(values.get("ema20") or 0.0)
-        close_px = float(snapshot.last)
-        if ema20 <= 0:
+        ema20 = self._finite(values.get("ema20"))
+        rsi = self._finite(values.get("rsi"))
+        volume_z = self._finite(values.get("volume_z"))
+        close_px = self._finite(snapshot.last)
+        if None in (ema20, close_px) or ema20 <= 0:
             return
 
-        should_close = False
-        reason = ""
-        # If LONG and candle closes clearly below EMA20 (by > 0.15%), invalidate early
-        if pos_side == "long" and close_px < ema20 * 0.9985:
-            should_close = True
-            reason = "early_invalidation_long_closed_below_ema20"
-        # If SHORT and candle closes clearly above EMA20 (by > 0.15%), invalidate early
-        elif pos_side == "short" and close_px > ema20 * 1.0015:
-            should_close = True
-            reason = "early_invalidation_short_closed_above_ema20"
+        confirm = int(getattr(self.settings, "early_invalidation_confirm_candles", 2))
+        distance = float(getattr(self.settings, "early_invalidation_distance_pct", 0.0035))
+        recent = candles.tail(confirm) if candles is not None and len(candles) >= confirm else None
+        if recent is None or len(recent) < confirm or "close" not in recent or "ema20" not in recent:
+            return
+        closes = [self._finite(x) for x in recent["close"].tolist()]
+        emas = [self._finite(x) for x in recent["ema20"].tolist()]
+        if any(x is None for x in closes + emas):
+            return
+        if pos_side == "long":
+            structure_broken = all(c < e * (1 - distance) for c, e in zip(closes, emas))
+            ema_sloping_down = emas[-1] < emas[0]
+            momentum_confirmed = (rsi is not None and rsi <= getattr(self.settings, "early_invalidation_rsi_long_max", 45.0)) or (volume_z is not None and volume_z >= 1.0)
+            should_close = structure_broken and ema_sloping_down and momentum_confirmed
+            reason = "early_invalidation_long_confirmed_2_candles"
+        else:
+            structure_broken = all(c > e * (1 + distance) for c, e in zip(closes, emas))
+            ema_sloping_up = emas[-1] > emas[0]
+            momentum_confirmed = (rsi is not None and rsi >= getattr(self.settings, "early_invalidation_rsi_short_min", 55.0)) or (volume_z is not None and volume_z >= 1.0)
+            should_close = structure_broken and ema_sloping_up and momentum_confirmed
+            reason = "early_invalidation_short_confirmed_2_candles"
 
         if should_close:
             try:
-                log.info("triggering_early_invalidation_close", extra={"symbol": swap_sym, "pos_side": pos_side, "close_px": close_px, "ema20": ema20, "reason": reason})
+                log.info("triggering_early_invalidation_close", extra={"symbol": swap_sym, "pos_side": pos_side, "close_px": close_px, "ema20": ema20, "rsi": rsi, "volume_z": volume_z, "reason": reason})
                 close_res = await self.client.close_swap_position(swap_sym, pos_side=pos_side, mgn_mode="isolated")
                 await self.audit.append("early_invalidation_exit", {
-                    "symbol": swap_sym,
-                    "pos_side": pos_side,
-                    "price": close_px,
-                    "ema20": ema20,
-                    "reason": reason,
-                    "response": close_res,
+                    "symbol": swap_sym, "pos_side": pos_side, "price": close_px, "ema20": ema20,
+                    "rsi": rsi, "volume_z": volume_z, "confirm_candles": confirm,
+                    "distance_pct": distance, "reason": reason, "response": close_res,
                 })
             except Exception as exc:
                 log.warning("early_invalidation_close_failed", extra={"symbol": swap_sym, "error": str(exc)[:200]})
-
     def _risk_context(self, equity: float, symbol: str, spread: float, slippage: float | None) -> dict:
         effective_max_pos_pct = 1.0 if (getattr(self.settings, "trading_mode", None) == TradingMode.live and equity and equity < 50.0) else self.settings.max_position_pct
         return {
@@ -1536,3 +1547,4 @@ class PaperWorker:
         return self.running and self.last_tick_at > 0 and time.time() - self.last_tick_at <= max_stale_seconds
 
     def stop(self): self.running = False
+
