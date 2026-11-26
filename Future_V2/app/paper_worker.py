@@ -64,6 +64,7 @@ class PaperWorker:
         self.exchange_sync_attempts = 0
         self.exchange_sync_step = ""
         self.live_trade_plans: dict[str, dict] = {}
+        self.live_trade_monitor_at: dict[str, float] = {}
         self.positions_history_cache: list[dict] = []
         self.last_positions_history_sync_at: float = 0.0
         self.instruments_ct_val_cache: dict[str, float] = {}
@@ -523,6 +524,22 @@ class PaperWorker:
                             reason = "trailing_profit_exit"
                         else:
                             reason = "stop_loss"
+                await self.audit.append("live_trade_close_detected", {
+                    "symbol": symbol,
+                    "order_id": plan.get("order_id"),
+                    "close_order_id": closing.get("ordId"),
+                    "close_algo_id": closing.get("algoId"),
+                    "pos_side": side,
+                    "detected_at_ms": int(time.time() * 1000),
+                    "close_reason_inferred": reason,
+                    "initial_stop_loss": plan.get("stop_loss"),
+                    "final_stop_loss": stop,
+                    "initial_take_profit": plan.get("take_profit"),
+                    "final_take_profit": target,
+                    "trailing_stage": stage,
+                    "okx_closing_order": closing,
+                    "position_before_close": previous,
+                })
                 await self.audit.append("live_trade_closed", {
                     "symbol": symbol,
                     "order_id": plan.get("order_id"),
@@ -540,6 +557,8 @@ class PaperWorker:
                     "net_pnl_usdt": round(gross_pnl + fee, 10),
                     "closed_at_ms": self._finite(closing.get("uTime")),
                     "okx_source": closing.get("source"),
+                    "okx_closing_order": closing,
+                    "trade_plan_at_close": plan,
                     "position_before_close": previous,
                 })
             except (httpx.HTTPError, KeyError, TypeError, ValueError, OSError) as exc:
@@ -641,6 +660,29 @@ class PaperWorker:
 
                 if not plan.get("algo_id"):
                     continue
+
+                # Keep a low-frequency snapshot so every trade can be reconstructed
+                # even when no TP/SL amendment occurs.
+                now_ms = int(time.time() * 1000)
+                if now_ms / 1000 - self.live_trade_monitor_at.get(symbol, 0) >= 60:
+                    self.live_trade_monitor_at[symbol] = now_ms / 1000
+                    await self.audit.append("live_trade_monitor", {
+                        "symbol": symbol,
+                        "order_id": plan.get("order_id"),
+                        "algo_id": plan.get("algo_id"),
+                        "pos_side": pos_side,
+                        "observed_at_ms": now_ms,
+                        "entry_price": entry_px,
+                        "mark_price": mark_px,
+                        "size": pos.get("quantity"),
+                        "unrealized_pnl": pos.get("unrealized_pnl"),
+                        "initial_stop_loss": plan.get("stop_loss"),
+                        "current_stop_loss": plan.get("current_sl"),
+                        "initial_take_profit": plan.get("take_profit"),
+                        "current_take_profit": plan.get("current_tp"),
+                        "trailing_stage": plan.get("trailing_stage", 0),
+                        "position_snapshot": pos,
+                    })
 
                 plan["tp1"] = tp1
                 plan["tp2"] = tp2
@@ -1427,6 +1469,7 @@ class PaperWorker:
                                 tp6_pct = getattr(self.settings, "tp6_pct", 0.065)
                                 tp7_pct = getattr(self.settings, "tp7_pct", 0.080)
                                 trade = {
+                                    "trade_id": uuid.uuid4().hex,
                                     "symbol": plan.get("instId"),
                                     "order_id": result.get("ordId"),
                                     "side": plan.get("side"),
@@ -1446,6 +1489,10 @@ class PaperWorker:
                                     "trailing_stage": 0,
                                     "opened_at_ms": int(time.time() * 1000),
                                     "size": plan.get("sz"),
+                                    "proposal": proposal_data,
+                                    "consensus": consensus.model_dump() if hasattr(consensus, "model_dump") else consensus.dict(),
+                                    "execution_response": response,
+                                    "order_body": plan,
                                 }
                                 self.live_trade_plans[trade["symbol"]] = trade
                                 await self.audit.append("live_trade_open", trade)
