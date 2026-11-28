@@ -153,6 +153,7 @@ class PaperWorker:
                 pnl_ratio_pct = round((self._finite(p.get("pnlRatio")) or 0.0) * 100, 2)
                 fee = round(self._finite(p.get("fee")) or 0.0, 4)
                 funding_fee = round(self._finite(p.get("fundingFee")) or 0.0, 4)
+                net_pnl = realized_pnl
                 c_time = int(p.get("cTime") or 0)
                 u_time = int(p.get("uTime") or 0)
 
@@ -167,6 +168,7 @@ class PaperWorker:
                     "margin": margin,
                     "pnl": pnl,
                     "realized_pnl": realized_pnl,
+                    "net_pnl": net_pnl,
                     "pnl_ratio_pct": pnl_ratio_pct,
                     "fee": fee,
                     "funding_fee": funding_fee,

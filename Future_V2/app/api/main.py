@@ -288,6 +288,13 @@ async def dashboard_data(limit: int = 300):
         symbol = tick.get("symbol")
         if symbol and symbol not in last_prices and tick.get("price") is not None:
             last_prices[symbol] = {"price": tick["price"], "rsi": tick.get("rsi"), "ts": tick.get("ts")}
+    closed_positions = await worker._get_positions_history(100) if worker else []
+    month_cutoff_ms = int((datetime.now(UTC).timestamp() - 30 * 86400) * 1000)
+    monthly_realized_pnl = round(sum(
+        float(row.get("realized_pnl") if row.get("realized_pnl") is not None else row.get("net_pnl") or 0.0)
+        for row in closed_positions
+        if float(row.get("u_time") or 0) >= month_cutoff_ms
+    ), 10)
     return {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "event_count": len(rows),
@@ -300,7 +307,8 @@ async def dashboard_data(limit: int = 300):
         "last_prices": last_prices,
         "last_ai_round": _last_ai_round(grouped["consensus"], grouped["agent_decision"]),
         "recent_losses_memory": (await worker._get_recent_losses_memory()) if worker else [],
-        "closed_positions_history": await worker._get_positions_history(50) if worker else [],
+        "closed_positions_history": closed_positions,
+        "monthly_realized_pnl": monthly_realized_pnl,
         "events": grouped,
     }
 

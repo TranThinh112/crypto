@@ -80,12 +80,14 @@ function listPositions(p){ const raw=(p||{}).positions||{}; return Array.isArray
 function kpi(k,v,s){ return "<div class=\"kpi\"><div class=\"k\">"+esc(k)+"</div><div class=\"v\">"+v+"</div><div class=\"s\">"+s+"</div></div>"; }
 function renderKpis(d){
   const totals=d.summary.totals||{}, day=d.summary.last_24h||{}, p=d.portfolio||{}, lr=d.last_ai_round||{}, u=lr.usage||{};
+  const monthlyPnl=Number(d.monthly_realized_pnl||0);
   const positions=listPositions(p), fallback=(d.summary.agents||[]).reduce((a,x)=>a+Number(x.fallback_calls||0),0), calls=(d.summary.agents||[]).reduce((a,x)=>a+Number(x.calls||0),0);
   $("kpis").innerHTML = [
     kpi("OKX equity", usd(p.equity), "cash " + usd(p.available_cash ?? p.cash) + " · PnL <span class=\"" + clsPnl(p.unrealized_pnl) + "\">" + usd(p.unrealized_pnl) + "</span>"),
     kpi("Open positions", n(positions.length,0), esc(p.source||"paper") + " · read-only"),
     kpi("Last AI cost", lr.usage_recorded ? usd(u.estimated_cost_usd) : "-", tok(u.total_tokens) + " tokens · " + n(u.agent_count,0) + " agents"),
     kpi("24h AI spend", usd(day.estimated_cost_usd), n(day.rounds,0) + " rounds · " + tok(day.total_tokens) + " tokens"),
+    kpi("30-day realized PnL", "<span class=\"" + clsPnl(monthlyPnl) + "\">" + usd(monthlyPnl) + "</span>", "Closed positions - last 30 days"),
     kpi("All-time cost", usd(totals.estimated_cost_usd), tok(totals.total_tokens) + " tokens"),
     kpi("AI rounds", n(totals.rounds,0), tok(totals.agent_calls) + " agent calls"),
     kpi("Fallbacks", n(fallback,0), "of " + n(calls,0) + " calls"),
@@ -555,7 +557,7 @@ function displayPosHistoryTable(){
     pageRows.map(r => {
       const isShort = String(r.direction || "").toLowerCase().includes("short");
       const sideBadge = isShort ? "<span class=\"tag sell\">SHORT</span>" : "<span class=\"tag buy\">LONG</span>";
-      const pnlVal = Number(r.pnl || 0);
+      const pnlVal = Number(r.net_pnl ?? r.pnl ?? 0);
       const isWin = pnlVal >= 0;
       const pnlClass = isWin ? "pnl-pos" : "pnl-neg";
       const pnlSign = isWin ? "+" : "";
@@ -573,7 +575,7 @@ function displayPosHistoryTable(){
         "<td class=\"num\"><b>" + formatCoinPrice(r.open_avg_px, sym) + "</b></td>" +
         "<td class=\"num\"><b>" + formatCoinPrice(r.close_avg_px, sym) + "</b></td>" +
         "<td class=\"num\"><b>" + usd(r.margin) + "</b></td>" +
-        "<td class=\"num " + pnlClass + "\"><b>" + pnlSign + usd(r.pnl) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">Net: " + (r.realized_pnl >= 0 ? "+" : "") + usd(r.realized_pnl) + "</span></td>" +
+      "<td class=\"num " + pnlClass + "\"><b>" + pnlSign + usd(pnlVal) + "</b><br><span style=\"font-size:10px;color:var(--muted)\">Gộp: " + (Number(r.pnl || 0) >= 0 ? "+" : "") + usd(r.pnl) + " · Phí: " + usd(Number(r.fee || 0) + Number(r.funding_fee || 0)) + "</span></td>" +
         "<td class=\"num " + pnlClass + "\"><b>" + ratioSign + pnlRatio.toFixed(2) + "%</b></td>" +
         "<td style=\"text-align:center;line-height:1.25\">" + closeBadge + "</td>" +
         "<td style=\"font-size:11px;color:var(--ink)\">" + openTime + "</td>" +
